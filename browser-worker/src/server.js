@@ -162,10 +162,16 @@ app.post('/action/execute', async (req, res) => {
         role: el.role,
         text: (el.text || '').substring(0, 80),
         label: (el.label || '').substring(0, 80),
+        value: el.value || '',
         placeholder: el.placeholder || null,
         type: el.type,
         href: el.href || null,
         enabled: el.enabled,
+        required: el.required || false,
+        autocomplete: el.autocomplete || null,
+        name: el.name || null,
+        id: el.id || null,
+        ariaRequired: el.ariaRequired || null,
       }));
       // Forward challenge detection (CAPTCHA/OTP) to backend
       if (obs.challenges) {
@@ -228,10 +234,16 @@ app.post('/session/unpark', async (req, res) => {
         role: el.role,
         text: (el.text || '').substring(0, 80),
         label: (el.label || '').substring(0, 80),
+        value: el.value || '',
         placeholder: el.placeholder || null,
         type: el.type,
         href: el.href || null,
         enabled: el.enabled,
+        required: el.required || false,
+        autocomplete: el.autocomplete || null,
+        name: el.name || null,
+        id: el.id || null,
+        ariaRequired: el.ariaRequired || null,
       })),
       screenshot: observation.screenshot?.base64 || null,
     });

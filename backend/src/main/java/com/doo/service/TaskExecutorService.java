@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -226,6 +227,11 @@ public class TaskExecutorService {
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
             int replanCount = 0;
+            // Track element indices successfully FILLed in the current observation cycle.
+            // Cleared whenever the observation ID changes. Prevents re-fill loops on
+            // password fields (value="***") and other fields whose DOM value is masked.
+            Set<Integer> filledInCurrentObservation = new HashSet<>();
+            String filledObservationId = null;
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -251,7 +257,10 @@ public class TaskExecutorService {
                 // Before consulting the AI, scan the current page for empty required/
                 // personal-data fields whose values are not yet in knownValues.
                 // If any are found, skip the model and fire ASK_USER directly.
-                if (lastInteractiveElements != null) {
+                // Skip on login pages (pages with a visible password field).
+                boolean hasPasswordField = lastInteractiveElements != null && lastInteractiveElements.stream()
+                    .anyMatch(e -> "password".equals(String.valueOf(e.getOrDefault("type", ""))));
+                if (lastInteractiveElements != null && !hasPasswordField) {
                     List<Map<String, Object>> missingFields = detectMissingFields(
                         lastInteractiveElements, knownValues, task.getUserRequest());
                     if (!missingFields.isEmpty()) {
@@ -397,6 +406,36 @@ public class TaskExecutorService {
                     continue;
                 }
 
+                // ── Step E: Skip re-fill of non-empty / already-filled fields ──────
+                // Clear the filled-set when the observation changes (new page).
+                if (!Objects.equals(lastObservationId, filledObservationId)) {
+                    filledInCurrentObservation.clear();
+                    filledObservationId = lastObservationId;
+                }
+                if ("FILL".equals(decision.actionType()) && decision.args() != null) {
+                    Object eidx = decision.args().get("element_index");
+                    if (eidx != null) {
+                        int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                        // Skip if already successfully filled in this observation cycle
+                        if (filledInCurrentObservation.contains(idx)) {
+                            log.info("Task {} step {} | FILL SKIPPED — element {} already filled this observation",
+                                taskId, step, idx);
+                            recentActions.add("FILL_SKIPPED: element " + idx + " already filled");
+                            continue;
+                        }
+                        // Skip if element has a visible non-empty value (non-password fields)
+                        if (lastInteractiveElements != null && idx >= 0 && idx < lastInteractiveElements.size()) {
+                            String currentValue = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("value", ""));
+                            if (!currentValue.isBlank() && !"***".equals(currentValue)) {
+                                log.info("Task {} step {} | FILL SKIPPED — element {} already has value",
+                                    taskId, step, idx);
+                                recentActions.add("FILL_SKIPPED: element " + idx + " already has value");
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 // No-progress detection: fingerprint = actionType + sorted key args + obsHash
                 String fingerprint = computeActionFingerprint(decision);
                 String fingerprintWithObs = fingerprint + "@" + lastObservationHash;
@@ -450,26 +489,27 @@ public class TaskExecutorService {
 
                 // ── Step G: Confirm-before-submit gate ────────────────────────
                 // Force approval on CLICK targeting submit-like buttons, even if the AI forgot.
+                // Only check the actual element text/label, NOT the AI's description (avoids false positives).
                 if ("CLICK".equals(decision.actionType()) && !decision.requiresApproval()
                         && decision.args() != null) {
-                    String btnDesc = String.valueOf(decision.args().getOrDefault("description", ""));
                     String btnText = "";
                     Object eidx = decision.args().get("element_index");
                     if (eidx != null && lastInteractiveElements != null) {
                         int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
                         if (idx >= 0 && idx < lastInteractiveElements.size()) {
-                            btnText = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("text", ""));
-                            if (btnText.isBlank()) {
-                                btnText = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("label", ""));
-                            }
+                            Map<String, Object> btnEl = lastInteractiveElements.get(idx);
+                            btnText = String.valueOf(btnEl.getOrDefault("text", ""));
+                            if (btnText.isBlank()) btnText = String.valueOf(btnEl.getOrDefault("label", ""));
+                            String btnRole = String.valueOf(btnEl.getOrDefault("role", ""));
+                            // Only apply to button-role elements, not links
+                            if (!"button".equals(btnRole)) btnText = "";
                         }
                     }
-                    String combined = btnDesc + " " + btnText;
-                    if (SUBMIT_BUTTON_PATTERN.matcher(combined).find()) {
-                        log.info("Task {} step {} | CONFIRM-BEFORE-SUBMIT forced for '{}'", taskId, step, combined.trim());
+                    if (!btnText.isBlank() && SUBMIT_BUTTON_PATTERN.matcher(btnText).find()) {
+                        log.info("Task {} step {} | CONFIRM-BEFORE-SUBMIT forced for '{}'", taskId, step, btnText.trim());
                         decision = new AiProvider.ActionDecision(
                             decision.actionType(), decision.args(), decision.rationale(),
-                            true, "Confirm before submitting: " + combined.trim());
+                            true, "Confirm before submitting: " + btnText.trim());
                     }
                 }
 
@@ -589,22 +629,7 @@ public class TaskExecutorService {
                     }
                 }
 
-                // ── Step E: Skip re-fill of non-empty fields ────────────────────
-                if ("FILL".equals(decision.actionType()) && decision.args() != null && lastInteractiveElements != null) {
-                    Object eidx = decision.args().get("element_index");
-                    if (eidx != null) {
-                        int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
-                        if (idx >= 0 && idx < lastInteractiveElements.size()) {
-                            String currentValue = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("value", ""));
-                            if (!currentValue.isBlank() && !"***".equals(currentValue)) {
-                                log.info("Task {} step {} | FILL SKIPPED — element {} already has value",
-                                    taskId, step, idx);
-                                recentActions.add("FILL_SKIPPED: element " + idx + " already filled");
-                                continue;
-                            }
-                        }
-                    }
-                }
+                // (Step E moved to before no-progress detector)
 
                 // Attach structured observation to element-index actions so the worker
                 // can resolve element_index → Playwright locator and run stale checks.
@@ -740,6 +765,14 @@ public class TaskExecutorService {
                     consecutiveFailures = 0;
                     resolverRetries = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
+                    // Track successfully filled element indices (Step E)
+                    if ("FILL".equals(decision.actionType()) && decision.args() != null) {
+                        Object eidx = decision.args().get("element_index");
+                        if (eidx != null) {
+                            int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                            filledInCurrentObservation.add(idx);
+                        }
+                    }
 
                     // Update structured observation state
                     if (result.observationId() != null) {
@@ -1112,9 +1145,13 @@ public class TaskExecutorService {
             String value = String.valueOf(el.getOrDefault("value", ""));
             if (!value.isBlank() && !"***".equals(value)) continue;
 
-            // Skip password fields — handled by credential gate
+            // Skip password fields and username/login fields — handled by credential gate
             String type = String.valueOf(el.getOrDefault("type", ""));
             if ("password".equals(type)) continue;
+            String elName = el.get("name") != null ? String.valueOf(el.get("name")).toLowerCase() : "";
+            String elAutocomplete = el.get("autocomplete") != null ? String.valueOf(el.get("autocomplete")).toLowerCase() : "";
+            if (elAutocomplete.equals("username") || elAutocomplete.equals("current-password")
+                    || elName.equals("username") || elName.equals("user") || elName.equals("login")) continue;
 
             boolean isRequired = Boolean.TRUE.equals(el.get("required"));
             String autocomplete = el.get("autocomplete") != null ? String.valueOf(el.get("autocomplete")) : "";
