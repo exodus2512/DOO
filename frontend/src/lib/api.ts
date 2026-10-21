@@ -40,6 +40,7 @@ export interface TaskResult {
   id: string;
   taskId: string;
   summary: string | null;
+  deliverableType?: string | null;
   verificationPassed: boolean | null;
   verificationNotes: string | null;
   sources: SourceRef[] | string;

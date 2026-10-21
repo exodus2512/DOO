@@ -777,6 +777,7 @@ public class TaskExecutorService {
                 .deliverableType(task.getDeliverableType())
                 .verificationPassed(verification.passed())
                 .verificationNotes(verification.notes())
+                .confidenceScore(verification.confidence())
                 .sources(sources)
                 .build();
             taskResultRepository.save(taskResult);

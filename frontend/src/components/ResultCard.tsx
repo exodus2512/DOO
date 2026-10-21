@@ -76,6 +76,11 @@ export default function ResultCard({ result, taskStatus }: ResultCardProps) {
               Score: <span className="text-sky-400 font-bold">{Math.round(result.confidenceScore * 100)}%</span>
             </div>
           )}
+          {result.deliverableType && (
+            <div className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-indigo-800/40 text-xs font-mono text-indigo-300">
+              {result.deliverableType.replace(/_/g, ' ')}
+            </div>
+          )}
         </div>
       </div>
 

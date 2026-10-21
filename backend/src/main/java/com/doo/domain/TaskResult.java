@@ -37,6 +37,9 @@ public class TaskResult {
     @Column(name = "verification_notes", columnDefinition = "TEXT")
     private String verificationNotes;
 
+    @Column(name = "confidence_score")
+    private Double confidenceScore;
+
     @Convert(converter = JsonConverters.SourceRefListConverter.class)
     @Column(name = "sources", columnDefinition = "TEXT")
     private List<SourceRef> sources;
