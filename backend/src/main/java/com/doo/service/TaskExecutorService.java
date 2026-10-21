@@ -489,7 +489,7 @@ public class TaskExecutorService {
                 }
 
                 // No-progress detection: fingerprint = actionType + sorted key args + obsHash
-                String fingerprint = computeActionFingerprint(decision);
+                String fingerprint = computeActionFingerprint(decision, currentUrl);
                 String fingerprintWithObs = fingerprint + "@" + lastObservationHash;
                 recentActionFingerprints.add(fingerprintWithObs);
 
@@ -894,6 +894,19 @@ public class TaskExecutorService {
                         }
                     }
 
+                    // ── Early success detection ──────────────────────────────────────
+                    // After CLICK or NAVIGATE check if success criteria are met.
+                    if ("CLICK".equals(decision.actionType()) || "NAVIGATE".equals(decision.actionType())) {
+                        if (meetsSuccessCriteria(task.getWorkflowType().name(),
+                                task.getSuccessCriteria(), pageText, currentUrl, textSnippets)) {
+                            log.info("Task {} step {} | SUCCESS CRITERIA MET — breaking to synthesize", taskId, step);
+                            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                                "Task complete — synthesizing result", step, Map.of()));
+                            recentActions.add("SUCCESS_CRITERIA_MET");
+                            break;
+                        }
+                    }
+
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
@@ -1178,6 +1191,18 @@ public class TaskExecutorService {
 
     private static final java.util.regex.Pattern SUBMIT_BUTTON_PATTERN = java.util.regex.Pattern.compile(
         "(?i)(finish|place.?order|submit|complete|confirm|pay|buy|checkout|send|purchase)"
+    );
+
+    /**
+     * Generic patterns that indicate a task has reached its final confirmation state.
+     * Site-agnostic: matches standard confirmation signals across any domain.
+     */
+    private static final java.util.regex.Pattern CONFIRMATION_SIGNAL_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)\\b(thank\\s+you|order\\s+(confirmed|placed|received|complete)|confirmation|"
+        + "successfully\\s+(submitted|placed|completed|sent|saved)|receipt|"
+        + "reference\\s+(number|#|no)|case\\s+(id|number|#)|ticket\\s+(id|number|#)|"
+        + "booking\\s+(confirmed|reference)|payment\\s+(confirmed|accepted|successful)|"
+        + "your\\s+order)\\b"
     );
 
     private static final Set<String> PERSONAL_AUTOCOMPLETE_TOKENS = Set.of(
@@ -1835,13 +1860,17 @@ public class TaskExecutorService {
         }
     }
 
-    private String computeActionFingerprint(AiProvider.ActionDecision decision) {
+    private String computeActionFingerprint(AiProvider.ActionDecision decision, String currentUrl) {
         String type = decision.actionType();
         Map<String, Object> args = decision.args() != null ? decision.args() : Map.of();
-        // Step E: FILL fingerprint by element_index only (drop the value)
+        // FILL: fingerprint by element_index only (different values don't count as progress)
         if ("FILL".equals(type)) {
             Object eidx = args.get("element_index");
             return type + "|element_index=" + eidx;
+        }
+        // EXTRACT_TEXT + SCREENSHOT: fingerprint by type + URL only; description/selector are cosmetic
+        if ("EXTRACT_TEXT".equals(type) || "SCREENSHOT".equals(type)) {
+            return type + "|url=" + (currentUrl != null ? currentUrl : "");
         }
         String keyArgs = args.entrySet().stream()
             .filter(e -> !e.getKey().startsWith("_") && !"observation_id".equals(e.getKey()))
@@ -2043,6 +2072,31 @@ public class TaskExecutorService {
             return parts.length > 1 ? parts[1] : value;
         }
         return value;
+    }
+
+    /**
+     * Check whether the current page state satisfies the task's success criteria.
+     * Site-agnostic: uses the task's planned criteria keywords and generic confirmation
+     * signals. Research tasks use data-completeness instead of page signals.
+     */
+    private boolean meetsSuccessCriteria(String workflowType, String successCriteria,
+            String pageText, String currentUrl, List<String> textSnippets) {
+        // Research tasks: done when enough distinct content is collected
+        if ("WEB_RESEARCH".equals(workflowType) || "PRODUCT_COMPARISON".equals(workflowType)) {
+            return textSnippets.size() >= 2 && textSnippets.stream().anyMatch(s -> s.length() > 200);
+        }
+        // UI tasks: check planned success criteria keyword matches
+        if (successCriteria != null && !successCriteria.isBlank()) {
+            String combined = (pageText != null ? pageText : "") + " " + (currentUrl != null ? currentUrl : "");
+            String[] words = successCriteria.toLowerCase().split("\\W+");
+            long matches = java.util.Arrays.stream(words)
+                .filter(w -> w.length() > 4)
+                .filter(w -> combined.toLowerCase().contains(w))
+                .count();
+            if (matches >= 2) return true;
+        }
+        // Generic confirmation signals
+        return pageText != null && CONFIRMATION_SIGNAL_PATTERN.matcher(pageText).find();
     }
 
     private String getKeyPoolState() {
