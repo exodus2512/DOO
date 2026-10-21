@@ -48,6 +48,9 @@ public class TaskExecutorService {
     @Value("${doo.task.execution-timeout-minutes:10}")
     private int executionTimeoutMinutes;
 
+    @Value("${doo.task.max-ai-calls:40}")
+    private int maxAiCalls;
+
     private static final int NO_PROGRESS_WINDOW = 5;
     private static final int NO_PROGRESS_THRESHOLD = 3;
 
@@ -57,7 +60,7 @@ public class TaskExecutorService {
     // Allowed action types (allowlist)
     private static final List<String> ALLOWED_ACTIONS = List.of(
         "NAVIGATE", "CLICK", "FILL", "EXTRACT_TEXT", "SCREENSHOT",
-        "SCROLL", "WAIT", "DONE", "GO_BACK"
+        "SCROLL", "WAIT", "DONE", "GO_BACK", "SELECT_OPTION", "PRESS_KEY"
     );
 
     // Actions that are NOT allowed (block harmful actions even if AI suggests them)
@@ -91,14 +94,17 @@ public class TaskExecutorService {
         List<String> textSnippets = new ArrayList<>();
         List<String> recentActions = new ArrayList<>();
 
+        int aiCallCount = 0;
+
         try {
             // Transition to RUNNING
             updateTaskStatus(task, TaskStatus.RUNNING, null);
 
             // Step 1: Classify workflow and generate plan
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Analyzing your request...", 0, Map.of()));
-            
+
             AiProvider.WorkflowClassification classification = aiProvider.classifyWorkflow(task.getUserRequest());
+            aiCallCount++;
             task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
             task.setSuccessCriteria(classification.successCriteria());
 
@@ -107,6 +113,7 @@ public class TaskExecutorService {
                 classification.successCriteria(),
                 new AiProvider.WorkflowContext(classification.workflowType())
             );
+            aiCallCount++;
 
             String planText = String.join("\n", plan.steps().stream()
                 .map((s) -> (plan.steps().indexOf(s) + 1) + ". " + s)
@@ -144,7 +151,14 @@ public class TaskExecutorService {
                 // Wall-clock budget enforcement
                 if (Instant.now().isAfter(deadline)) {
                     log.warn("Task {} exceeded {}min wall-clock budget at step {}", taskId, executionTimeoutMinutes, step);
-                    failTask(task, "Task exceeded " + executionTimeoutMinutes + " minute execution budget");
+                    failTask(task, "TASK_DEADLINE_EXCEEDED: exceeded " + executionTimeoutMinutes + " minute execution budget");
+                    return;
+                }
+
+                // AI call budget enforcement
+                if (aiCallCount >= maxAiCalls) {
+                    log.warn("Task {} exceeded AI call budget ({}) at step {}", taskId, maxAiCalls, step);
+                    failTask(task, "AI_CALL_BUDGET_EXCEEDED: used " + aiCallCount + "/" + maxAiCalls + " AI calls");
                     return;
                 }
 
@@ -169,6 +183,7 @@ public class TaskExecutorService {
                         task.getWorkflowType().name()
                     )
                 );
+                aiCallCount++;
 
                 // Check for DONE
                 if ("DONE".equals(decision.actionType())) {
@@ -322,6 +337,7 @@ public class TaskExecutorService {
                     recentActions
                 )
             );
+            aiCallCount++;
 
             // Step 5: Evidence-based verification
             publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome against evidence...", maxSteps, Map.of()));
@@ -347,6 +363,7 @@ public class TaskExecutorService {
                     evidenceSummary
                 )
             );
+            aiCallCount++;
 
             saveEvidence(taskId, "VERIFICATION_RESULT", "Verification",
                 "Passed: " + verification.passed() + "\n" + verification.notes(), null);

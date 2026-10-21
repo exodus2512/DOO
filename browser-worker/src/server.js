@@ -76,6 +76,27 @@ app.post('/session/state', async (req, res) => {
   }
 });
 
+// ─── Observe (structured perception) ─────────────────────────────────────────
+app.post('/session/observe', async (req, res) => {
+  const { taskId, includeScreenshot } = req.body;
+  if (!taskId) return res.status(400).json({ error: 'taskId is required' });
+
+  const session = sessionManager.getSession(taskId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  try {
+    const { buildObservation } = require('./perception');
+    const observation = await buildObservation(session.page, taskId, {
+      includeScreenshot: includeScreenshot ?? true,
+    });
+    res.json(observation);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ─── Execute Action ───────────────────────────────────────────────────────────
 app.post('/action/execute', async (req, res) => {
   const { taskId, sessionId, actionType, args } = req.body;
@@ -97,7 +118,22 @@ app.post('/action/execute', async (req, res) => {
   console.log(`[/action/execute] Task ${taskId} | ${actionType} | args: ${JSON.stringify(args || {}).substring(0, 100)}`);
 
   try {
-    const result = await executeAction(session.page, actionType, args || {});
+    const result = await executeAction(session.page, actionType, args || {}, taskId);
+
+    // Flatten observation into legacy fields for backward compat
+    if (result.observation) {
+      const obs = result.observation;
+      result.currentUrl = obs.url;
+      result.pageTitle = obs.title;
+      result.pageText = obs.page_text?.text || '';
+      result.accessibilityTree = JSON.stringify(
+        (obs.interactive_elements || []).slice(0, 30), null, 2
+      );
+      if (obs.screenshot?.base64 && !result.screenshot) {
+        result.screenshot = obs.screenshot.base64;
+      }
+    }
+
     res.json(result);
   } catch (error) {
     console.error(`[/action/execute] Error for task ${taskId}:`, error.message);

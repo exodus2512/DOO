@@ -5,8 +5,8 @@
 
 const { chromium } = require('playwright');
 
-const SESSION_TTL_MS = 15 * 60 * 1000;
-const SESSION_IDLE_MS = 5 * 60 * 1000;
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;  // 60min absolute
+const SESSION_IDLE_MS = Number(process.env.SESSION_IDLE_MS) || 15 * 60 * 1000; // 15min idle
 const REAPER_INTERVAL_MS = 60 * 1000;
 
 class SessionManager {
@@ -44,7 +44,6 @@ class SessionManager {
           '--disable-dev-shm-usage',
           '--disable-gpu',
           '--disable-blink-features=AutomationControlled',
-          '--disable-web-security', // Allow cross-origin for research tasks
         ]
       });
       console.log('[BrowserWorker] Browser ready');

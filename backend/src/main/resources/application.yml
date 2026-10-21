@@ -43,6 +43,7 @@ doo:
   task:
     max-steps: ${TASK_MAX_STEPS:30}
     max-retries: ${TASK_MAX_RETRIES:3}
+    max-ai-calls: ${TASK_MAX_AI_CALLS:40}
     execution-timeout-minutes: ${TASK_TIMEOUT_MINUTES:10}
     stale-running-minutes: ${TASK_STALE_MINUTES:15}
 
