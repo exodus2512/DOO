@@ -2191,6 +2191,22 @@ public class TaskExecutorService {
         }
     }
 
+    private static final int MAX_CHALLENGE_RETRIES = 3;
+
+    /**
+     * Return true if page text still shows a challenge-still-present signal.
+     * Uses generic phrases, no site-specific strings.
+     */
+    private static boolean challengeStillDetected(List<Map<String, Object>> elements, String pageText) {
+        if (pageText == null) return false;
+        String lower = pageText.toLowerCase();
+        return lower.contains("verify you are human")
+            || lower.contains("just a moment")
+            || lower.contains("press & hold")
+            || lower.contains("access denied")
+            || lower.contains("unusual traffic");
+    }
+
     ChallengeHandleResult handleChallenges(Task task, String sessionId, int currentStep,
                                            ActionResult actionResult) {
         UUID taskId = task.getId();
@@ -2201,7 +2217,7 @@ public class TaskExecutorService {
 
         boolean isOtp = "otp".equals(firstType);
         String approvalType = isOtp ? "otp_request" : "captcha_request";
-        String prompt = isOtp
+        String basePrompt = isOtp
             ? "2FA/OTP verification code required"
             : "CAPTCHA detected" + (provider != null && !provider.isEmpty() ? " (" + provider + ")" : "")
                 + " — please solve it in the browser";
@@ -2214,39 +2230,65 @@ public class TaskExecutorService {
         if (provider != null) params.put("provider", provider);
         if (inputName != null) params.put("inputName", inputName);
 
-        ApprovalRequest approval = ApprovalRequest.builder()
-            .taskId(taskId)
-            .prompt(prompt)
-            .proposedAction(approvalType.toUpperCase())
-            .parameters(params)
-            .status("PENDING")
-            .build();
-        approval = approvalRepository.save(approval);
+        ApprovalRequest approval = findOrCreateApproval(taskId, approvalType.toUpperCase(), basePrompt, params);
 
-        PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
-            prompt, approvalType.toUpperCase(), currentStep, params);
+        PauseResult pauseResult = null;
 
-        if (!pauseResult.resumed) {
-            return ChallengeHandleResult.failed(pauseResult.failureReason());
-        }
+        for (int attempt = 1; attempt <= MAX_CHALLENGE_RETRIES; attempt++) {
+            String prompt = attempt == 1 ? basePrompt
+                : basePrompt + " (still showing — please finish it, attempt " + attempt + "/" + MAX_CHALLENGE_RETRIES + ")";
 
-        // For OTP: fill the code directly via the worker (bypasses the model)
-        if (isOtp) {
-            ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
-            String otpCode = parseOtpCode(resolved);
-            if (otpCode != null && !otpCode.isBlank()) {
-                ActionResult otpResult = browserWorkerClient.fillOtp(taskId, otpCode.trim(), inputName);
-                if (!otpResult.success()) {
-                    log.warn("Task {} — OTP fill failed: {}", taskId, otpResult.error());
+            if (attempt > 1) {
+                // Reset approval to PENDING so the card re-appears
+                approval.setStatus("PENDING");
+                approval.setResolvedAt(null);
+                approval.setUserResponse(null);
+                approvalRepository.save(approval);
+            }
+
+            pauseResult = pauseForUser(task, sessionId, approval.getId(),
+                prompt, approvalType.toUpperCase(), currentStep, params);
+
+            if (!pauseResult.resumed) {
+                return ChallengeHandleResult.failed(pauseResult.failureReason());
+            }
+
+            // OTP: fill code and return immediately — no re-verify loop
+            if (isOtp) {
+                ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+                String otpCode = parseOtpCode(resolved);
+                if (otpCode != null && !otpCode.isBlank()) {
+                    ActionResult otpResult = browserWorkerClient.fillOtp(taskId, otpCode.trim(), inputName);
+                    if (!otpResult.success()) {
+                        log.warn("Task {} — OTP fill failed: {}", taskId, otpResult.error());
+                    }
+                    return new ChallengeHandleResult(true, null,
+                        otpResult.currentUrl(), otpResult.pageTitle(),
+                        pauseResult.pageText(), otpResult.observationId(),
+                        pauseResult.interactiveElements());
                 }
                 return new ChallengeHandleResult(true, null,
-                    otpResult.currentUrl(), otpResult.pageTitle(),
-                    pauseResult.pageText(), otpResult.observationId(),
+                    pauseResult.currentUrl(), pauseResult.pageTitle(),
+                    pauseResult.pageText(), pauseResult.observationId(),
                     pauseResult.interactiveElements());
             }
+
+            // CAPTCHA: re-observe to check whether the challenge is actually gone
+            String freshPageText = pauseResult.pageText() != null ? pauseResult.pageText() : "";
+            if (!challengeStillDetected(pauseResult.interactiveElements(), freshPageText)) {
+                log.info("Task {} — challenge cleared on attempt {}", taskId, attempt);
+                break; // challenge cleared
+            }
+
+            if (attempt == MAX_CHALLENGE_RETRIES) {
+                return ChallengeHandleResult.failed(
+                    "Challenge still present after " + MAX_CHALLENGE_RETRIES + " attempts");
+            }
+            log.warn("Task {} — challenge still present (attempt {}/{}), re-showing card",
+                taskId, attempt, MAX_CHALLENGE_RETRIES);
         }
 
-        // For CAPTCHA: user solved it in the browser, just resume with unparked state
+        // CAPTCHA resolved — resume with unparked state
         return new ChallengeHandleResult(true, null,
             pauseResult.currentUrl(), pauseResult.pageTitle(),
             pauseResult.pageText(), pauseResult.observationId(),
