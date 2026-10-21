@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * The core agent execution loop.
@@ -55,6 +56,7 @@ public class TaskExecutorService {
 
     private static final int NO_PROGRESS_WINDOW = 5;
     private static final int NO_PROGRESS_THRESHOLD = 3;
+    private static final int IDENTICAL_CONSECUTIVE_LIMIT = 2;
 
     // Track cancelled tasks to prevent actions being dispatched after cancellation
     private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
@@ -200,10 +202,38 @@ public class TaskExecutorService {
                     break;
                 }
 
-                // No-progress detection: fingerprint = actionType + sorted key args
+                // No-progress detection: fingerprint = actionType + sorted key args + obsHash
                 String fingerprint = computeActionFingerprint(decision);
-                recentActionFingerprints.add(fingerprint);
-                if (detectNoProgress(recentActionFingerprints)) {
+                String fingerprintWithObs = fingerprint + "@" + lastObservationHash;
+                recentActionFingerprints.add(fingerprintWithObs);
+
+                // Strict check: 2 consecutive identical actions with unchanged observation
+                if (recentActionFingerprints.size() >= IDENTICAL_CONSECUTIVE_LIMIT) {
+                    int sz = recentActionFingerprints.size();
+                    String current = recentActionFingerprints.get(sz - 1);
+                    boolean allIdentical = true;
+                    for (int k = sz - IDENTICAL_CONSECUTIVE_LIMIT; k < sz; k++) {
+                        if (!recentActionFingerprints.get(k).equals(current)) {
+                            allIdentical = false;
+                            break;
+                        }
+                    }
+                    if (allIdentical) {
+                        log.warn("Task {} stuck: identical action '{}' repeated {} times with unchanged page",
+                            taskId, decision.actionType(), IDENTICAL_CONSECUTIVE_LIMIT);
+                        publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                            "No progress: same action repeated with no page change", step, Map.of()));
+                        failTask(task, "Agent made no progress: repeated '" + decision.actionType()
+                            + "' action " + IDENTICAL_CONSECUTIVE_LIMIT + " times with unchanged observation");
+                        return;
+                    }
+                }
+
+                // Window-based check: same fingerprint 3+ times in last 5 steps (ignores obsHash for this)
+                List<String> fpOnly = recentActionFingerprints.stream()
+                    .map(fp -> fp.contains("@") ? fp.substring(0, fp.lastIndexOf("@")) : fp)
+                    .collect(Collectors.toList());
+                if (detectNoProgress(fpOnly)) {
                     log.warn("Task {} stuck: action '{}' repeated {} times in last {} steps",
                         taskId, decision.actionType(), NO_PROGRESS_THRESHOLD, NO_PROGRESS_WINDOW);
                     publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
@@ -255,6 +285,12 @@ public class TaskExecutorService {
                 publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
                     decision.rationale() + " → " + decision.actionType(), step, Map.of()));
 
+                // Re-check cancellation before sending action to worker
+                if (isCancelled(taskId)) {
+                    log.info("Task {} cancelled before action execution at step {}", taskId, step);
+                    break;
+                }
+
                 // Execute action
                 ActionResult result = browserWorkerClient.executeAction(
                     taskId, sessionId, decision.actionType(), decision.args());
@@ -277,6 +313,63 @@ public class TaskExecutorService {
                     consecutiveFailures = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
 
+                    // ── Fill-then-submit guard ──────────────────────────────
+                    // After a FILL that didn't change the page (no navigation, no DOM shift),
+                    // the field was filled but the form was NOT submitted. Deterministically
+                    // try PRESS_KEY Enter, then fall back to CLICK on a submit button.
+                    if ("FILL".equals(decision.actionType())) {
+                        String postFillHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
+                        boolean pageChanged = !postFillHash.equals(lastObservationHash);
+                        boolean urlChanged = result.currentUrl() != null && !result.currentUrl().equals(currentUrl);
+                        if (!pageChanged && !urlChanged) {
+                            log.info("Task {} fill-guard: FILL did not change page state, injecting PRESS_KEY Enter", taskId);
+                            recentActions.add("PRESS_KEY: fill-guard auto-submit (Enter)");
+                            ActionResult enterResult = browserWorkerClient.executeAction(
+                                taskId, sessionId, "PRESS_KEY", Map.of("key", "Enter"));
+                            TaskStep enterStep = TaskStep.builder()
+                                .taskId(taskId).stepIndex(step).actionType("PRESS_KEY")
+                                .actionArgs(Map.of("key", "Enter", "_guard", "fill-submit"))
+                                .status(enterResult.success() ? "COMPLETED" : "FAILED")
+                                .result(enterResult.result()).error(enterResult.error())
+                                .completedAt(Instant.now()).build();
+                            taskStepRepository.save(enterStep);
+
+                            if (enterResult.success()) {
+                                String postEnterHash = computeObservationHash(
+                                    enterResult.currentUrl(), enterResult.pageTitle(), enterResult.pageText());
+                                if (!postEnterHash.equals(postFillHash)) {
+                                    log.info("Task {} fill-guard: PRESS_KEY Enter advanced page", taskId);
+                                    result = enterResult;
+                                } else {
+                                    log.info("Task {} fill-guard: Enter had no effect, trying CLICK submit button", taskId);
+                                    recentActions.add("CLICK: fill-guard auto-submit (click)");
+                                    ActionResult clickResult = browserWorkerClient.executeAction(
+                                        taskId, sessionId, "CLICK",
+                                        Map.of("selector", "button[type='submit'], input[type='submit'], button.btn-primary, button.btn-success, button:has-text('Submit'), button:has-text('Search')",
+                                               "description", "submit button"));
+                                    TaskStep clickStep = TaskStep.builder()
+                                        .taskId(taskId).stepIndex(step).actionType("CLICK")
+                                        .actionArgs(Map.of("selector", "submit-button", "_guard", "fill-submit"))
+                                        .status(clickResult.success() ? "COMPLETED" : "FAILED")
+                                        .result(clickResult.result()).error(clickResult.error())
+                                        .completedAt(Instant.now()).build();
+                                    taskStepRepository.save(clickStep);
+                                    if (clickResult.success()) {
+                                        result = clickResult;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // For EXTRACT_TEXT, save the action's direct result as primary evidence
+                    if ("EXTRACT_TEXT".equals(decision.actionType()) && result.result() != null && result.result().length() > 50) {
+                        String extractLabel = (String) decision.args().getOrDefault("label", "Extracted content");
+                        String extractSnippet = result.result().substring(0, Math.min(4000, result.result().length()));
+                        textSnippets.add("[" + extractLabel + "] " + extractSnippet);
+                        saveEvidence(taskId, "TEXT_SNIPPET", extractLabel, extractSnippet, currentUrl);
+                    }
+
                     // Update observation epoch on state change
                     String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
                     if (!newObsHash.equals(lastObservationHash)) {
@@ -297,7 +390,7 @@ public class TaskExecutorService {
                         pageTitle = result.pageTitle() != null ? result.pageTitle() : "";
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
 
-                        if (result.pageText().length() > 100) {
+                        if (!"EXTRACT_TEXT".equals(decision.actionType()) && result.pageText().length() > 100) {
                             String snippet = result.pageText().substring(0, Math.min(2000, result.pageText().length()));
                             textSnippets.add("[" + result.pageTitle() + "] " + snippet);
                             saveEvidence(taskId, "TEXT_SNIPPET", result.pageTitle(),

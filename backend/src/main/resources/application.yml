@@ -36,7 +36,7 @@ doo:
       api-key: ${GEMINI_API_KEY_1:}
       api-key-2: ${GEMINI_API_KEY_2:}
       api-key-3: ${GEMINI_API_KEY_3:}
-      model: ${GEMINI_MODEL:gemini-3.8-flash}
+      model: ${GEMINI_MODEL:gemini-3.5-flash-lite}
       max-retries: ${GEMINI_MAX_RETRIES:6}
       min-call-interval-ms: ${GEMINI_MIN_INTERVAL_MS:4000}
       max-rpm: ${GEMINI_MAX_RPM:10}

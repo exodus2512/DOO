@@ -12,6 +12,10 @@ export interface TaskStreamEvent {
   timestamp: string;
 }
 
+const TERMINAL_STATUSES = ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'];
+const RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECTS = 5;
+
 export function useTaskStream(
   taskId: string | null,
   onEvent: (event: TaskStreamEvent) => void
@@ -19,12 +23,24 @@ export function useTaskStream(
   const esRef = useRef<EventSource | null>(null);
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const reconnectCount = useRef(0);
+  const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const terminated = useRef(false);
 
-  const connect = useCallback(() => {
-    if (!taskId) return;
+  const cleanup = useCallback(() => {
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
     if (esRef.current) {
       esRef.current.close();
+      esRef.current = null;
     }
+  }, []);
+
+  const connect = useCallback(() => {
+    if (!taskId || terminated.current) return;
+    cleanup();
 
     const es = new EventSource(api.streamUrl(taskId));
     esRef.current = es;
@@ -33,20 +49,22 @@ export function useTaskStream(
       try {
         const data = JSON.parse(e.data) as TaskStreamEvent;
         onEventRef.current(data);
+
+        reconnectCount.current = 0;
+
         if (
           data.eventType === 'completed' ||
           data.eventType === 'error' ||
-          ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'].includes(data.status || '')
+          TERMINAL_STATUSES.includes(data.status || '')
         ) {
-          es.close();
-          esRef.current = null;
+          terminated.current = true;
+          cleanup();
         }
       } catch {
         // ignore malformed events
       }
     };
 
-    // Listen for all named events
     const eventTypes = [
       'connected', 'status_change', 'step_update',
       'screenshot', 'approval_required', 'error', 'completed', 'debug'
@@ -54,22 +72,25 @@ export function useTaskStream(
     eventTypes.forEach(type => es.addEventListener(type, handleEvent));
 
     es.onerror = () => {
-      // Clean up on error or server completion
       es.close();
       esRef.current = null;
-    };
 
-    return () => {
-      es.close();
-      esRef.current = null;
+      if (terminated.current) return;
+
+      if (reconnectCount.current < MAX_RECONNECTS) {
+        reconnectCount.current++;
+        console.log(`[DOO] SSE disconnected, reconnecting (${reconnectCount.current}/${MAX_RECONNECTS})...`);
+        reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
+      } else {
+        console.warn('[DOO] SSE max reconnects reached, falling back to polling');
+      }
     };
-  }, [taskId]);
+  }, [taskId, cleanup]);
 
   useEffect(() => {
-    const cleanup = connect();
-    return () => {
-      cleanup?.();
-      esRef.current?.close();
-    };
-  }, [connect]);
+    terminated.current = false;
+    reconnectCount.current = 0;
+    connect();
+    return cleanup;
+  }, [connect, cleanup]);
 }

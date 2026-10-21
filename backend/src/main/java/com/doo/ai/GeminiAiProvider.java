@@ -147,19 +147,20 @@ public class GeminiAiProvider implements AiProvider {
             return deterministic_generatePlan(userRequest, context.workflowType());
         }
         String prompt = """
-            You are DOO, an AI browser agent. Create a step-by-step execution plan.
+            You are DOO, an AI browser agent. Create a focused execution plan.
 
             User request: "%s"
             Workflow type: %s
             Success criteria: %s
 
             Rules:
-            - Each step should be a concrete browser action or observation
-            - Maximum 10 steps
-            - For WEB_RESEARCH: start with search, visit pages, extract info, synthesize
-            - For PRODUCT_COMPARISON: visit each product URL, extract specs/price, compare
-            - For UI_INTERACTION: navigate to test form, fill fields, submit, verify
-            - Do NOT include steps that require login or payment
+            - Maximum 6 steps. Every step must move the task forward.
+            - Each step should describe WHAT to do, not HOW (you will choose actions later).
+            - For WEB_RESEARCH: navigate to a search engine, search the query, extract key information from 1-2 results, synthesize. That's 4-5 steps max.
+            - For PRODUCT_COMPARISON: visit each product page, extract specs/price from each.
+            - For UI_INTERACTION: navigate, fill fields, submit, verify.
+            - Do NOT include redundant steps like "open browser" or "review results". Get to the point.
+            - Do NOT include steps that require login or payment.
 
             Respond in JSON format ONLY:
             {
@@ -200,9 +201,9 @@ public class GeminiAiProvider implements AiProvider {
             Recent actions: %s
             Allowed action types: %s
 
-            Select ONE action from the allowed types. Respond in JSON format ONLY:
+            Select ONE action. Respond in JSON format ONLY:
             {
-              "actionType": "NAVIGATE|CLICK|FILL|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE",
+              "actionType": "NAVIGATE|CLICK|FILL|PRESS_KEY|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE",
               "args": { ... action-specific args ... },
               "rationale": "why this action",
               "requiresApproval": false,
@@ -213,15 +214,30 @@ public class GeminiAiProvider implements AiProvider {
             - NAVIGATE: {"url": "https://..."}
             - CLICK: {"selector": "css or xpath", "description": "what element"}
             - FILL: {"selector": "...", "value": "text to enter", "description": "field name"}
-            - EXTRACT_TEXT: {"selector": "...", "label": "what we're extracting"}
+            - PRESS_KEY: {"key": "Enter|Tab|Escape|Backspace|ArrowDown|ArrowUp|Space"}
+            - EXTRACT_TEXT: {"selector": "body", "label": "what we're extracting"}
             - SCREENSHOT: {"label": "description of what we're capturing"}
             - SCROLL: {"direction": "down|up", "amount": 500}
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
 
-            IMPORTANT: Never navigate to file:// URLs or private IPs (10.x, 172.16-31.x, 192.168.x).
-            localhost URLs are allowed when specified in the task.
-            Never fill password fields. Never click purchase/checkout/buy/subscribe buttons.
+            WORKFLOW PATTERNS — follow these sequences:
+            - To search: FILL the search box → PRESS_KEY Enter → EXTRACT_TEXT on results
+            - To read a page: NAVIGATE → EXTRACT_TEXT (extract first, scroll only if needed)
+            - To submit a form: FILL fields → CLICK submit button
+
+            EXAMPLE (search on Google):
+              Step 1: FILL {"selector": "textarea[name='q']", "value": "trending python repos"}
+              Step 2: PRESS_KEY {"key": "Enter"}    ← typing alone does nothing; you must submit
+              Step 3: EXTRACT_TEXT {"selector": "body", "label": "search results"}
+
+            RULES:
+            - FILL only puts text in a field. It does NOT submit. After FILL, you MUST either PRESS_KEY Enter or CLICK the submit/search button.
+            - Use EXTRACT_TEXT as soon as useful content is visible. Do not scroll first.
+            - You MUST use EXTRACT_TEXT at least once before using DONE. The task needs explicit evidence.
+            - Do NOT repeat the same action more than twice in a row.
+            - Never navigate to file:// URLs or private IPs.
+            - Never fill password fields or click purchase/buy/subscribe buttons.
             """.formatted(
                 request.userRequest(),
                 request.currentStep(),
@@ -646,9 +662,26 @@ public class GeminiAiProvider implements AiProvider {
 
     private ActionDecision deterministic_selectAction(ActionSelectionRequest request) {
         if (request.currentUrl() == null || request.currentUrl().isBlank()) {
+            String url = "UI_INTERACTION".equals(request.workflowType())
+                ? "http://localhost:8081" : "https://en.wikipedia.org/wiki/Main_Page";
             return new ActionDecision("NAVIGATE",
-                Map.of("url", "https://en.wikipedia.org/wiki/Main_Page"),
+                Map.of("url", url),
                 "Starting navigation (demo mode)", false, "");
+        }
+        if ("UI_INTERACTION".equals(request.workflowType())) {
+            if (request.currentStep() == 1) {
+                return new ActionDecision("FILL",
+                    Map.of("selector", "#full-name", "value", "Demo User", "description", "Full Name"),
+                    "Filling form field (demo mode)", false, "");
+            }
+            if (request.currentStep() >= 2) {
+                return new ActionDecision("DONE",
+                    Map.of("reason", "Demo mode: form interaction simulated"),
+                    "Demo mode complete", false, "");
+            }
+            return new ActionDecision("SCREENSHOT",
+                Map.of("label", "Current state observation"),
+                "Capturing current state (demo mode)", false, "");
         }
         if (request.currentStep() >= 2) {
             return new ActionDecision("DONE",

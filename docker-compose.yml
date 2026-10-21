@@ -29,7 +29,7 @@ services:
       - "3001:3001"
     environment:
       PORT: 3001
-      WORKER_SECRET: doo-secure-worker-secret-key-phase1
+      BROWSER_WORKER_SECRET: doo-secure-worker-secret-key-phase1
       HEADLESS: "true"
 
 volumes:

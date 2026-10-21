@@ -136,7 +136,24 @@ class AcceptanceTests {
         @Test
         @DisplayName("3. Multi-step UI interaction with fixture verification")
         void uiInteraction() throws Exception {
-            setupBrowserSuccess();
+            given(browserWorkerClient.initSession(any())).willReturn(
+                new SessionResult(true, "session-1", null));
+            given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any())).willReturn(
+                new ActionResult(true, "Navigated", null, null,
+                    "http://localhost:8081", "DOO Test Fixture",
+                    longText("Step 1 — Personal Information Full Name Email"), null));
+            given(browserWorkerClient.executeAction(any(), any(), eq("FILL"), any())).willReturn(
+                new ActionResult(true, "Filled field", null, null,
+                    "http://localhost:8081", "DOO Test Fixture",
+                    longText("Step 1 — Personal Information Full Name Email"), null));
+            given(browserWorkerClient.executeAction(any(), any(), eq("PRESS_KEY"), any())).willReturn(
+                new ActionResult(true, "Pressed Enter", null, null,
+                    "http://localhost:8081", "DOO Test Fixture",
+                    longText("Step 2 — Preferences Select Plan"), null));
+            given(browserWorkerClient.executeAction(any(), any(), eq("SCREENSHOT"), any())).willReturn(
+                new ActionResult(true, "Screenshot", null, "base64data",
+                    "http://localhost:8081", "DOO Test Fixture",
+                    longText("Step 2 — Preferences Select Plan"), null));
             Task result = createAndRun("Fill out the test form at localhost and submit it");
 
             assertThat(result.getWorkflowType()).isEqualTo(WorkflowType.UI_INTERACTION);

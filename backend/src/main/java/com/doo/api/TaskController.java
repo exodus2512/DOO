@@ -29,7 +29,7 @@ import java.util.stream.Stream;
 @RestController
 @RequestMapping("/api/tasks")
 @RequiredArgsConstructor
-@CrossOrigin(origins = {"http://localhost:3000", "http://localhost:3001"}, allowCredentials = "false")
+@CrossOrigin(origins = {"http://localhost:3000"}, allowCredentials = "false")
 public class TaskController {
 
     private final TaskService taskService;

@@ -107,6 +107,49 @@ class NoProgressDetectionTest {
         assertThat(detectNoProgress(fps)).isFalse();
     }
 
+    // ─── Consecutive-identical detector (observation-aware, limit=2) ──────
+
+    private static final int IDENTICAL_CONSECUTIVE_LIMIT = 2;
+
+    private boolean detectConsecutiveIdentical(List<String> fingerprintsWithObs) {
+        if (fingerprintsWithObs.size() < IDENTICAL_CONSECUTIVE_LIMIT) return false;
+        int sz = fingerprintsWithObs.size();
+        String current = fingerprintsWithObs.get(sz - 1);
+        for (int k = sz - IDENTICAL_CONSECUTIVE_LIMIT; k < sz; k++) {
+            if (!fingerprintsWithObs.get(k).equals(current)) return false;
+        }
+        return true;
+    }
+
+    @Test
+    @DisplayName("Two identical FILL+same obs triggers consecutive detection")
+    void twoIdenticalFillsSameObsTriggers() {
+        List<String> fps = new ArrayList<>(List.of(
+            "FILL|selector=#name&value=test@obs-abc",
+            "FILL|selector=#name&value=test@obs-abc"
+        ));
+        assertThat(detectConsecutiveIdentical(fps)).isTrue();
+    }
+
+    @Test
+    @DisplayName("Two identical FILL+different obs does NOT trigger")
+    void twoIdenticalFillsDifferentObsNoTrigger() {
+        List<String> fps = new ArrayList<>(List.of(
+            "FILL|selector=#name&value=test@obs-abc",
+            "FILL|selector=#name&value=test@obs-def"
+        ));
+        assertThat(detectConsecutiveIdentical(fps)).isFalse();
+    }
+
+    @Test
+    @DisplayName("Single action does NOT trigger consecutive detection")
+    void singleActionNoTrigger() {
+        List<String> fps = new ArrayList<>(List.of(
+            "FILL|selector=#name&value=test@obs-abc"
+        ));
+        assertThat(detectConsecutiveIdentical(fps)).isFalse();
+    }
+
     @Test
     @DisplayName("Empty fingerprint list returns false")
     void emptyListReturnsFalse() {

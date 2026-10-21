@@ -125,7 +125,7 @@ npx -y serve -l 8081 test-fixture
 ```bash
 cd backend
 mvn spring-boot:run
-# Backend runs on http://localhost:8080
+# Backend runs on http://localhost:8082
 ```
 
 #### Frontend
