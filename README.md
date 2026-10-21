@@ -1,6 +1,64 @@
 # DOO — GUI-First Personal AI Agent (Phase 1)
 
-> **“You ask. It does.”**
+> **”You ask. It does.”**
+
+## Running headed locally / noVNC in Docker
+
+### Headed on your own machine (best for login + CAPTCHA)
+
+```bash
+# browser-worker/.env (or export before starting)
+HEADLESS=false        # or HEADED=true
+PROFILE_MODE=persistent   # default — reuses cookies across restarts
+STORAGE_STATE_DIR=~/.doo-worker/storage-states
+```
+
+Start the worker as normal (`node src/server.js`).  Chromium will open a
+real window.  When DOO encounters a login page or CAPTCHA, the **Live
+View** card appears; click **Open live view** and interact directly in the
+browser window.  The session resumes automatically when the challenge
+clears.
+
+> **Why headed matters:** Cloud/datacenter IPs receive more bot
+> challenges.  Running headed on your home IP looks like a normal user and
+> significantly reduces friction.
+
+### noVNC in Docker / GitHub Codespaces
+
+The Dockerfile exposes an Xvfb-backed browser via noVNC when
+`NOVNC=true`.  Forward the noVNC port and open it in a browser tab to see
+and control the Chromium window remotely.
+
+```bash
+docker run -e NOVNC=true -e HEADED=true -p 6080:6080 doo-worker
+# open http://localhost:6080 (or the forwarded Codespaces URL)
+```
+
+Add to `.devcontainer/devcontainer.json`:
+```json
+{ “forwardPorts”: [3001, 6080], “portsAttributes”: { “6080”: { “label”: “Browser (noVNC)” } } }
+```
+
+### Live browser view inside the approval card
+
+When a `captcha_request` or `auth_gate` card appears in the UI, a
+**LiveBrowser** canvas is shown (if the worker supports it).  Pointer
+movements and keystrokes from the canvas are relayed to Chromium via CDP
+Input events.  The stream is WebSocket-backed with a 10-minute
+short-lived token; the same browser session is kept alive throughout.
+
+### Honest limits
+
+| Scenario | Best setup |
+|---|---|
+| Sign-in via email + password | Any mode; DOO fills from vault or asks once |
+| Sign-in via Google / Apple / OAuth | Headed on home IP; use Live View |
+| Cloudflare / reCAPTCHA v2 | Headed on home IP; use Live View |
+| reCAPTCHA v3 (invisible badge) | No action needed — DOO ignores invisible badges |
+| Bot-block wall (403/429/unusual traffic) | Live View or skip source |
+| Cloud/datacenter IP | Challenges increase; headed helps but not guaranteed |
+
+
 
 DOO is an autonomous, GUI-first personal AI agent designed to execute real multi-step tasks inside actual web browsers, capture photographic proof of every action, and rigorously verify whether the requested outcome was actually achieved.
 

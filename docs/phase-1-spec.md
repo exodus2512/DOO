@@ -1,5 +1,7 @@
 # DOO Phase 1 — Canonical Specification
 
+> Last updated: challenge-handling overhaul (commits 5dcfa5e – 9c0f5ea).
+
 > Single source of truth for architecture, contracts, lifecycle, limits, security, and acceptance criteria.
 
 ---
@@ -293,11 +295,34 @@ Enforced at both backend (`UrlValidator`) and worker (`security.js`).
 
 ### Browser Security
 
-- Chromium launched headless with `--no-sandbox` (Codespaces/container requirement) and `--disable-setuid-sandbox`.
+- Chromium launched with `--no-sandbox`, `--disable-setuid-sandbox`, `--disable-blink-features=AutomationControlled`.
 - `--disable-web-security` is **not** used.
+- No hardcoded userAgent; no `navigator.webdriver` patch (both increase detectability).
 - Worker authenticated via `X-Worker-Secret` header; secret not exposed to frontend.
 - Browser contexts isolated per task; cleaned up on every terminal path.
 - SSRF mitigation via URL validation on NAVIGATE; redirects are not independently checked (known limitation).
+- `HEADLESS=false` / `HEADED=true` enable a real window for login/CAPTCHA handoff (recommended on home IP).
+
+### Challenge Handling
+
+DOO reduces CAPTCHA/bot-detection friction through behaviour (not spoofing):
+
+| Challenge | Detection | Handling |
+|---|---|---|
+| reCAPTCHA v2 / hCaptcha / Turnstile | Visible iframe/widget (≥100×40 px, not hidden) | Human handoff card; resume after verified cleared |
+| reCAPTCHA v3 | Invisible badge — not reported | None required; ignored |
+| Bot-block page (403/429/unusual traffic) | Visible text match | Evidence saved; options: live view / skip / stop |
+| Login form | DOM: password input + identifier | Auth surface card with methods from DOM |
+| OAuth/SSO | Buttons/links matching known providers | Handoff only — never auto-clicked |
+| Email magic link | Email input, no password | Email-only form option |
+| OTP / 2FA | Short numeric input with OTP attrs | OTP card; code injected by worker, never via model |
+
+**Live view** (WebSocket + CDP screencast): stream the live Chromium frame to the UI;
+relay pointer and keyboard events back. Protected by a 10-min short-lived token.
+One controller per task; screencast stops when the socket or session closes.
+
+**Honest limits:** cloud/datacenter IPs get more challenges. Run headed on a home IP
+for best results. DOO will never solve CAPTCHA automatically.
 
 ### Action Security
 
