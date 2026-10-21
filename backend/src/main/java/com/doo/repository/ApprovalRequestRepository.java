@@ -12,4 +12,5 @@ import java.util.UUID;
 public interface ApprovalRequestRepository extends JpaRepository<ApprovalRequest, UUID> {
     List<ApprovalRequest> findByTaskIdAndStatus(UUID taskId, String status);
     Optional<ApprovalRequest> findFirstByTaskIdAndStatusOrderByCreatedAtDesc(UUID taskId, String status);
+    Optional<ApprovalRequest> findFirstByTaskIdAndProposedActionAndStatus(UUID taskId, String proposedAction, String status);
 }

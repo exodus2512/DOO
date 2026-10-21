@@ -119,6 +119,9 @@ public class TaskService {
             throw new IllegalArgumentException("Approval does not belong to task " + taskId);
         }
         if (!"PENDING".equals(approval.getStatus())) {
+            // Idempotent: return existing record if already resolved the same way (handles double-clicks)
+            if ("APPROVED".equals(approval.getStatus()) && approved) return approval;
+            if ("REJECTED".equals(approval.getStatus()) && !approved) return approval;
             throw new IllegalStateException("Approval is already resolved: " + approval.getStatus());
         }
         if (approval.isExpired()) {
@@ -131,6 +134,12 @@ public class TaskService {
         approval.setUserResponse(userResponse);
         approval.setResolvedAt(Instant.now());
         return approvalRepository.save(approval);
+    }
+
+    public ApprovalRequest getApprovalIfExists(UUID taskId, UUID approvalId) {
+        return approvalRepository.findById(approvalId)
+            .filter(a -> a.getTaskId().equals(taskId))
+            .orElse(null);
     }
 
     /**

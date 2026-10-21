@@ -1684,7 +1684,7 @@ public class TaskExecutorService {
         // We need to init the browser first for the pause to work, or handle pre-browser pause
         if (sessionId == null) {
             // We haven't launched the browser yet — do a lightweight pause without parking
-            log.info("[GATE] login detected — waiting for credentials (domain={})", domain);
+            log.info("[GATE] {} — pausing for user (domain={})", approval.getProposedAction(), domain);
             updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
             publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
                 "Login required for " + domain, "CREDENTIAL_REQUEST", approval.getParameters()));
@@ -2090,6 +2090,19 @@ public class TaskExecutorService {
         // (order, shirt, checkout) with the success criteria but are not completion pages.
         if (pageText != null && CONFIRMATION_SIGNAL_PATTERN.matcher(pageText).find()) return true;
         return false;
+    }
+
+    /**
+     * Idempotent approval creation: reuse an existing PENDING approval of the same type
+     * for this task if one already exists, avoiding duplicate cards on retries.
+     */
+    private ApprovalRequest findOrCreateApproval(UUID taskId, String proposedAction,
+            String prompt, Map<String, Object> parameters) {
+        return approvalRepository
+            .findFirstByTaskIdAndProposedActionAndStatus(taskId, proposedAction, "PENDING")
+            .orElseGet(() -> approvalRepository.save(ApprovalRequest.builder()
+                .taskId(taskId).prompt(prompt).proposedAction(proposedAction)
+                .parameters(parameters).status("PENDING").build()));
     }
 
     private String getKeyPoolState() {

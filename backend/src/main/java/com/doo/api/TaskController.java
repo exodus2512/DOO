@@ -106,8 +106,15 @@ public class TaskController {
         @PathVariable UUID approvalId,
         @Valid @RequestBody ApprovalResponseRequest req
     ) {
-        ApprovalRequest approval = taskService.respondToApproval(taskId, approvalId, req.approved(), req.userResponse());
-        return ResponseEntity.ok(ApprovalResponse.from(approval));
+        try {
+            ApprovalRequest approval = taskService.respondToApproval(taskId, approvalId, req.approved(), req.userResponse());
+            return ResponseEntity.ok(ApprovalResponse.from(approval));
+        } catch (IllegalStateException e) {
+            // Already resolved — return the existing state (409) so the UI can sync without alerting
+            ApprovalRequest existing = taskService.getApprovalIfExists(taskId, approvalId);
+            if (existing != null) return ResponseEntity.status(409).body(ApprovalResponse.from(existing));
+            return ResponseEntity.status(409).build();
+        }
     }
 
     // ─── SSE Stream ────────────────────────────────────────────────────────────
