@@ -96,11 +96,11 @@ public class CredentialVaultService {
      * This method is ONLY called by the worker fill path — never by the LLM or API responses.
      */
     public Optional<ResolvedCredential> resolve(String domain) {
-        domain = domain.toLowerCase();
-        return repository.findByDomain(domain)
+        final String normalizedDomain = domain.toLowerCase();
+        return repository.findByDomain(normalizedDomain)
             .map(entry -> {
                 String password = decrypt(entry.getEncryptedPassword());
-                log.info("Vault: resolved credentials for domain={} (password redacted)", domain);
+                log.info("Vault: resolved credentials for domain={} (password redacted)", normalizedDomain);
                 return new ResolvedCredential(entry.getUsername(), password);
             });
     }

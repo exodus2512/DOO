@@ -114,17 +114,17 @@ class FillSubmitGuardTest {
         given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
             .willReturn(new ActionResult(true, "Navigated", null, null,
                 "http://localhost:8081", "DOO Test Fixture", formPage, null,
-                "obs_nav", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))));
+                "obs_nav", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name")), null));
 
         // First FILL attempt returns RESOLVE_FAILED with fresh observation containing valid indices
         given(browserWorkerClient.executeAction(any(), any(), eq("FILL"), any()))
             .willReturn(new ActionResult(false, null,
                 "RESOLVE_FAILED: element_index 5 could not be resolved. Current valid indices: [[0] <input> textbox \"Full Name\"]",
                 null, "http://localhost:8081", "DOO Test Fixture", formPage, null,
-                "obs_fresh", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))))
+                "obs_fresh", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name")), null))
             .willReturn(new ActionResult(true, "Filled field", null, null,
                 "http://localhost:8081", "DOO Test Fixture", formPage, null,
-                "obs_filled", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))));
+                "obs_filled", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name")), null));
 
         // SCREENSHOT
         given(browserWorkerClient.executeAction(any(), any(), eq("SCREENSHOT"), any()))

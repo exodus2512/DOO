@@ -146,9 +146,11 @@ async function buildObservation(page, taskId, options = {}) {
     interactiveElements = rawElements.elements.map((el, idx) => {
       const mapped = {
         index: idx,
+        tag: el.tagName,
         role: el.role,
         label: el.label,
         text: el.text,
+        value: el.value || '',
         placeholder: el.placeholder,
         type: el.type,
         enabled: el.enabled,

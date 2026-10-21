@@ -206,16 +206,18 @@ public class GeminiAiProvider implements AiProvider {
             sb.append("Interactive elements (use element_index to act on them):\n");
             for (java.util.Map<String, Object> el : request.interactiveElements()) {
                 Object idx = el.get("index");
-                Object tag = el.get("tag");
+                Object tag = el.get("tag") != null ? el.get("tag") : (el.get("type") != null ? el.get("type") : "element");
                 Object role = el.get("role");
                 Object label = el.get("label");
                 Object text = el.get("text");
+                Object value = el.get("value");
                 Object placeholder = el.get("placeholder");
                 Object type = el.get("type");
                 Object href = el.get("href");
                 sb.append(String.format("  [%s] <%s> role=%s", idx, tag, role));
                 if (label != null && !label.toString().isBlank()) sb.append(" label=\"").append(label).append("\"");
                 if (text != null && !text.toString().isBlank()) sb.append(" text=\"").append(text).append("\"");
+                if (value != null && !value.toString().isBlank()) sb.append(" value=\"").append(value).append("\"");
                 if (placeholder != null && !placeholder.toString().isBlank()) sb.append(" placeholder=\"").append(placeholder).append("\"");
                 if ("a".equals(tag) && href != null) sb.append(" href=\"").append(href).append("\"");
                 sb.append("\n");
@@ -285,7 +287,8 @@ public class GeminiAiProvider implements AiProvider {
 
             RULES:
             - FILL only puts text into a single field. It does NOT submit the form.
-            - On forms with multiple inputs (e.g. username and password), DO NOT press Enter after filling just one field. FILL all required fields before submitting.
+            - On forms with multiple inputs (e.g. username and password), check the 'value="..."' attribute of each element. If a field already has a value filled (or '***'), DO NOT fill it again — proceed to fill the next empty field, or CLICK the submit/login button once all are filled.
+            - DO NOT press Enter after filling just one field of a multi-field form.
             - For single-field search inputs (type=search or a lone input on the page), follow FILL with PRESS_KEY Enter.
             - If a previous action returned RESOLVE_FAILED, look at the fresh Interactive elements list and pick from the current valid indices.
             - When logging into a site, FILL the username and password fields using the credential placeholders below, then CLICK the login/submit button.
