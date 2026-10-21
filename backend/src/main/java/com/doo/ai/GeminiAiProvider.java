@@ -237,13 +237,30 @@ public class GeminiAiProvider implements AiProvider {
                 Object placeholder = el.get("placeholder");
                 Object type = el.get("type");
                 Object href = el.get("href");
+                boolean isPassword = "password".equals(type);
                 sb.append(String.format("  [%s] <%s> role=%s", idx, tag, role));
                 if (label != null && !label.toString().isBlank()) sb.append(" label=\"").append(label).append("\"");
                 if (text != null && !text.toString().isBlank()) sb.append(" text=\"").append(text).append("\"");
-                if (value != null && !value.toString().isBlank()) sb.append(" value=\"").append(value).append("\"");
+                // Password fields: never show value (always "***"), show fill hint instead
+                if (isPassword) {
+                    sb.append(" [password — fill with credential placeholder]");
+                } else if (value != null && !value.toString().isBlank() && !"***".equals(value.toString())) {
+                    sb.append(" value=\"").append(value).append("\"");
+                }
                 if (placeholder != null && !placeholder.toString().isBlank()) sb.append(" placeholder=\"").append(placeholder).append("\"");
                 if ("a".equals(tag) && href != null) sb.append(" href=\"").append(href).append("\"");
                 sb.append("\n");
+            }
+            // Always append page error/alert text alongside elements so the model sees failures
+            String pageText = request.pageText() != null ? request.pageText() : "";
+            String errorLines = java.util.Arrays.stream(pageText.split("\n"))
+                .filter(line -> line.toLowerCase().matches(".*\\b(error|required|invalid|failed|denied|incorrect|wrong|try again|not found|epic sadface)\\b.*"))
+                .limit(5)
+                .map(String::trim)
+                .filter(l -> !l.isBlank())
+                .collect(java.util.stream.Collectors.joining("\n"));
+            if (!errorLines.isBlank()) {
+                sb.append("\nPage alerts/errors:\n").append(errorLines).append("\n");
             }
             pageStateBlock = sb.toString();
         } else {
@@ -319,11 +336,13 @@ public class GeminiAiProvider implements AiProvider {
 
             RULES:
             - FILL only puts text into a single field. It does NOT submit the form.
-            - Check the 'value="..."' attribute of each element. If a field already has a value (or '***'), DO NOT fill it again.
+            - Check the 'value="..."' attribute: if a field has a NON-EMPTY value (not '***'), do NOT fill it again.
+            - Password fields show '[password — fill with credential placeholder]' — they NEVER show the actual value. You MUST always FILL them using the credential placeholder (__cred_password:domain__). Do NOT skip password fields.
             - DO NOT press Enter after filling just one field of a multi-field form.
             - For single-field search inputs (type=search or a lone input), follow FILL with PRESS_KEY Enter.
             - If a previous action returned RESOLVE_FAILED, pick from the current valid indices.
-            - When logging into a site, FILL credentials using the credential placeholders below, then CLICK the submit button.
+            - When logging into a site: (1) FILL username field, (2) FILL password field using credential placeholder, (3) CLICK the login/submit button. Always fill BOTH username AND password before clicking login.
+            - If the page shows an error like "Password is required" or "Invalid credentials": you missed a FILL step. Go back and fill the empty field before clicking login again.
             - Use EXTRACT_TEXT as soon as useful content is visible. Always extract before DONE.
             - You MUST use EXTRACT_TEXT at least once before DONE.
             - For EXTRACT_TEXT, set the "label" field to describe WHAT you're extracting (e.g. "pricing table", "product features", "form error messages").

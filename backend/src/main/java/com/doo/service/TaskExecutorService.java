@@ -232,6 +232,10 @@ public class TaskExecutorService {
             // password fields (value="***") and other fields whose DOM value is masked.
             Set<Integer> filledInCurrentObservation = new HashSet<>();
             String filledObservationId = null;
+            // Tracks the last CLICK element_index + page error state, to catch repeated
+            // failed clicks (e.g. clicking Login 7 times with "Password is required").
+            Integer lastClickElementIndex = null;
+            boolean lastClickHadError = false;
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -404,6 +408,27 @@ public class TaskExecutorService {
                     }
                     recentActions.add("ASK_USER: user provided values for " + fieldsList.size() + " fields");
                     continue;
+                }
+
+                // ── Repeated-failed-CLICK guard ───────────────────────────────────
+                // If the model clicks the same element again after it produced a page error,
+                // block it and force a replan. Prevents "click Login 7 times" loops.
+                if ("CLICK".equals(decision.actionType()) && decision.args() != null) {
+                    Object eidx = decision.args().get("element_index");
+                    if (eidx != null) {
+                        int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                        if (lastClickHadError && Objects.equals(idx, lastClickElementIndex)) {
+                            log.warn("Task {} step {} | CLICK element {} blocked — last click on this element produced an error page",
+                                taskId, step, idx);
+                            String errSnippet = extractPageErrorText(pageText);
+                            recentActions.add("CLICK_BLOCKED: retrying element " + idx + " after error: " + errSnippet);
+                            // Force consecutive-failure path to trigger replan
+                            lastClickElementIndex = null;
+                            lastClickHadError = false;
+                            consecutiveFailures = maxRetries;
+                            // Fall through to the failure/replan handler below
+                        }
+                    }
                 }
 
                 // ── Step E: Skip re-fill of non-empty / already-filled fields ──────
@@ -771,6 +796,18 @@ public class TaskExecutorService {
                         if (eidx != null) {
                             int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
                             filledInCurrentObservation.add(idx);
+                        }
+                    }
+                    // Track CLICK result: record element index and whether the resulting page has errors.
+                    // Used by the repeated-failed-CLICK guard above.
+                    if ("CLICK".equals(decision.actionType()) && decision.args() != null) {
+                        Object eidx = decision.args().get("element_index");
+                        if (eidx != null) {
+                            int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                            String newPageText = result.pageText() != null ? result.pageText() : "";
+                            boolean hasError = !extractPageErrorText(newPageText).isBlank();
+                            lastClickElementIndex = idx;
+                            lastClickHadError = hasError;
                         }
                     }
 
@@ -1184,6 +1221,22 @@ public class TaskExecutorService {
 
     private static String normalizeFieldKey(String fieldHint) {
         return fieldHint.toLowerCase().replaceAll("[^a-z0-9]+", "_").replaceAll("^_|_$", "");
+    }
+
+    private static final java.util.regex.Pattern PAGE_ERROR_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)\\b(error|required|invalid|failed|denied|incorrect|wrong|try again|not found|epic sadface|password is required|username.*required)\\b"
+    );
+
+    /** Extract up to 200 chars of error-like text from a page text blob. */
+    private static String extractPageErrorText(String pageText) {
+        if (pageText == null || pageText.isBlank()) return "";
+        return java.util.Arrays.stream(pageText.split("\n"))
+            .filter(line -> PAGE_ERROR_PATTERN.matcher(line).find())
+            .map(String::trim)
+            .filter(l -> !l.isBlank())
+            .limit(3)
+            .collect(java.util.stream.Collectors.joining("; "))
+            .transform(s -> s.length() > 200 ? s.substring(0, 200) : s);
     }
 
     /**
