@@ -183,6 +183,9 @@ public class TaskExecutorService {
             Map<String, String> taskCredentials = new HashMap<>();
             // Credential hints for the AI prompt — placeholders, never actual passwords
             String credentialHints = null;
+            // User-provided values from ASK_USER, keyed by normalized field label/autocomplete.
+            // The AI prompt only sees "__user:key__" placeholders; actual values resolve at FILL time.
+            Map<String, String> knownValues = new HashMap<>();
             if (wfType.requiresBrowser()) {
                 CredentialGateResult credResult = checkCredentialGate(task, planHolder[0].steps(), sessionId);
                 if (credResult.needsPause && !credResult.resolved) {
@@ -243,6 +246,58 @@ public class TaskExecutorService {
                 taskRepository.save(task);
 
                 log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
+
+                // ── Step B: Deterministic form gate ─────────────────────────────
+                // Before consulting the AI, scan the current page for empty required/
+                // personal-data fields whose values are not yet in knownValues.
+                // If any are found, skip the model and fire ASK_USER directly.
+                if (lastInteractiveElements != null) {
+                    List<Map<String, Object>> missingFields = detectMissingFields(
+                        lastInteractiveElements, knownValues, task.getUserRequest());
+                    if (!missingFields.isEmpty()) {
+                        log.info("Task {} step {} | FORM GATE: {} missing fields detected, triggering ASK_USER",
+                            taskId, step, missingFields.size());
+                        publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                            "Form detected with " + missingFields.size() + " fields needing input — asking user",
+                            step, Map.of()));
+
+                        String askReason = "This form requires personal information. Please provide the details below.";
+                        Map<String, Object> approvalParams = new HashMap<>();
+                        approvalParams.put("type", "form_input_request");
+                        approvalParams.put("fields", missingFields);
+                        approvalParams.put("reason", askReason);
+
+                        ApprovalRequest gateApproval = ApprovalRequest.builder()
+                            .taskId(taskId).prompt(askReason).proposedAction("ASK_USER")
+                            .parameters(approvalParams).status("PENDING").build();
+                        gateApproval = approvalRepository.save(gateApproval);
+
+                        PauseResult gatePause = pauseForUser(task, sessionId, gateApproval.getId(),
+                            askReason, "ASK_USER", step, approvalParams);
+                        if (!gatePause.resumed) { failTask(task, gatePause.failureReason()); return; }
+
+                        ApprovalRequest gateResolved = approvalRepository.findById(gateApproval.getId()).orElse(null);
+                        if (gateResolved != null && gateResolved.getUserResponse() != null) {
+                            storeUserValues(gateResolved.getUserResponse(), knownValues, taskId);
+                        }
+                        // Rebuild credential hints with user-value placeholders
+                        credentialHints = buildFullHints(taskCredentials, knownValues);
+
+                        if (gatePause.observationId != null) {
+                            lastObservationId = gatePause.observationId;
+                            lastInteractiveElements = gatePause.interactiveElements;
+                        }
+                        if (gatePause.currentUrl != null) currentUrl = gatePause.currentUrl;
+                        if (gatePause.pageTitle != null) pageTitle = gatePause.pageTitle;
+                        if (gatePause.pageText != null) {
+                            pageText = gatePause.pageText;
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        }
+                        recentActions.add("FORM_GATE → ASK_USER: user provided " + missingFields.size() + " fields");
+                        continue;
+                    }
+                }
 
                 // Select next action
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — step " + step + ", url=" + truncate(currentUrl, 60), Map.of("phase", "SELECT_ACTION", "step", step, "keyPool", getKeyPoolState())));
@@ -319,22 +374,11 @@ public class TaskExecutorService {
                         return;
                     }
 
-                    // Parse user-provided field values and inject them into subsequent FILL actions
+                    // Parse user-provided field values into knownValues (Step C)
                     ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
                     if (resolved != null && resolved.getUserResponse() != null) {
-                        try {
-                            @SuppressWarnings("unchecked")
-                            Map<String, String> userValues = new com.fasterxml.jackson.databind.ObjectMapper()
-                                .readValue(resolved.getUserResponse(), Map.class);
-                            // Store values as credential-like hints so the model can reference them
-                            StringBuilder hints = new StringBuilder("\nUser-provided values (use these for FILL):\n");
-                            for (Map.Entry<String, String> entry : userValues.entrySet()) {
-                                hints.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
-                            }
-                            credentialHints = (credentialHints != null ? credentialHints : "") + hints;
-                        } catch (Exception e) {
-                            log.warn("Task {} — could not parse ASK_USER response: {}", taskId, e.getMessage());
-                        }
+                        storeUserValues(resolved.getUserResponse(), knownValues, taskId);
+                        credentialHints = buildFullHints(taskCredentials, knownValues);
                     }
 
                     // Restore observation state from unpark
@@ -450,19 +494,89 @@ public class TaskExecutorService {
                     break;
                 }
 
-                // Resolve credential placeholders in FILL values before sending to worker.
-                // The model uses __cred_username:domain__ / __cred_password:domain__ placeholders;
-                // actual passwords never enter the LLM prompt.
+                // Resolve credential and user-value placeholders in FILL values before sending to worker.
+                // The model uses __cred_password:domain__ and __user:key__ placeholders;
+                // actual values never enter the LLM prompt.
                 if ("FILL".equals(decision.actionType()) && decision.args() != null) {
                     Object fillValue = decision.args().get("value");
                     if (fillValue instanceof String sv) {
                         String resolved = resolveCredentialPlaceholder(sv, taskCredentials);
+                        resolved = resolveUserPlaceholder(resolved, knownValues);
                         if (!sv.equals(resolved)) {
                             Map<String, Object> patchedArgs = new HashMap<>(decision.args());
                             patchedArgs.put("value", resolved);
                             decision = new AiProvider.ActionDecision(
                                 decision.actionType(), patchedArgs, decision.rationale(),
                                 decision.requiresApproval(), decision.approvalReason());
+                        }
+                    }
+                }
+
+                // ── Step D: Personal-data FILL guard ────────────────────────────
+                // Reject FILL on a personal field unless the value is a placeholder
+                // (__cred_* or __user:*__), appears in the task text, or is in knownValues.
+                if ("FILL".equals(decision.actionType()) && decision.args() != null) {
+                    String fillDesc = String.valueOf(decision.args().getOrDefault("description", ""));
+                    String fillValue = String.valueOf(decision.args().getOrDefault("value", ""));
+                    if (isPersonalDataField(fillDesc) && !isValueFromKnownSource(fillValue, knownValues, task.getUserRequest())) {
+                        log.warn("Task {} step {} | FILL REJECTED — personal field '{}' value not from known source",
+                            taskId, step, fillDesc);
+                        publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                            "Blocked invented data for '" + fillDesc + "' — triggering ASK_USER", step, Map.of()));
+
+                        List<Map<String, Object>> askFields = detectMissingFields(lastInteractiveElements, knownValues, task.getUserRequest());
+                        if (askFields.isEmpty()) {
+                            askFields = List.of(Map.of("label", fillDesc, "name", normalizeFieldKey(fillDesc), "type", "text", "required", true));
+                        }
+                        String askReason = "The form requires personal information that was not provided in the task.";
+                        Map<String, Object> approvalParams = new HashMap<>();
+                        approvalParams.put("type", "form_input_request");
+                        approvalParams.put("fields", askFields);
+                        approvalParams.put("reason", askReason);
+
+                        ApprovalRequest approval = ApprovalRequest.builder()
+                            .taskId(taskId).prompt(askReason).proposedAction("ASK_USER")
+                            .parameters(approvalParams).status("PENDING").build();
+                        approval = approvalRepository.save(approval);
+
+                        PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
+                            askReason, "ASK_USER", step, approvalParams);
+                        if (!pauseResult.resumed) { failTask(task, pauseResult.failureReason()); return; }
+
+                        ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+                        if (resolved != null && resolved.getUserResponse() != null) {
+                            storeUserValues(resolved.getUserResponse(), knownValues, taskId);
+                            credentialHints = buildFullHints(taskCredentials, knownValues);
+                        }
+                        if (pauseResult.observationId != null) {
+                            lastObservationId = pauseResult.observationId;
+                            lastInteractiveElements = pauseResult.interactiveElements;
+                        }
+                        if (pauseResult.currentUrl != null) currentUrl = pauseResult.currentUrl;
+                        if (pauseResult.pageTitle != null) pageTitle = pauseResult.pageTitle;
+                        if (pauseResult.pageText != null) {
+                            pageText = pauseResult.pageText;
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        }
+                        recentActions.add("FILL_REJECTED → ASK_USER: personal data not in known sources");
+                        continue;
+                    }
+                }
+
+                // ── Step E: Skip re-fill of non-empty fields ────────────────────
+                if ("FILL".equals(decision.actionType()) && decision.args() != null && lastInteractiveElements != null) {
+                    Object eidx = decision.args().get("element_index");
+                    if (eidx != null) {
+                        int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                        if (idx >= 0 && idx < lastInteractiveElements.size()) {
+                            String currentValue = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("value", ""));
+                            if (!currentValue.isBlank() && !"***".equals(currentValue)) {
+                                log.info("Task {} step {} | FILL SKIPPED — element {} already has value",
+                                    taskId, step, idx);
+                                recentActions.add("FILL_SKIPPED: element " + idx + " already filled");
+                                continue;
+                            }
                         }
                     }
                 }
@@ -481,12 +595,22 @@ public class TaskExecutorService {
                     ));
                 }
 
-                // Log what we're sending to the worker
-                Object sentElementIndex = actionArgs.get("element_index");
-                Object sentObsId = actionArgs.get("observation_id");
-                if (sentElementIndex != null) {
-                    log.info("Task {} step {} | DISPATCH {} | element_index={} obs_id={} lastKnownObs={}",
-                        taskId, step, decision.actionType(), sentElementIndex, sentObsId, lastObservationId);
+                // ── Step F: Per-action structured log (mask personal values) ──
+                {
+                    Object eidx = actionArgs.get("element_index");
+                    Object obsId = actionArgs.get("observation_id");
+                    String detail = "";
+                    if ("FILL".equals(decision.actionType())) {
+                        String desc = String.valueOf(actionArgs.getOrDefault("description", "?"));
+                        Object val = actionArgs.get("value");
+                        String valStr = val instanceof String s ? s : "";
+                        boolean isSecret = valStr.startsWith("__cred_") || isPersonalDataField(desc);
+                        detail = " desc=\"" + desc + "\" value=" + (isSecret ? "[MASKED]" : "\"" + valStr + "\"");
+                    } else if ("NAVIGATE".equals(decision.actionType())) {
+                        detail = " url=\"" + truncate(String.valueOf(actionArgs.getOrDefault("url", "")), 80) + "\"";
+                    }
+                    log.info("Task {} step {} | DISPATCH {} | element_index={} obs_id={}{}",
+                        taskId, step, decision.actionType(), eidx, obsId, detail);
                 }
 
                 // Execute action
@@ -636,6 +760,7 @@ public class TaskExecutorService {
                                 snippet, currentUrl);
                         }
                     }
+
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
@@ -896,6 +1021,139 @@ public class TaskExecutorService {
         }
 
         return true;
+    }
+
+    // ─── Personal-data / form gate helpers ──────────────────────────────────────
+
+    private static final java.util.regex.Pattern PERSONAL_FIELD_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)(first.?name|last.?name|full.?name|\\bname\\b|email|e-mail|phone|mobile|address|zip|postal|city|state|country|dob|birth|ssn|credit.?card)"
+    );
+
+    private static final Set<String> PERSONAL_AUTOCOMPLETE_TOKENS = Set.of(
+        "given-name", "family-name", "name", "email", "tel", "tel-national",
+        "address-line1", "address-line2", "address-level1", "address-level2",
+        "postal-code", "country-name", "bday", "cc-name", "cc-number"
+    );
+
+    private static boolean isPersonalDataField(String fieldDescription) {
+        if (fieldDescription == null || fieldDescription.isBlank()) return false;
+        return PERSONAL_FIELD_PATTERN.matcher(fieldDescription).find();
+    }
+
+    private static boolean isValueFromKnownSource(String value, Map<String, String> knownValues, String userRequest) {
+        if (value == null || value.isBlank()) return true;
+        String v = value.trim();
+        if (v.startsWith("__cred_") || v.startsWith("__user:")) return true;
+        if (knownValues != null && knownValues.containsValue(v)) return true;
+        if (userRequest != null && userRequest.toLowerCase().contains(v.toLowerCase())) return true;
+        return false;
+    }
+
+    /**
+     * Detect empty form fields that need user input (Step B).
+     * Matches on: required attribute, autocomplete token in PERSONAL_AUTOCOMPLETE_TOKENS,
+     * or label/placeholder matching PERSONAL_FIELD_PATTERN.
+     * Excludes fields whose value already exists in knownValues or the task text.
+     */
+    private static List<Map<String, Object>> detectMissingFields(
+            List<Map<String, Object>> interactiveElements,
+            Map<String, String> knownValues,
+            String userRequest) {
+        if (interactiveElements == null) return List.of();
+        List<Map<String, Object>> fields = new ArrayList<>();
+        for (Map<String, Object> el : interactiveElements) {
+            String role = String.valueOf(el.getOrDefault("role", ""));
+            if (!"textbox".equals(role) && !"combobox".equals(role)) continue;
+
+            // Skip fields that already have a value
+            String value = String.valueOf(el.getOrDefault("value", ""));
+            if (!value.isBlank() && !"***".equals(value)) continue;
+
+            // Skip password fields — handled by credential gate
+            String type = String.valueOf(el.getOrDefault("type", ""));
+            if ("password".equals(type)) continue;
+
+            boolean isRequired = Boolean.TRUE.equals(el.get("required"));
+            String autocomplete = el.get("autocomplete") != null ? String.valueOf(el.get("autocomplete")) : "";
+            String name = el.get("name") != null ? String.valueOf(el.get("name")) : "";
+            String label = String.valueOf(el.getOrDefault("label", ""));
+            String placeholder = el.get("placeholder") != null ? String.valueOf(el.get("placeholder")) : "";
+            String fieldHint = !label.isBlank() ? label : (!placeholder.isBlank() ? placeholder : name);
+            if (fieldHint.isBlank()) continue;
+
+            boolean isPersonalAutocomplete = !autocomplete.isBlank() && PERSONAL_AUTOCOMPLETE_TOKENS.contains(autocomplete);
+            boolean isPersonalLabel = PERSONAL_FIELD_PATTERN.matcher(fieldHint).find();
+
+            if (!isRequired && !isPersonalAutocomplete && !isPersonalLabel) continue;
+
+            // Check if we already have a value for this field
+            String normalizedKey = normalizeFieldKey(fieldHint);
+            if (knownValues.containsKey(normalizedKey)) continue;
+            if (!autocomplete.isBlank() && knownValues.containsKey(autocomplete)) continue;
+            if (userRequest != null && userRequest.toLowerCase().contains(fieldHint.toLowerCase())) continue;
+
+            fields.add(Map.of(
+                "label", fieldHint,
+                "name", normalizedKey,
+                "type", "text",
+                "required", true
+            ));
+        }
+        return fields;
+    }
+
+    private static String normalizeFieldKey(String fieldHint) {
+        return fieldHint.toLowerCase().replaceAll("[^a-z0-9]+", "_").replaceAll("^_|_$", "");
+    }
+
+    /**
+     * Parse ASK_USER JSON response and store values in knownValues (Step C).
+     */
+    private void storeUserValues(String jsonResponse, Map<String, String> knownValues, UUID taskId) {
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, String> userValues = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(jsonResponse, Map.class);
+            for (Map.Entry<String, String> entry : userValues.entrySet()) {
+                String key = normalizeFieldKey(entry.getKey());
+                knownValues.put(key, entry.getValue());
+            }
+            log.info("Task {} — stored {} user values in knownValues", taskId, userValues.size());
+        } catch (Exception e) {
+            log.warn("Task {} — could not parse ASK_USER response: {}", taskId, e.getMessage());
+        }
+    }
+
+    /**
+     * Build the full hints block for the AI prompt: credential placeholders + user-value placeholders.
+     * Actual values NEVER appear in the prompt (Step C).
+     */
+    private String buildFullHints(Map<String, String> taskCredentials, Map<String, String> knownValues) {
+        StringBuilder sb = new StringBuilder();
+        String credHints = buildCredentialHints(taskCredentials);
+        if (credHints != null) sb.append(credHints);
+        if (!knownValues.isEmpty()) {
+            sb.append("\nUSER-PROVIDED VALUES (use these exact placeholders in FILL value):\n");
+            for (String key : knownValues.keySet()) {
+                sb.append("  Value available: __user:").append(key).append("__\n");
+            }
+            sb.append("IMPORTANT: Use the exact __user:key__ placeholder. The backend resolves it to the actual value.\n");
+        }
+        return sb.isEmpty() ? null : sb.toString();
+    }
+
+    // ─── User-value placeholder resolution (Step C) ───────────────────────────
+
+    private static final java.util.regex.Pattern USER_PLACEHOLDER = java.util.regex.Pattern.compile(
+        "__user:([^_]+)__"
+    );
+
+    private static String resolveUserPlaceholder(String value, Map<String, String> knownValues) {
+        java.util.regex.Matcher m = USER_PLACEHOLDER.matcher(value);
+        if (!m.matches()) return value;
+        String key = m.group(1).toLowerCase();
+        String resolved = knownValues.get(key);
+        return resolved != null ? resolved : value;
     }
 
     private ApprovalRequest requestApproval(Task task, AiProvider.ActionDecision decision) {
@@ -1276,7 +1534,11 @@ public class TaskExecutorService {
     private String computeActionFingerprint(AiProvider.ActionDecision decision) {
         String type = decision.actionType();
         Map<String, Object> args = decision.args() != null ? decision.args() : Map.of();
-        // Exclude internal/transient keys: _ prefix and observation_id (changes every step)
+        // Step E: FILL fingerprint by element_index only (drop the value)
+        if ("FILL".equals(type)) {
+            Object eidx = args.get("element_index");
+            return type + "|element_index=" + eidx;
+        }
         String keyArgs = args.entrySet().stream()
             .filter(e -> !e.getKey().startsWith("_") && !"observation_id".equals(e.getKey()))
             .sorted(Map.Entry.comparingByKey())

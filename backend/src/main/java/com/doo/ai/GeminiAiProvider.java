@@ -336,10 +336,17 @@ public class GeminiAiProvider implements AiProvider {
             - If unsure whether an action is safe, set requiresApproval=true with a clear approvalReason.
             Read-only actions (NAVIGATE, EXTRACT_TEXT, SCREENSHOT, SCROLL) NEVER need approval.
 
+            PERSONAL DATA — ABSOLUTE RULE:
+            - You MUST NEVER invent, guess, or fabricate values for personal-data fields.
+            - Personal-data fields include: first name, last name, full name, email, phone, address, zip/postal code, city, state, date of birth, SSN, credit card.
+            - If the page shows empty personal-data fields and you do not have the values in the "User-provided values" section below, you MUST use ASK_USER — not FILL.
+            - The ONLY sources you may use for FILL on personal-data fields are: (1) values explicitly stated in the user's task instruction, (2) credential hints below, (3) values returned from a prior ASK_USER.
+            - If you FILL a personal field with a made-up value, the backend will reject it and trigger ASK_USER anyway. So always use ASK_USER first.
+
             FORM HANDLING:
-            - If the page has a form with required fields that need personal data you don't have (name, email, phone, address), set actionType="ASK_USER" with args listing the fields.
-            - ASK_USER args: {"fields": [{"label": "Full Name", "type": "text", "required": true}, ...], "reason": "Form requires personal information"}
-            - NEVER invent personal data. Always ASK_USER for data you don't have.
+            - When you see a form with required empty personal-data fields, IMMEDIATELY use ASK_USER to request values.
+            - ASK_USER args: {"fields": [{"label": "First Name", "name": "firstName", "type": "text", "required": true}, ...], "reason": "Checkout form requires personal information"}
+            - Include every empty required personal-data field in one ASK_USER call. Do not ask one at a time.
             %s
             """.formatted(
                 request.userRequest(),
