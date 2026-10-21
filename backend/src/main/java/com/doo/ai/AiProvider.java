@@ -38,7 +38,19 @@ public interface AiProvider {
      */
     String directAnswer(String userRequest);
 
-    record WorkflowClassification(String workflowType, String rationale, String successCriteria) {}
+    record WorkflowClassification(
+        String workflowType,
+        String rationale,
+        String successCriteria,
+        String goal,
+        List<String> entities,
+        String deliverable,
+        List<String> missingInputs
+    ) {
+        public WorkflowClassification(String workflowType, String rationale, String successCriteria) {
+            this(workflowType, rationale, successCriteria, null, List.of(), null, List.of());
+        }
+    }
 
     record WorkflowContext(String workflowType) {}
 
@@ -104,8 +116,15 @@ public interface AiProvider {
     record SynthesisRequest(
         String userRequest,
         String workflowType,
+        String deliverableType,
         List<String> visitedUrls,
         List<String> textSnippets,
         List<String> actionHistory
-    ) {}
+    ) {
+        public SynthesisRequest(String userRequest, String workflowType,
+                                List<String> visitedUrls, List<String> textSnippets,
+                                List<String> actionHistory) {
+            this(userRequest, workflowType, null, visitedUrls, textSnippets, actionHistory);
+        }
+    }
 }

@@ -109,22 +109,25 @@ public class GeminiAiProvider implements AiProvider {
             return deterministic_classifyWorkflow(userRequest);
         }
         String prompt = """
-            You are DOO, an AI agent. Classify this user request into exactly one workflow type.
+            You are DOO, a general-purpose AI browser agent. Classify this user request.
 
             User request: "%s"
 
             Workflow types:
-            - WEB_RESEARCH: needs live web data, current events, real-time information
-            - PRODUCT_COMPARISON: compare specific products using live web pages
-            - UI_INTERACTION: fill forms, click buttons, interact with a specific web page
-            - LLM_ONLY: static knowledge questions, explanations, summaries, math, code help — anything you can answer from training data without a browser
-            - UNKNOWN: ambiguous or unclear request that needs clarification
+            - WEB_RESEARCH: needs live web data — research, comparison, lead lookup, pricing, audits, reviews, dashboard reads, study plans. Most tasks that need a browser.
+            - UI_INTERACTION: the user wants you to fill forms, submit data, interact with a specific page, or complete a multi-step workflow on a site.
+            - LLM_ONLY: static knowledge questions, explanations, summaries, math, code help — answerable without a browser.
+            - UNKNOWN: genuinely ambiguous — you cannot determine the goal.
 
             Respond in JSON format ONLY (no markdown, no explanation outside JSON):
             {
-              "workflowType": "WEB_RESEARCH|PRODUCT_COMPARISON|UI_INTERACTION|LLM_ONLY|UNKNOWN",
+              "workflowType": "WEB_RESEARCH|UI_INTERACTION|LLM_ONLY|UNKNOWN",
               "rationale": "one sentence explanation",
-              "successCriteria": "specific, testable conditions for completion"
+              "successCriteria": "specific, testable conditions for task completion",
+              "goal": "one-sentence restatement of what the user wants",
+              "entities": ["key nouns/names the task is about"],
+              "deliverable": "what artifact to produce: comparison_table | report | bug_list | draft | form_submission | data_extract | answer",
+              "missingInputs": ["anything the user didn't specify that you'll need to ask or assume"]
             }
             """.formatted(userRequest);
 
@@ -135,11 +138,20 @@ public class GeminiAiProvider implements AiProvider {
             String response = callGemini(prompt, taskLabel);
             JsonNode json = objectMapper.readTree(extractJson(response));
             String wfType = json.path("workflowType").asText("UNKNOWN");
-            log.info("[STEP 1/5] CLASSIFY — result: {}", wfType);
+            List<String> entities = new ArrayList<>();
+            json.path("entities").forEach(n -> entities.add(n.asText()));
+            List<String> missingInputs = new ArrayList<>();
+            json.path("missingInputs").forEach(n -> missingInputs.add(n.asText()));
+            log.info("[STEP 1/5] CLASSIFY — result: {} deliverable={} entities={}", wfType,
+                json.path("deliverable").asText(""), entities);
             return new WorkflowClassification(
                 wfType,
                 json.path("rationale").asText(""),
-                json.path("successCriteria").asText("")
+                json.path("successCriteria").asText(""),
+                json.path("goal").asText(""),
+                entities,
+                json.path("deliverable").asText(""),
+                missingInputs
             );
         } catch (Exception e) {
             log.error("[STEP 1/5] CLASSIFY — FAILED: {}", e.getMessage());
@@ -154,24 +166,35 @@ public class GeminiAiProvider implements AiProvider {
             return deterministic_generatePlan(userRequest, context.workflowType());
         }
         String prompt = """
-            You are DOO, an AI browser agent. Create a focused execution plan.
+            You are DOO, a general-purpose AI browser agent. Create a focused execution plan.
 
             User request: "%s"
             Workflow type: %s
             Success criteria: %s
 
+            STEP TYPES you can use (prefix each step with its type):
+            - NAVIGATE: go to a specific URL or search engine
+            - SEARCH: use a search engine to find information
+            - EXTRACT: pull structured data from the current page (price, features, text, links)
+            - INTERACT: fill a form field, click a button, select an option
+            - COMPARE: visit multiple sources and extract the same schema from each for comparison
+            - ASK_USER: pause and ask the user for input (credentials, personal data, choices)
+            - SYNTHESIZE: combine extracted data into the deliverable (table, report, list)
+            - VERIFY: check the final result against evidence and success criteria
+
             Rules:
-            - Maximum 6 steps. Every step must move the task forward.
-            - Each step should describe WHAT to do, not HOW (you will choose actions later).
-            - For WEB_RESEARCH: navigate to a search engine, search the query, extract key information from 1-2 results, synthesize. That's 4-5 steps max.
-            - For PRODUCT_COMPARISON: visit each product page, extract specs/price from each.
-            - For UI_INTERACTION: navigate, fill fields, submit, verify.
-            - Do NOT include redundant steps like "open browser" or "review results". Get to the point.
-            - Do NOT include steps that require login or payment.
+            - Maximum 8 steps. Every step must advance the task.
+            - Each step starts with its TYPE in brackets, e.g. "[NAVIGATE] Go to google.com"
+            - For research/comparison: search → visit 2-3 sources → extract from each → synthesize.
+            - For form filling: navigate → observe form → ASK_USER for any unknown personal data → fill → submit → verify.
+            - For QA/audit: navigate → systematically check pages/links/forms → extract issues → synthesize report.
+            - NEVER invent personal data (name, email, phone, address). Use ASK_USER instead.
+            - Do NOT include steps that require payment or destructive actions.
+            - If comparing multiple items, plan to visit each item's page separately.
 
             Respond in JSON format ONLY:
             {
-              "steps": ["step 1 description", "step 2 description", ...],
+              "steps": ["[TYPE] step description", "[TYPE] step description", ...],
               "successCriteria": "refined testable criteria"
             }
             """.formatted(userRequest, context.workflowType(), successCriteria);
@@ -247,7 +270,7 @@ public class GeminiAiProvider implements AiProvider {
 
             Select ONE action. Respond in JSON format ONLY:
             {
-              "actionType": "NAVIGATE|CLICK|FILL|PRESS_KEY|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE",
+              "actionType": "NAVIGATE|CLICK|FILL|PRESS_KEY|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE|ASK_USER",
               "args": { ... action-specific args ... },
               "rationale": "why this action",
               "requiresApproval": false,
@@ -265,37 +288,43 @@ public class GeminiAiProvider implements AiProvider {
             - SCROLL: {"direction": "down|up", "amount": 500}
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
+            - ASK_USER: {"fields": [{"label": "field name", "type": "text|email|tel|select|date|radio", "required": true, "options": ["opt1","opt2"]}], "reason": "why we need user input"}
 
             CRITICAL: For CLICK, FILL, SELECT_OPTION — you MUST use element_index from the elements list above.
             Never invent CSS selectors. The element_index is the [number] in brackets from the list.
             Always include observation_id in args when using element_index.
 
             WORKFLOW PATTERNS:
-            - Single-field search (e.g. search box or lone input): FILL search box (by element_index) → PRESS_KEY Enter → EXTRACT_TEXT on results
-            - Multi-field form (e.g. login, registration, contact): FILL each required field in order (by element_index), and only AFTER all fields are filled, CLICK the submit/login button (or PRESS_KEY Enter on the final field/submit button).
-            - Reading a page: NAVIGATE → EXTRACT_TEXT
-
-            EXAMPLE 1 (search box):
-              Step 1: FILL {"element_index": 2, "observation_id": "obs_abc123", "value": "trending python repos", "description": "search box"}
-              Step 2: PRESS_KEY {"key": "Enter"}
-              Step 3: EXTRACT_TEXT {"selector": "body", "label": "search results"}
-
-            EXAMPLE 2 (login form with username [3], password [4], submit button [5]):
-              Step 1: FILL {"element_index": 3, "observation_id": "obs_1", "value": "standard_user", "description": "username"}
-              Step 2: FILL {"element_index": 4, "observation_id": "obs_2", "value": "secret_sauce", "description": "password"}
-              Step 3: CLICK {"element_index": 5, "observation_id": "obs_3", "description": "login button"}
+            - Search: FILL search box → PRESS_KEY Enter → EXTRACT_TEXT on results
+            - Multi-field form: FILL each required empty field in order → CLICK submit when all filled
+            - Research: NAVIGATE to source → EXTRACT_TEXT structured data → repeat for next source
+            - Comparison: visit each item's page → EXTRACT_TEXT same fields from each → let SYNTHESIZE combine
+            - QA audit: NAVIGATE each page → check links/forms/content → EXTRACT_TEXT findings
+            - Pagination: after extracting, look for "Next" or page number links and CLICK to continue
 
             RULES:
             - FILL only puts text into a single field. It does NOT submit the form.
-            - On forms with multiple inputs (e.g. username and password), check the 'value="..."' attribute of each element. If a field already has a value filled (or '***'), DO NOT fill it again — proceed to fill the next empty field, or CLICK the submit/login button once all are filled.
+            - Check the 'value="..."' attribute of each element. If a field already has a value (or '***'), DO NOT fill it again.
             - DO NOT press Enter after filling just one field of a multi-field form.
-            - For single-field search inputs (type=search or a lone input on the page), follow FILL with PRESS_KEY Enter.
-            - If a previous action returned RESOLVE_FAILED, look at the fresh Interactive elements list and pick from the current valid indices.
-            - When logging into a site, FILL the username and password fields using the credential placeholders below, then CLICK the login/submit button.
-            - Use EXTRACT_TEXT as soon as useful content is visible.
+            - For single-field search inputs (type=search or a lone input), follow FILL with PRESS_KEY Enter.
+            - If a previous action returned RESOLVE_FAILED, pick from the current valid indices.
+            - When logging into a site, FILL credentials using the credential placeholders below, then CLICK the submit button.
+            - Use EXTRACT_TEXT as soon as useful content is visible. Always extract before DONE.
             - You MUST use EXTRACT_TEXT at least once before DONE.
+            - For EXTRACT_TEXT, set the "label" field to describe WHAT you're extracting (e.g. "pricing table", "product features", "form error messages").
             - Never navigate to file:// URLs or private IPs.
-            - Never click purchase/buy/subscribe buttons without explicit confirmation.
+
+            SAFETY GATES — set requiresApproval=true for any of these:
+            - Submitting a form that sends data externally (contact form, signup, purchase, subscription)
+            - Clicking buy/purchase/subscribe/delete/send/publish buttons
+            - Any action that is irreversible or externally visible
+            - If unsure whether an action is safe, set requiresApproval=true with a clear approvalReason.
+            Read-only actions (NAVIGATE, EXTRACT_TEXT, SCREENSHOT, SCROLL) NEVER need approval.
+
+            FORM HANDLING:
+            - If the page has a form with required fields that need personal data you don't have (name, email, phone, address), set actionType="ASK_USER" with args listing the fields.
+            - ASK_USER args: {"fields": [{"label": "Full Name", "type": "text", "required": true}, ...], "reason": "Form requires personal information"}
+            - NEVER invent personal data. Always ASK_USER for data you don't have.
             %s
             """.formatted(
                 request.userRequest(),
@@ -366,10 +395,13 @@ public class GeminiAiProvider implements AiProvider {
             Evidence collected:
             %s
 
-            IMPORTANT: Base your verdict on the specific evidence listed above.
-            If evidence is insufficient to confirm the success criteria, mark as NOT passed.
-            Cite specific screenshot numbers and extracted text snippets in your notes
-            to justify your confidence level (e.g. "Screenshot #3 shows the confirmation page").
+            VERIFICATION RULES:
+            - Base your verdict on the specific evidence listed above.
+            - Check that every claim in the synthesized result has a matching evidence item (URL, text snippet, or screenshot).
+            - Flag any claim that appears to be invented (not supported by evidence) — list it in unsupportedClaims.
+            - If evidence is insufficient to confirm the success criteria, mark as NOT passed.
+            - Cite specific screenshot numbers and extracted text snippets in your notes.
+            - Check that facts labeled "confirmed" actually appear in the evidence.
 
             Did the execution meet the success criteria? Respond in JSON format ONLY:
             {
@@ -413,20 +445,43 @@ public class GeminiAiProvider implements AiProvider {
             log.info("[DEMO MODE] Using deterministic result synthesis");
             return deterministic_synthesizeResult(request);
         }
+        String deliverableHint = request.deliverableType() != null ? request.deliverableType() : "auto";
         String prompt = """
-            You are DOO. Synthesize a clear, structured answer based on the evidence collected.
+            You are DOO. Synthesize a structured deliverable from the evidence collected.
 
             User request: "%s"
             Workflow: %s
+            Requested deliverable format: %s
             Visited URLs: %s
-            Evidence collected: %s
+            Evidence collected:
+            %s
 
-            Write a clear, well-structured answer. For research tasks, use markdown with sections.
-            Include source references. Be honest about gaps in information.
-            Do NOT invent facts not present in the evidence.
+            DELIVERABLE FORMATS (pick based on "Requested deliverable format" above):
+            - comparison_table → Markdown table with columns per entity. Include "Source" column. Each cell shows confirmed/estimated/unavailable.
+            - report → Markdown sections with headings. Cite sources inline.
+            - bug_list → Numbered list: issue, severity, reproduction steps, screenshot reference, URL.
+            - draft → Clearly labeled DRAFT content (post, email, etc.).
+            - data_extract → Structured data (JSON code block or Markdown table).
+            - form_submission → Summary of what was submitted and confirmation status.
+            - answer → Direct answer with citations.
+            - auto → Infer the best format from the user request.
+
+            OUTPUT RULES:
+            1. Use Markdown formatting appropriate to the deliverable format above.
+            2. Every fact must cite its source: "[Source: URL]" or "[Evidence: snippet label]".
+            3. Classify each fact as:
+               - **Confirmed**: directly seen on a page (cite the URL)
+               - **Estimated**: inferred or approximate (explain why)
+               - **Unavailable**: could not be found (say so, don't guess)
+            4. For comparison tables, include a "Source" column with the URL for each row.
+            5. For QA/audit reports, include: issue description, reproduction steps, severity, screenshot reference.
+            6. For draft content (posts, emails), clearly label it as a DRAFT.
+            7. NEVER invent facts not present in the evidence. Say "unavailable" for gaps.
+            8. End with a "## Sources" section listing all URLs visited.
             """.formatted(
                 request.userRequest(),
                 request.workflowType(),
+                deliverableHint,
                 String.join(", ", request.visitedUrls()),
                 truncate(String.join("\n\n---\n\n", request.textSnippets()), 6000)
             );
@@ -703,8 +758,8 @@ public class GeminiAiProvider implements AiProvider {
                 "Result contains comparison with source URLs");
         }
         if (lower.contains("product") || lower.contains("price") || lower.contains("buy")) {
-            return new WorkflowClassification("PRODUCT_COMPARISON",
-                "Request appears to be a product comparison",
+            return new WorkflowClassification("WEB_RESEARCH",
+                "Request appears to be a product/price research task",
                 "Each product has extracted specs and price with traceable sources");
         }
         if (lower.contains("what is") || lower.contains("explain") || lower.contains("how does") ||
@@ -730,12 +785,13 @@ public class GeminiAiProvider implements AiProvider {
                 "Synthesize findings into a structured answer"
             ), "Answer contains at least 2 sourced sections");
             case "PRODUCT_COMPARISON" -> new TaskPlan(List.of(
-                "Navigate to the first product URL",
-                "Extract product name, price, and features",
-                "Navigate to the second product URL",
-                "Extract product name, price, and features",
-                "Produce comparison table with sources"
-            ), "All products have extracted data with traceable URLs");
+                "Navigate to a search engine",
+                "Search for the first product or topic",
+                "Extract key data points",
+                "Navigate to compare with second source",
+                "Extract comparison data",
+                "Synthesize into a comparison table with source URLs"
+            ), "All items have extracted data with traceable URLs");
             case "UI_INTERACTION" -> new TaskPlan(List.of(
                 "Navigate to the test fixture",
                 "Locate and fill Step 1 fields",

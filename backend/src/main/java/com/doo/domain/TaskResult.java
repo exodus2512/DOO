@@ -28,6 +28,9 @@ public class TaskResult {
     @Column(name = "summary", columnDefinition = "TEXT")
     private String summary;
 
+    @Column(name = "deliverable_type", length = 64)
+    private String deliverableType;
+
     @Column(name = "verification_passed")
     private Boolean verificationPassed;
 

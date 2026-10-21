@@ -6,6 +6,7 @@ import org.hibernate.annotations.JdbcType;
 import org.hibernate.dialect.PostgreSQLEnumJdbcType;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 @Entity
@@ -40,6 +41,16 @@ public class Task {
 
     @Column(name = "success_criteria", columnDefinition = "TEXT")
     private String successCriteria;
+
+    @Column(name = "goal", columnDefinition = "TEXT")
+    private String goal;
+
+    @Column(name = "deliverable_type", length = 64)
+    private String deliverableType;
+
+    @Convert(converter = JsonConverters.StringListConverter.class)
+    @Column(name = "entities", columnDefinition = "TEXT")
+    private List<String> entities;
 
     @Column(name = "failure_reason", columnDefinition = "TEXT")
     private String failureReason;

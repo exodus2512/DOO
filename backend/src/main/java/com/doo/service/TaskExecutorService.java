@@ -65,7 +65,7 @@ public class TaskExecutorService {
     // Allowed action types (allowlist)
     private static final List<String> ALLOWED_ACTIONS = List.of(
         "NAVIGATE", "CLICK", "FILL", "EXTRACT_TEXT", "SCREENSHOT",
-        "SCROLL", "WAIT", "DONE", "GO_BACK", "SELECT_OPTION", "PRESS_KEY"
+        "SCROLL", "WAIT", "DONE", "GO_BACK", "SELECT_OPTION", "PRESS_KEY", "ASK_USER"
     );
 
     // Actions that are NOT allowed (block harmful actions even if AI suggests them)
@@ -114,7 +114,10 @@ public class TaskExecutorService {
             publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — result: " + classification.workflowType(), Map.of("phase", "CLASSIFY", "result", classification.workflowType())));
             task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
             task.setSuccessCriteria(classification.successCriteria());
-            taskRepository.save(task); // persist workflowType so the UI chip shows immediately
+            task.setGoal(classification.goal());
+            task.setDeliverableType(classification.deliverable());
+            task.setEntities(classification.entities());
+            taskRepository.save(task);
             publishEvent(TaskEvent.taskUpdated(taskId, classification.workflowType()));
 
             publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — generating", Map.of("phase", "PLAN", "keyPool", getKeyPoolState())));
@@ -282,6 +285,69 @@ public class TaskExecutorService {
                     publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
                         "Agent completed all planned steps", step, Map.of()));
                     break;
+                }
+
+                // ASK_USER: pause and show an ask-card built from the AI's field list
+                if ("ASK_USER".equals(decision.actionType())) {
+                    Map<String, Object> askArgs = decision.args() != null ? decision.args() : Map.of();
+                    String askReason = (String) askArgs.getOrDefault("reason", "The agent needs additional information to proceed");
+                    Object fieldsObj = askArgs.get("fields");
+                    List<?> fieldsList = fieldsObj instanceof List<?> l ? l : List.of();
+
+                    Map<String, Object> approvalParams = new HashMap<>();
+                    approvalParams.put("type", "form_input_request");
+                    approvalParams.put("fields", fieldsList);
+                    approvalParams.put("reason", askReason);
+
+                    ApprovalRequest approval = ApprovalRequest.builder()
+                        .taskId(taskId)
+                        .prompt(askReason)
+                        .proposedAction("ASK_USER")
+                        .parameters(approvalParams)
+                        .status("PENDING")
+                        .build();
+                    approval = approvalRepository.save(approval);
+
+                    log.info("Task {} — ASK_USER: {} fields requested", taskId, fieldsList.size());
+                    PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
+                        askReason, "ASK_USER", step, approvalParams);
+                    if (!pauseResult.resumed) {
+                        failTask(task, pauseResult.failureReason());
+                        return;
+                    }
+
+                    // Parse user-provided field values and inject them into subsequent FILL actions
+                    ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+                    if (resolved != null && resolved.getUserResponse() != null) {
+                        try {
+                            @SuppressWarnings("unchecked")
+                            Map<String, String> userValues = new com.fasterxml.jackson.databind.ObjectMapper()
+                                .readValue(resolved.getUserResponse(), Map.class);
+                            // Store values as credential-like hints so the model can reference them
+                            StringBuilder hints = new StringBuilder("\nUser-provided values (use these for FILL):\n");
+                            for (Map.Entry<String, String> entry : userValues.entrySet()) {
+                                hints.append("- ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                            }
+                            credentialHints = (credentialHints != null ? credentialHints : "") + hints;
+                        } catch (Exception e) {
+                            log.warn("Task {} — could not parse ASK_USER response: {}", taskId, e.getMessage());
+                        }
+                    }
+
+                    // Restore observation state from unpark
+                    if (pauseResult.observationId != null) {
+                        lastObservationId = pauseResult.observationId;
+                        lastInteractiveElements = pauseResult.interactiveElements;
+                    }
+                    if (pauseResult.currentUrl != null) currentUrl = pauseResult.currentUrl;
+                    if (pauseResult.pageTitle != null) pageTitle = pauseResult.pageTitle;
+                    if (pauseResult.pageText != null) {
+                        pageText = pauseResult.pageText;
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                        observationEpoch++;
+                    }
+                    recentActions.add("ASK_USER: user provided values for " + fieldsList.size() + " fields");
+                    continue;
                 }
 
                 // No-progress detection: fingerprint = actionType + sorted key args + obsHash
@@ -618,11 +684,12 @@ public class TaskExecutorService {
             updateTaskStatus(task, TaskStatus.VERIFYING, null);
             publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Synthesizing results...", maxSteps, Map.of()));
 
-            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — " + visitedUrls.size() + " URLs, " + textSnippets.size() + " snippets", Map.of("phase", "SYNTHESIZE", "keyPool", getKeyPoolState())));
+            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — " + visitedUrls.size() + " URLs, " + textSnippets.size() + " snippets, deliverable=" + task.getDeliverableType(), Map.of("phase", "SYNTHESIZE", "keyPool", getKeyPoolState())));
             String synthesized = aiProvider.synthesizeResult(
                 new AiProvider.SynthesisRequest(
                     task.getUserRequest(),
                     task.getWorkflowType().name(),
+                    task.getDeliverableType(),
                     visitedUrls,
                     textSnippets,
                     recentActions
@@ -674,6 +741,7 @@ public class TaskExecutorService {
             TaskResult taskResult = TaskResult.builder()
                 .taskId(taskId)
                 .summary(synthesized)
+                .deliverableType(task.getDeliverableType())
                 .verificationPassed(verification.passed())
                 .verificationNotes(verification.notes())
                 .sources(sources)

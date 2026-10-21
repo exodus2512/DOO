@@ -36,6 +36,29 @@ public class JsonConverters {
     }
 
     @Converter(autoApply = false)
+    public static class StringListConverter implements AttributeConverter<List<String>, String> {
+        @Override
+        public String convertToDatabaseColumn(List<String> attribute) {
+            if (attribute == null) return "[]";
+            try {
+                return MAPPER.writeValueAsString(attribute);
+            } catch (JsonProcessingException e) {
+                return "[]";
+            }
+        }
+
+        @Override
+        public List<String> convertToEntityAttribute(String dbData) {
+            if (dbData == null || dbData.isBlank()) return new ArrayList<>();
+            try {
+                return MAPPER.readValue(dbData, new TypeReference<List<String>>() {});
+            } catch (Exception e) {
+                return new ArrayList<>();
+            }
+        }
+    }
+
+    @Converter(autoApply = false)
     public static class SourceRefListConverter implements AttributeConverter<List<TaskResult.SourceRef>, String> {
         @Override
         public String convertToDatabaseColumn(List<TaskResult.SourceRef> attribute) {
