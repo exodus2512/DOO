@@ -288,6 +288,10 @@ public class TaskExecutorService {
                                 authOptions.add(Map.of("value", "email_link", "label", "Enter email address",
                                     "description", "Receive a magic link or verification code."));
                             }
+                            if (authSurface.hasPhoneOtp()) {
+                                authOptions.add(Map.of("value", "phone", "label", "Enter phone number",
+                                    "description", "Receive a verification code via SMS."));
+                            }
                             if (!authSurface.oauthProviders().isEmpty()) {
                                 authOptions.add(Map.of("value", "oauth_note",
                                     "label", "OAuth: " + String.join(", ", authSurface.oauthProviders()),
@@ -335,10 +339,30 @@ public class TaskExecutorService {
                                 handleAuthGateResponse(authResolved.getUserResponse(), authDomain,
                                     taskCredentials, knownValues, authHandledDomains, taskId);
                                 approvalAnswerCache.put(authDedupKey, authResolved.getUserResponse());
-                                // Save storage state so next task on this domain skips login
-                                String domainForSave = extractDomain(authPause.currentUrl() != null
-                                    ? authPause.currentUrl() : currentUrl);
-                                if (domainForSave != null) browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                // Verify login succeeded before saving storage state
+                                boolean loginVerified = false;
+                                for (int loginAttempt = 0; loginAttempt < 3; loginAttempt++) {
+                                    List<Map<String, Object>> verifyEls = authPause.interactiveElements() != null
+                                        ? authPause.interactiveElements() : lastInteractiveElements;
+                                    String verifyText = authPause.pageText() != null ? authPause.pageText() : pageText;
+                                    String verifyUrl = authPause.currentUrl() != null ? authPause.currentUrl() : currentUrl;
+                                    if (verifyLoggedIn(verifyEls, verifyText, verifyUrl, authSurface)) {
+                                        loginVerified = true;
+                                        log.info("Task {} — AUTH GATE: login verified for {} (attempt {})", taskId, authDomain, loginAttempt + 1);
+                                        String domainForSave = extractDomain(verifyUrl);
+                                        if (domainForSave != null) browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                        break;
+                                    }
+                                    if (loginAttempt < 2) {
+                                        try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                                    }
+                                }
+                                if (!loginVerified) {
+                                    log.warn("Task {} — AUTH GATE: login not verified after 3 attempts for {}", taskId, authDomain);
+                                    authHandledDomains.remove(authDomain);
+                                    approvalAnswerCache.remove(authDedupKey);
+                                    recentActions.add("AUTH_GATE: login verification failed — will retry");
+                                }
                             } else {
                                 authHandledDomains.add(authDomain);
                             }
@@ -1403,6 +1427,37 @@ public class TaskExecutorService {
         } catch (Exception e) {
             log.warn("Task {} — AUTH GATE: could not parse auth response: {}", taskId, e.getMessage());
         }
+    }
+
+    /**
+     * Check whether the auth surface is gone and at least one logged-in marker is present.
+     * Returns true when we're confident the user is authenticated.
+     */
+    private static boolean verifyLoggedIn(
+            List<Map<String, Object>> elements, String pageText, String url, AuthSurface authSurface) {
+        if (elements == null) return false;
+        AuthSurface current = detectAuthSurface(elements, pageText, url);
+        if (current.isAuthPage()) return false; // still on an auth page
+
+        final java.util.regex.Pattern LOGGED_IN_MARKERS = java.util.regex.Pattern.compile(
+            "(?i)\\b(sign\\s*out|log\\s*out|logout|my\\s+account|my\\s+profile|profile|dashboard|settings|account\\s+settings|avatar|notifications\\s+for|welcome|hello)\\b"
+        );
+        for (Map<String, Object> el : elements) {
+            String combined = el.getOrDefault("label", "") + " "
+                + el.getOrDefault("text", "") + " "
+                + (el.get("href") != null ? el.get("href") : "");
+            if (LOGGED_IN_MARKERS.matcher(combined).find()) return true;
+        }
+        if (pageText != null && LOGGED_IN_MARKERS.matcher(
+                pageText.substring(0, Math.min(1000, pageText.length()))).find()) {
+            return true;
+        }
+        // URL left the typical auth path — treat as likely success
+        if (url != null && !url.toLowerCase().matches(
+                ".*/(login|signin|sign-in|auth|account/login|user/login).*")) {
+            return true;
+        }
+        return false;
     }
 
     // ─── Confirmation signal patterns ─────────────────────────────────────────────
