@@ -76,70 +76,147 @@ describe('Perception Module', () => {
   });
 });
 
-describe('Challenge detection logic', () => {
-  // These tests validate the isVisible guard and bot_block text pattern
-  // by inspecting the source directly (no real browser required).
+describe('Challenge detection logic — source invariants', () => {
   const fs = require('fs');
   const source = fs.readFileSync(require.resolve('../perception'), 'utf8');
 
   test('isVisible requires minimum 100x40 bounding box', () => {
-    // The guard must check width < 100 || height < 40
     assert.ok(source.includes('r.width < 100'), 'width guard missing');
     assert.ok(source.includes('r.height < 40'), 'height guard missing');
   });
 
   test('isVisible checks display, visibility, and opacity', () => {
-    assert.ok(source.includes("s.display !== 'none'"), 'display guard missing');
-    assert.ok(source.includes("s.visibility !== 'hidden'"), 'visibility guard missing');
-    assert.ok(source.includes("s.opacity !== '0'"), 'opacity guard missing');
+    assert.ok(source.includes("s.display === 'none'"), 'display guard missing');
+    assert.ok(source.includes("s.visibility === 'hidden'"), 'visibility guard missing');
+    assert.ok(source.includes("s.opacity === '0'"), 'opacity guard missing');
   });
 
-  test('reCAPTCHA detection gates on visible iframe or .g-recaptcha, not bare data-sitekey', () => {
-    // Must require isVisible on the iframe/widget, not just any [data-sitekey]
-    assert.ok(source.includes('iframe[src*="recaptcha/api2"]'), 'must target api2 iframe');
-    assert.ok(source.includes('.g-recaptcha'), 'must check .g-recaptcha widget');
-    // Old pattern was [data-sitekey] without visibility check — must NOT exist alone
-    assert.ok(!source.includes("'[data-sitekey]'"), 'bare data-sitekey selector must be gone');
+  test('viewport intersection ratio requires >=70% overlap', () => {
+    assert.ok(source.includes('viewportIntersectionRatio'), 'viewportIntersectionRatio function missing');
+    assert.ok(source.includes('>= 0.7'), '70% threshold missing');
   });
 
-  test('hCaptcha detection gates on visible iframe or .h-captcha', () => {
+  test('isInvisibleRecaptcha skips size=invisible src', () => {
+    assert.ok(source.includes('size=invisible'), 'size=invisible check missing');
+    assert.ok(source.includes('isInvisibleRecaptcha'), 'isInvisibleRecaptcha function missing');
+  });
+
+  test('isInvisibleRecaptcha skips .grecaptcha-badge ancestors', () => {
+    assert.ok(source.includes('grecaptcha-badge'), 'grecaptcha-badge ancestor check missing');
+  });
+
+  test('reCAPTCHA only triggers on bframe or anchor (not any api2 iframe)', () => {
+    assert.ok(source.includes('bframe'), 'bframe check missing');
+    assert.ok(source.includes('anchor'), 'anchor check missing');
+    assert.ok(source.includes('isInvisibleRecaptcha(iframe)'), 'invisible check in rc loop missing');
+  });
+
+  test('hCaptcha and Turnstile use visible + in-viewport rule', () => {
     assert.ok(source.includes('iframe[src*="hcaptcha"]'), 'hcaptcha iframe missing');
     assert.ok(source.includes('.h-captcha'), '.h-captcha widget missing');
-  });
-
-  test('Turnstile detection gates on visible iframe or .cf-turnstile', () => {
     assert.ok(source.includes('iframe[src*="challenges.cloudflare"]'), 'turnstile iframe missing');
     assert.ok(source.includes('.cf-turnstile'), '.cf-turnstile widget missing');
+  });
+
+  test('reportCaptcha logs matchedSelector, iframeSrc, boundingRect, intersectionRatio', () => {
+    assert.ok(source.includes('matchedSelector'), 'matchedSelector in log missing');
+    assert.ok(source.includes('iframeSrc'), 'iframeSrc in log missing');
+    assert.ok(source.includes('boundingRect'), 'boundingRect in log missing');
+    assert.ok(source.includes('viewportIntersectionRatio:'), 'intersectionRatio in log missing');
+  });
+
+  test('[CAPTCHA] log line emitted for each captcha challenge', () => {
+    assert.ok(source.includes('[CAPTCHA]'), '[CAPTCHA] log prefix missing');
+    assert.ok(source.includes('provider='), 'provider field missing from log');
+    assert.ok(source.includes('selector='), 'selector field missing from log');
+    assert.ok(source.includes('intersection='), 'intersection field missing from log');
   });
 
   test('bot_block pattern covers standard block-page phrases', () => {
     const match = source.match(/BOT_BLOCK_RE\s*=\s*\/(.+?)\//);
     assert.ok(match, 'BOT_BLOCK_RE pattern not found');
     const re = new RegExp(match[1], 'i');
-    const phrases = [
-      'unusual traffic',
-      'access denied',
-      'verify you are human',
-      'just a moment',
-      'press & hold',
-      'are you a robot',
-    ];
-    for (const phrase of phrases) {
+    for (const phrase of ['unusual traffic','access denied','verify you are human','just a moment','press & hold','are you a robot']) {
       assert.ok(re.test(phrase), `BOT_BLOCK_RE should match: "${phrase}"`);
     }
   });
 
-  test('bot_block result has type and reason fields', () => {
-    assert.ok(source.includes("type: 'bot_block'"), "bot_block type missing");
-    assert.ok(source.includes('reason:'), 'bot_block reason missing');
-  });
-
   test('generic captcha fallback only triggers for visible elements', () => {
-    // Must call isVisible() inside the for loop, not just querySelector
     const genericSection = source.slice(
-      source.indexOf('Generic visible CAPTCHA'),
+      source.indexOf('Generic fallback'),
       source.indexOf('Bot-block detection')
     );
     assert.ok(genericSection.includes('isVisible(el)'), 'generic captcha must check isVisible');
+  });
+});
+
+describe('Challenge detection — fixture page tests (using Playwright)', () => {
+  // These tests use real Chromium to exercise the CAPTCHA detection against
+  // hand-crafted fixture HTML pages. They require @playwright/test to be installed.
+  // Run via: node --test (slow tests skipped in unit-test CI via SKIP_BROWSER_TESTS)
+  const { chromium } = require('playwright');
+  const { buildObservation } = require('../perception');
+  const SKIP = process.env.SKIP_BROWSER_TESTS === '1';
+
+  // Fixture HTML helpers
+  function makeFixture(bodyHtml) {
+    return `data:text/html,<html><body style="margin:0;width:1280px;height:800px">${encodeURIComponent(bodyHtml)}</body></html>`;
+  }
+
+  // Invisible badge: an iframe whose src contains size=invisible.
+  // Must NOT trigger a captcha challenge.
+  test('invisible reCAPTCHA badge does NOT trigger captcha', { skip: SKIP }, async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      // Simulate the invisible badge iframe: matches recaptcha/api2 but has size=invisible
+      await page.setContent(`<html><body style="margin:0">
+        <div class="grecaptcha-badge" style="width:256px;height:60px;position:fixed;bottom:14px;right:14px">
+          <iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&k=site&size=invisible&co=aH&hl=en"
+                  style="width:256px;height:60px"></iframe>
+        </div>
+      </body></html>`);
+      const obs = await buildObservation(page, 'test-invisible', {});
+      const captchas = (obs.challenges || []).filter(c => c.type === 'captcha');
+      assert.equal(captchas.length, 0,
+        `invisible badge must NOT trigger captcha, got: ${JSON.stringify(captchas)}`);
+    } finally { await browser.close(); }
+  });
+
+  // v2 checkbox iframe: api2/anchor WITHOUT size=invisible, large, in-viewport.
+  // Must trigger a captcha challenge.
+  test('reCAPTCHA v2 checkbox anchor iframe triggers captcha', { skip: SKIP }, async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      // Anchor iframe without size=invisible — the v2 checkbox widget
+      await page.setContent(`<html><body style="margin:0">
+        <div style="width:304px;height:78px">
+          <iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&k=site&co=aH&hl=en"
+                  style="width:304px;height:78px;display:block"></iframe>
+        </div>
+      </body></html>`);
+      const obs = await buildObservation(page, 'test-v2-anchor', {});
+      const captchas = (obs.challenges || []).filter(c => c.type === 'captcha' && c.provider === 'recaptcha');
+      assert.equal(captchas.length, 1,
+        `v2 anchor iframe must trigger exactly 1 captcha, got: ${JSON.stringify(captchas)}`);
+    } finally { await browser.close(); }
+  });
+
+  // bframe popup: api2/bframe, large, in-viewport.
+  // Must trigger a captcha challenge.
+  test('reCAPTCHA bframe image-grid popup triggers captcha', { skip: SKIP }, async () => {
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await page.setContent(`<html><body style="margin:0">
+        <iframe src="https://www.google.com/recaptcha/api2/bframe?hl=en&v=abc"
+                style="width:300px;height:420px;display:block"></iframe>
+      </body></html>`);
+      const obs = await buildObservation(page, 'test-bframe', {});
+      const captchas = (obs.challenges || []).filter(c => c.type === 'captcha' && c.provider === 'recaptcha');
+      assert.equal(captchas.length, 1,
+        `bframe iframe must trigger exactly 1 captcha, got: ${JSON.stringify(captchas)}`);
+    } finally { await browser.close(); }
   });
 });

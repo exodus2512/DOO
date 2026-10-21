@@ -225,60 +225,142 @@ async function buildObservation(page, taskId, options = {}) {
   try {
     challenges = await page.evaluate(() => {
       const found = [];
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
 
       /**
-       * Check whether an element is user-visible: has a bounding box of at
-       * least 100×40 px and is not hidden by CSS. Ignores invisible reCAPTCHA
-       * v3 badges and bare [data-sitekey] containers without a visible widget.
+       * Compute what fraction (0–1) of the element's bounding box is inside
+       * the current viewport. Requires at least 70% overlap to count.
+       */
+      function viewportIntersectionRatio(r) {
+        const ix = Math.max(0, Math.min(r.right, vw) - Math.max(r.left, 0));
+        const iy = Math.max(0, Math.min(r.bottom, vh) - Math.max(r.top, 0));
+        const area = r.width * r.height;
+        return area > 0 ? (ix * iy) / area : 0;
+      }
+
+      /**
+       * Check whether an element is user-visible:
+       *   - bounding box ≥ 100×40 px
+       *   - not hidden by CSS (display/visibility/opacity)
+       *   - ≥ 70 % of its area is inside the viewport
        */
       function isVisible(el) {
         const r = el.getBoundingClientRect();
         if (r.width < 100 || r.height < 40) return false;
         const s = window.getComputedStyle(el);
-        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+        if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+        return viewportIntersectionRatio(r) >= 0.7;
       }
 
-      // reCAPTCHA v2: require a visible iframe or visible .g-recaptcha container.
-      // reCAPTCHA v3 only has an invisible badge — skip it (no user interaction needed).
-      const rcIframe = document.querySelector('iframe[src*="recaptcha/api2"]');
-      const rcWidget = document.querySelector('.g-recaptcha');
-      if ((rcIframe && isVisible(rcIframe)) || (rcWidget && isVisible(rcWidget))) {
-        found.push({ type: 'captcha', provider: 'recaptcha' });
+      /**
+       * Return true if a recaptcha iframe should be skipped:
+       *   - src contains "size=invisible" (v3 / invisible badge)
+       *   - any ancestor has class "grecaptcha-badge" (the floating badge)
+       */
+      function isInvisibleRecaptcha(iframe) {
+        const src = iframe.src || '';
+        if (src.includes('size=invisible')) return true;
+        let el = iframe.parentElement;
+        while (el) {
+          if (el.classList && el.classList.contains('grecaptcha-badge')) return true;
+          el = el.parentElement;
+        }
+        return false;
       }
 
-      // hCaptcha
-      const hcIframe = document.querySelector('iframe[src*="hcaptcha"]');
-      const hcWidget = document.querySelector('.h-captcha');
-      if ((hcIframe && isVisible(hcIframe)) || (hcWidget && isVisible(hcWidget))) {
-        found.push({ type: 'captcha', provider: 'hcaptcha' });
+      /** Strip query string from a URL for logging. */
+      function stripQuery(url) {
+        try { return url.split('?')[0]; } catch { return url; }
       }
 
-      // Cloudflare Turnstile
-      const cfIframe = document.querySelector('iframe[src*="challenges.cloudflare"]');
-      const cfWidget = document.querySelector('.cf-turnstile');
-      if ((cfIframe && isVisible(cfIframe)) || (cfWidget && isVisible(cfWidget))) {
-        found.push({ type: 'captcha', provider: 'turnstile' });
+      /** Push a captcha entry and build a compact log record. */
+      function reportCaptcha(provider, matchedSelector, el) {
+        const r = el.getBoundingClientRect();
+        const ratio = Math.round(viewportIntersectionRatio(r) * 100) / 100;
+        const src = stripQuery(el.src || el.getAttribute('src') || '');
+        found.push({
+          type: 'captcha',
+          provider,
+          _log: {
+            matchedSelector,
+            iframeSrc: src,
+            boundingRect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) },
+            viewportIntersectionRatio: ratio,
+          },
+        });
       }
 
-      // Generic visible CAPTCHA containers (fallback, not invisible badge)
-      if (!found.length) {
+      // ── reCAPTCHA ────────────────────────────────────────────────────────────
+      // Count only:
+      //   (a) api2/bframe  — the image-grid challenge popup
+      //   (b) api2/anchor  — the v2 checkbox, but NOT when size=invisible
+      // Never count v3 invisible badges.
+      let rcReported = false;
+      for (const iframe of document.querySelectorAll('iframe[src*="recaptcha/api2"]')) {
+        if (isInvisibleRecaptcha(iframe)) continue;
+        const src = iframe.src || '';
+        const isBframe = src.includes('bframe');
+        const isAnchor = src.includes('anchor') && !src.includes('size=invisible');
+        if ((isBframe || isAnchor) && isVisible(iframe)) {
+          reportCaptcha('recaptcha', isBframe ? 'iframe[src*="bframe"]' : 'iframe[src*="anchor"]', iframe);
+          rcReported = true;
+          break;
+        }
+      }
+      // Fallback: visible .g-recaptcha container (no invisible ancestor)
+      if (!rcReported) {
+        const rcWidget = document.querySelector('.g-recaptcha');
+        if (rcWidget && isVisible(rcWidget) && !rcWidget.closest('.grecaptcha-badge')) {
+          reportCaptcha('recaptcha', '.g-recaptcha', rcWidget);
+        }
+      }
+
+      // ── hCaptcha ─────────────────────────────────────────────────────────────
+      for (const iframe of document.querySelectorAll('iframe[src*="hcaptcha"]')) {
+        if (isVisible(iframe)) {
+          reportCaptcha('hcaptcha', 'iframe[src*="hcaptcha"]', iframe);
+          break;
+        }
+      }
+      if (!found.some(f => f.provider === 'hcaptcha')) {
+        const hcWidget = document.querySelector('.h-captcha');
+        if (hcWidget && isVisible(hcWidget)) reportCaptcha('hcaptcha', '.h-captcha', hcWidget);
+      }
+
+      // ── Cloudflare Turnstile ──────────────────────────────────────────────────
+      for (const iframe of document.querySelectorAll('iframe[src*="challenges.cloudflare"]')) {
+        if (isVisible(iframe)) {
+          reportCaptcha('turnstile', 'iframe[src*="challenges.cloudflare"]', iframe);
+          break;
+        }
+      }
+      if (!found.some(f => f.provider === 'turnstile')) {
+        const cfWidget = document.querySelector('.cf-turnstile');
+        if (cfWidget && isVisible(cfWidget)) reportCaptcha('turnstile', '.cf-turnstile', cfWidget);
+      }
+
+      // ── Generic fallback (visible, in-viewport) ───────────────────────────────
+      if (!found.some(f => f.type === 'captcha')) {
         const captchaEls = document.querySelectorAll('[class*="captcha" i], [id*="captcha" i], [data-captcha]');
         for (const el of captchaEls) {
+          // Skip elements that are part of the invisible reCAPTCHA badge
+          if (el.closest('.grecaptcha-badge')) continue;
           if (isVisible(el)) {
-            found.push({ type: 'captcha', provider: 'unknown' });
+            reportCaptcha('unknown', '[captcha]', el);
             break;
           }
         }
       }
 
-      // Bot-block detection: page-level access denial or challenge walls
+      // ── Bot-block detection ───────────────────────────────────────────────────
       const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
       const BOT_BLOCK_RE = /unusual traffic|access denied|verify you are human|just a moment|press & hold|are you a robot/i;
       if (BOT_BLOCK_RE.test(bodyText.substring(0, 3000))) {
         found.push({ type: 'bot_block', reason: 'visible block text detected' });
       }
 
-      // OTP / 2FA input patterns
+      // ── OTP / 2FA inputs ──────────────────────────────────────────────────────
       const inputs = document.querySelectorAll('input');
       for (const inp of inputs) {
         const attrs = (inp.name + ' ' + inp.id + ' ' + inp.placeholder + ' ' + (inp.getAttribute('aria-label') || '')).toLowerCase();
@@ -294,17 +376,18 @@ async function buildObservation(page, taskId, options = {}) {
     });
   } catch { /* continue without challenge detection */ }
 
-  // Supplement bot_block detection from HTTP status code where available
-  try {
-    const status = page.url() ? await page.evaluate(() => {
-      // performance.getEntriesByType gives us the navigation timing with status
-      const nav = performance.getEntriesByType('navigation')[0];
-      return nav ? null : null; // status not directly accessible via JS
-    }) : null;
-    // Playwright doesn't expose HTTP status in page.evaluate; we rely on the
-    // visible-text detection above for bot_block. The caller (server.js) can
-    // supplement with the response status from page.on('response').
-  } catch { /* ignore */ }
+  // Log each reported captcha challenge (one line per entry)
+  for (const c of challenges) {
+    if (c.type === 'captcha' && c._log) {
+      const l = c._log;
+      console.log(
+        `[CAPTCHA] provider=${c.provider} selector="${l.matchedSelector}"` +
+        ` src="${l.iframeSrc}"` +
+        ` rect=${JSON.stringify(l.boundingRect)}` +
+        ` intersection=${l.viewportIntersectionRatio}`
+      );
+    }
+  }
 
   // Scroll position and page dimensions — lets the AI decide whether to scroll for more content
   let scrollInfo = { scrollY: 0, pageHeight: 0, viewportHeight: 0 };
