@@ -2081,22 +2081,15 @@ public class TaskExecutorService {
      */
     private boolean meetsSuccessCriteria(String workflowType, String successCriteria,
             String pageText, String currentUrl, List<String> textSnippets) {
-        // Research tasks: done when enough distinct content is collected
+        // Research/comparison tasks: done when sufficient distinct content collected (no confirmation page)
         if ("WEB_RESEARCH".equals(workflowType) || "PRODUCT_COMPARISON".equals(workflowType)) {
-            return textSnippets.size() >= 2 && textSnippets.stream().anyMatch(s -> s.length() > 200);
+            return textSnippets.size() >= 3 && textSnippets.stream().filter(s -> s.length() > 200).count() >= 2;
         }
-        // UI tasks: check planned success criteria keyword matches
-        if (successCriteria != null && !successCriteria.isBlank()) {
-            String combined = (pageText != null ? pageText : "") + " " + (currentUrl != null ? currentUrl : "");
-            String[] words = successCriteria.toLowerCase().split("\\W+");
-            long matches = java.util.Arrays.stream(words)
-                .filter(w -> w.length() > 4)
-                .filter(w -> combined.toLowerCase().contains(w))
-                .count();
-            if (matches >= 2) return true;
-        }
-        // Generic confirmation signals
-        return pageText != null && CONFIRMATION_SIGNAL_PATTERN.matcher(pageText).find();
+        // UI_INTERACTION: only trigger on generic confirmation signals (thank you, order confirmed, etc.).
+        // Do NOT use keyword-matching against success criteria — inventory/product pages share many words
+        // (order, shirt, checkout) with the success criteria but are not completion pages.
+        if (pageText != null && CONFIRMATION_SIGNAL_PATTERN.matcher(pageText).find()) return true;
+        return false;
     }
 
     private String getKeyPoolState() {
