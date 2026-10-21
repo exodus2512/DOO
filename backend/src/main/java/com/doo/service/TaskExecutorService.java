@@ -41,6 +41,7 @@ public class TaskExecutorService {
     private final BrowserWorkerClient browserWorkerClient;
     private final TaskEventPublisher eventPublisher;
     private final UrlValidator urlValidator;
+    private final CredentialVaultService credentialVaultService;
 
     @Value("${doo.task.max-steps:30}")
     private int maxSteps;
@@ -176,14 +177,17 @@ public class TaskExecutorService {
             }
 
             // ── Credential gate: detect login steps and resolve credentials ──
-            Map<String, String> taskCredentials = new HashMap<>(); // domain -> credentials resolved for this run
+            // domain -> "username\npassword" (actual values for worker fill, never sent to LLM)
+            Map<String, String> taskCredentials = new HashMap<>();
+            // Credential hints for the AI prompt — placeholders, never actual passwords
+            String credentialHints = null;
             if (wfType.requiresBrowser()) {
                 CredentialGateResult credResult = checkCredentialGate(task, plan.steps(), sessionId);
                 if (credResult.needsPause && !credResult.resolved) {
-                    // Failed to get credentials — task was already failed inside checkCredentialGate
                     return;
                 }
                 taskCredentials.putAll(credResult.credentials);
+                credentialHints = buildCredentialHints(taskCredentials);
             }
 
             // ── Browser path: WEB_RESEARCH, PRODUCT_COMPARISON, UI_INTERACTION ──
@@ -250,7 +254,8 @@ public class TaskExecutorService {
                         ALLOWED_ACTIONS,
                         task.getWorkflowType().name(),
                         lastObservationId,
-                        lastInteractiveElements
+                        lastInteractiveElements,
+                        credentialHints
                     )
                 );
                 aiCallCount++;
@@ -372,6 +377,23 @@ public class TaskExecutorService {
                 if (isCancelled(taskId)) {
                     log.info("Task {} cancelled before action execution at step {}", taskId, step);
                     break;
+                }
+
+                // Resolve credential placeholders in FILL values before sending to worker.
+                // The model uses __cred_username:domain__ / __cred_password:domain__ placeholders;
+                // actual passwords never enter the LLM prompt.
+                if ("FILL".equals(decision.actionType()) && decision.args() != null) {
+                    Object fillValue = decision.args().get("value");
+                    if (fillValue instanceof String sv) {
+                        String resolved = resolveCredentialPlaceholder(sv, taskCredentials);
+                        if (!sv.equals(resolved)) {
+                            Map<String, Object> patchedArgs = new HashMap<>(decision.args());
+                            patchedArgs.put("value", resolved);
+                            decision = new AiProvider.ActionDecision(
+                                decision.actionType(), patchedArgs, decision.rationale(),
+                                decision.requiresApproval(), decision.approvalReason());
+                        }
+                    }
                 }
 
                 // Attach structured observation to element-index actions so the worker
@@ -891,7 +913,22 @@ public class TaskExecutorService {
         // 2. Try to extract a target domain from the user request
         String targetDomain = extractDomain(userRequest);
 
-        // 3. Check if credentials are embedded in the user request
+        // 3. Check the vault for stored credentials
+        if (targetDomain != null && credentialVaultService.hasDomain(targetDomain)) {
+            log.info("Task {} — vault has credentials for domain={}, skipping approval", taskId, targetDomain);
+            publishEvent(TaskEvent.debug(taskId, "Using vault credentials for " + targetDomain,
+                Map.of("domain", targetDomain)));
+            // Resolve vault credentials — the actual password stays in the vault service,
+            // we just pass a reference that the worker will resolve at fill time
+            var resolved = credentialVaultService.resolve(targetDomain);
+            if (resolved.isPresent()) {
+                Map<String, String> creds = new HashMap<>();
+                creds.put(targetDomain, resolved.get().username() + "\n" + resolved.get().password());
+                return new CredentialGateResult(true, true, creds);
+            }
+        }
+
+        // 4. Check if credentials are embedded in the user request
         Map<String, String> extractedCreds = extractCredentialsFromInstruction(userRequest);
         if (!extractedCreds.isEmpty()) {
             log.info("Task {} — credentials found in instruction for domain(s): {}", taskId, extractedCreds.keySet());
@@ -900,7 +937,7 @@ public class TaskExecutorService {
             return new CredentialGateResult(true, true, extractedCreds);
         }
 
-        // 4. No credentials in instruction — pause and ask the user
+        // 5. No credentials in instruction or vault — pause and ask the user
         log.info("Task {} — no credentials in instruction, pausing for user", taskId);
 
         String domain = targetDomain != null ? targetDomain : "unknown site";
@@ -1019,9 +1056,7 @@ public class TaskExecutorService {
     private Map<String, String> parseCredentialResponse(ApprovalRequest approval, String domain) {
         Map<String, String> creds = new HashMap<>();
         String response = approval.getUserResponse();
-        Map<String, Object> params = approval.getParameters();
 
-        // The frontend sends credentials as JSON in userResponse
         if (response != null && !response.isBlank()) {
             try {
                 @SuppressWarnings("unchecked")
@@ -1029,10 +1064,20 @@ public class TaskExecutorService {
                     .readValue(response, Map.class);
                 String username = (String) parsed.getOrDefault("username", "");
                 String password = (String) parsed.getOrDefault("password", "");
+                boolean saveToVault = Boolean.TRUE.equals(parsed.get("saveToVault"));
+
                 if (!username.isBlank() && !password.isBlank()) {
                     creds.put(domain, username + "\n" + password);
+
+                    if (saveToVault) {
+                        try {
+                            credentialVaultService.upsert(domain, username, password);
+                            log.info("Credentials saved to vault for domain={}", domain);
+                        } catch (Exception e) {
+                            log.warn("Failed to save credentials to vault for domain={}: {}", domain, e.getMessage());
+                        }
+                    }
                 }
-                // Note: "saveToVault" is handled by PIECE 2
             } catch (Exception e) {
                 log.warn("Could not parse credential response: {}", e.getMessage());
             }
@@ -1105,6 +1150,50 @@ public class TaskExecutorService {
         } catch (Exception e) {
             log.debug("Event publish failed: {}", e.getMessage());
         }
+    }
+
+    // ─── Credential placeholder system ─────────────────────────────────────────
+    // The model never sees actual passwords. Instead, it gets placeholders like
+    // __cred_username:saucedemo.com__ and __cred_password:saucedemo.com__.
+    // These are resolved to actual values here, just before dispatching to the worker.
+
+    private static final java.util.regex.Pattern CRED_PLACEHOLDER = java.util.regex.Pattern.compile(
+        "__cred_(username|password):([^_]+)__"
+    );
+
+    private String buildCredentialHints(Map<String, String> taskCredentials) {
+        if (taskCredentials.isEmpty()) return null;
+        StringBuilder sb = new StringBuilder();
+        sb.append("\nCREDENTIALS AVAILABLE (use these exact placeholder values in FILL actions):\n");
+        for (Map.Entry<String, String> entry : taskCredentials.entrySet()) {
+            String domain = entry.getKey();
+            String[] parts = entry.getValue().split("\n", 2);
+            String username = parts.length > 0 ? parts[0] : "";
+            sb.append("  Domain: ").append(domain).append("\n");
+            sb.append("    Username field → FILL value: \"").append(username).append("\"\n");
+            sb.append("    Password field → FILL value: \"__cred_password:").append(domain).append("__\"\n");
+        }
+        sb.append("IMPORTANT: Use the exact placeholder string for password fields. Never guess or invent passwords.\n");
+        return sb.toString();
+    }
+
+    private String resolveCredentialPlaceholder(String value, Map<String, String> taskCredentials) {
+        java.util.regex.Matcher m = CRED_PLACEHOLDER.matcher(value);
+        if (!m.matches()) return value;
+        String field = m.group(1);
+        String domain = m.group(2);
+        String creds = taskCredentials.get(domain);
+        if (creds == null) {
+            log.warn("No credentials for domain={} to resolve placeholder", domain);
+            return value;
+        }
+        String[] parts = creds.split("\n", 2);
+        if ("username".equals(field)) {
+            return parts.length > 0 ? parts[0] : value;
+        } else if ("password".equals(field)) {
+            return parts.length > 1 ? parts[1] : value;
+        }
+        return value;
     }
 
     private String getKeyPoolState() {

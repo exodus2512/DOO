@@ -116,7 +116,10 @@ app.post('/action/execute', async (req, res) => {
   }
 
   const safeArgs = args ? { ...args } : {};
-  delete safeArgs._observation; // don't log the large observation blob
+  delete safeArgs._observation;
+  if (safeArgs.value && actionType === 'FILL') {
+    safeArgs.value = safeArgs.value.length > 0 ? '[REDACTED]' : '';
+  }
   console.log(`[/action/execute] Task ${taskId} | ${actionType} | args: ${JSON.stringify(safeArgs).substring(0, 200)}`);
 
   try {

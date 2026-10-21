@@ -193,4 +193,21 @@ export const api = {
   streamUrl: (id: string) => {
     return `${API_BASE}/api/tasks/${id}/stream`;
   },
+
+  // ─── Credential Vault (passwords never returned) ──────────────────────────
+  vault: {
+    listDomains: () =>
+      request<{ domain: string; username: string; createdAt: string }[]>('/api/vault'),
+
+    upsert: (domain: string, username: string, password: string) =>
+      request<{ status: string; domain: string }>('/api/vault', {
+        method: 'POST',
+        body: JSON.stringify({ domain, username, password }),
+      }),
+
+    delete: (domain: string) =>
+      request<{ deleted: boolean; domain: string }>(`/api/vault/${encodeURIComponent(domain)}`, {
+        method: 'DELETE',
+      }),
+  },
 };

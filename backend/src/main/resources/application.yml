@@ -46,6 +46,8 @@ doo:
     url: ${BROWSER_WORKER_URL:http://localhost:3001}
     secret: ${BROWSER_WORKER_SECRET:dev-secret-change-in-production}
     timeout-seconds: ${BROWSER_WORKER_TIMEOUT:120}
+  vault:
+    secret: ${VAULT_SECRET:default-vault-secret-change-in-production}
   task:
     max-steps: ${TASK_MAX_STEPS:30}
     max-retries: ${TASK_MAX_RETRIES:3}

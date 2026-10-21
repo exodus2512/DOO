@@ -66,7 +66,9 @@ public interface AiProvider {
         String workflowType,
         // Structured perception (null when no observation available yet)
         String observationId,
-        List<java.util.Map<String, Object>> interactiveElements
+        List<java.util.Map<String, Object>> interactiveElements,
+        // Credential hints for vault/gate — placeholders, never actual passwords
+        String credentialHints
     ) {
         // Backward-compat constructor for tests that don't have observation data
         public ActionSelectionRequest(
@@ -75,7 +77,7 @@ public interface AiProvider {
             List<String> recentActions, List<String> allowedActionTypes, String workflowType) {
             this(userRequest, currentPlan, currentStep, planSteps, currentUrl, pageTitle,
                  pageText, accessibilityTree, recentActions, allowedActionTypes, workflowType,
-                 null, null);
+                 null, null, null);
         }
     }
 

@@ -230,6 +230,8 @@ public class GeminiAiProvider implements AiProvider {
             ? "\nobservation_id (REQUIRED in args for CLICK/FILL/SELECT_OPTION/PRESS_KEY): \"" + request.observationId() + "\""
             : "";
 
+        String credBlock = request.credentialHints() != null ? request.credentialHints() : "";
+
         String prompt = """
             You are DOO, an AI browser agent selecting the next browser action.
 
@@ -286,11 +288,12 @@ public class GeminiAiProvider implements AiProvider {
             - On forms with multiple inputs (e.g. username and password), DO NOT press Enter after filling just one field. FILL all required fields before submitting.
             - For single-field search inputs (type=search or a lone input on the page), follow FILL with PRESS_KEY Enter.
             - If a previous action returned RESOLVE_FAILED, look at the fresh Interactive elements list and pick from the current valid indices.
-            - When logging into a site with credentials provided in the request, FILL the username and password fields, then CLICK the login/submit button.
+            - When logging into a site, FILL the username and password fields using the credential placeholders below, then CLICK the login/submit button.
             - Use EXTRACT_TEXT as soon as useful content is visible.
             - You MUST use EXTRACT_TEXT at least once before DONE.
             - Never navigate to file:// URLs or private IPs.
             - Never click purchase/buy/subscribe buttons without explicit confirmation.
+            %s
             """.formatted(
                 request.userRequest(),
                 request.currentStep(),
@@ -300,7 +303,8 @@ public class GeminiAiProvider implements AiProvider {
                 request.pageTitle(),
                 pageStateBlock,
                 String.join(", ", request.recentActions().stream().limit(5).toList()),
-                obsIdLine
+                obsIdLine,
+                credBlock
             );
 
         String taskLabel = truncate(request.userRequest(), 60);

@@ -33,12 +33,15 @@ async function buildObservation(page, taskId, options = {}) {
   const pageTitle = await page.title().catch(() => '');
 
   // Extract page text (excluding scripts, styles, nav, footer)
+  // Password field values are excluded by masking type=password inputs in the clone
   let pageTextResult;
   try {
     pageTextResult = await page.evaluate((maxLen) => {
       const clone = document.cloneNode(true);
       const toRemove = clone.querySelectorAll('script, style, noscript, nav, header, footer, svg, [role="navigation"], [role="banner"], [aria-hidden="true"]');
       toRemove.forEach(el => el.remove());
+      // Mask password field values in text extraction
+      clone.querySelectorAll('input[type="password"]').forEach(el => { el.value = ''; });
       const raw = (clone.body || clone).innerText || '';
       const text = raw.substring(0, maxLen);
       return { text, truncated: raw.length > maxLen };
@@ -171,10 +174,18 @@ async function buildObservation(page, taskId, options = {}) {
     // If element extraction fails, continue with empty list
   }
 
-  // Screenshot if requested
+  // Screenshot if requested — mask password fields before capture
   let screenshotData = null;
   if (includeScreenshot) {
     try {
+      // Inject a temporary overlay to mask password field contents
+      await page.evaluate(() => {
+        const style = document.createElement('style');
+        style.id = '__doo_pwd_mask';
+        style.textContent = 'input[type="password"] { -webkit-text-security: disc !important; color: transparent !important; text-shadow: 0 0 0 #000 !important; }';
+        document.head.appendChild(style);
+      }).catch(() => {});
+
       const buffer = await page.screenshot({
         type: 'jpeg',
         quality: 60,
@@ -185,6 +196,12 @@ async function buildObservation(page, taskId, options = {}) {
         base64: buffer.toString('base64'),
         mime_type: 'image/jpeg',
       };
+
+      // Remove the temporary mask style
+      await page.evaluate(() => {
+        const s = document.getElementById('__doo_pwd_mask');
+        if (s) s.remove();
+      }).catch(() => {});
     } catch {
       screenshotData = { available: false };
     }
