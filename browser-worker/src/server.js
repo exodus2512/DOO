@@ -159,6 +159,61 @@ app.post('/action/execute', async (req, res) => {
   }
 });
 
+// ─── Park Session (WAITING_FOR_USER) ─────────────────────────────────────────
+app.post('/session/park', async (req, res) => {
+  const { taskId } = req.body;
+  if (!taskId) return res.status(400).json({ error: 'taskId is required' });
+
+  const success = sessionManager.parkSession(taskId);
+  if (!success) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+  res.json({ success: true, parked: true });
+});
+
+// ─── Unpark Session (resume from WAITING_FOR_USER) ──────────────────────────
+app.post('/session/unpark', async (req, res) => {
+  const { taskId } = req.body;
+  if (!taskId) return res.status(400).json({ error: 'taskId is required' });
+
+  const session = sessionManager.getSession(taskId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found — may have timed out' });
+  }
+
+  sessionManager.unparkSession(taskId);
+
+  // Return a fresh observation so the backend can resume with current page state
+  try {
+    const { buildObservation } = require('./perception');
+    const observation = await buildObservation(session.page, taskId, { includeScreenshot: true });
+    session.lastObservation = observation;
+
+    res.json({
+      success: true,
+      parked: false,
+      currentUrl: observation.url,
+      pageTitle: observation.title,
+      pageText: observation.page_text?.text || '',
+      observationId: observation.observation_id,
+      interactiveElements: (observation.interactive_elements || []).map(el => ({
+        index: el.index,
+        tag: el._locator?.tagName || el.type,
+        role: el.role,
+        text: (el.text || '').substring(0, 80),
+        label: (el.label || '').substring(0, 80),
+        placeholder: el.placeholder || null,
+        type: el.type,
+        href: el.href || null,
+        enabled: el.enabled,
+      })),
+      screenshot: observation.screenshot?.base64 || null,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ─── Close Session ───────────────────────────────────────────────────────────
 app.post('/session/close', async (req, res) => {
   const { taskId } = req.body;

@@ -7,12 +7,13 @@ const { chromium } = require('playwright');
 
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;  // 60min absolute
 const SESSION_IDLE_MS = Number(process.env.SESSION_IDLE_MS) || 15 * 60 * 1000; // 15min idle
+const PARKED_IDLE_MS = Number(process.env.PARKED_IDLE_MS) || 35 * 60 * 1000;  // 35min for parked (waiting-for-user) sessions
 const REAPER_INTERVAL_MS = 60 * 1000;
 
 class SessionManager {
   constructor() {
     this.browser = null;
-    this.sessions = new Map(); // taskId -> { context, page, sessionId, cancelToken, createdAt, lastActivity }
+    this.sessions = new Map(); // taskId -> { context, page, sessionId, cancelToken, createdAt, lastActivity, parked }
     this._startReaper();
   }
 
@@ -26,8 +27,9 @@ class SessionManager {
     for (const [taskId, session] of this.sessions) {
       const age = now - session.createdAt;
       const idle = now - session.lastActivity;
-      if (age > SESSION_TTL_MS || idle > SESSION_IDLE_MS) {
-        console.log(`[BrowserWorker] Reaping expired session for task ${taskId} (age=${Math.round(age/1000)}s, idle=${Math.round(idle/1000)}s)`);
+      const idleLimit = session.parked ? PARKED_IDLE_MS : SESSION_IDLE_MS;
+      if (age > SESSION_TTL_MS || idle > idleLimit) {
+        console.log(`[BrowserWorker] Reaping expired session for task ${taskId} (age=${Math.round(age/1000)}s, idle=${Math.round(idle/1000)}s, parked=${!!session.parked})`);
         await this.closeSession(taskId);
       }
     }
@@ -96,6 +98,7 @@ class SessionManager {
       context, page, sessionId, cancelToken,
       createdAt: now, lastActivity: now,
       lastObservation: null, // stores the most recent full doo.perception.v1 observation
+      parked: false, // true when task is WAITING_FOR_USER — browser stays alive, idle timeout extended
     });
     
     console.log(`[BrowserWorker] Session ${sessionId} initialized for task ${taskId}`);
@@ -119,6 +122,31 @@ class SessionManager {
       this.sessions.delete(taskId);
       console.log(`[BrowserWorker] Session closed for task ${taskId}`);
     }
+  }
+
+  parkSession(taskId) {
+    const session = this.sessions.get(taskId);
+    if (session) {
+      session.parked = true;
+      session.lastActivity = Date.now();
+      console.log(`[BrowserWorker] Session parked for task ${taskId} (browser stays alive)`);
+    }
+    return !!session;
+  }
+
+  unparkSession(taskId) {
+    const session = this.sessions.get(taskId);
+    if (session) {
+      session.parked = false;
+      session.lastActivity = Date.now();
+      console.log(`[BrowserWorker] Session unparked for task ${taskId}`);
+    }
+    return !!session;
+  }
+
+  isParked(taskId) {
+    const session = this.sessions.get(taskId);
+    return session ? session.parked : false;
   }
 
   cancelTask(taskId) {

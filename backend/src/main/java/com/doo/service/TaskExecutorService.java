@@ -320,16 +320,24 @@ public class TaskExecutorService {
                 // Check if approval required
                 if (decision.requiresApproval()) {
                     ApprovalRequest approval = requestApproval(task, decision);
-                    publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
-                        decision.approvalReason(), decision.actionType()));
-                    updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
-
-                    ApprovalRequest resolved = waitForApproval(approval.getId(), taskId);
-                    if (resolved == null || "REJECTED".equals(resolved.getStatus())) {
-                        failTask(task, "Action was rejected by user or approval expired");
+                    PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
+                        decision.approvalReason(), decision.actionType(), step);
+                    if (!pauseResult.resumed) {
+                        failTask(task, pauseResult.failureReason);
                         return;
                     }
-                    updateTaskStatus(task, TaskStatus.RUNNING, null);
+                    // Restore observation state from unpark if available
+                    if (pauseResult.observationId != null) {
+                        lastObservationId = pauseResult.observationId;
+                        lastInteractiveElements = pauseResult.interactiveElements;
+                    }
+                    if (pauseResult.currentUrl != null) currentUrl = pauseResult.currentUrl;
+                    if (pauseResult.pageTitle != null) pageTitle = pauseResult.pageTitle;
+                    if (pauseResult.pageText != null) {
+                        pageText = pauseResult.pageText;
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        observationEpoch++;
+                    }
                 }
 
                 // Record step with observation epoch
@@ -731,29 +739,105 @@ public class TaskExecutorService {
         return approvalRepository.save(approval);
     }
 
-    private ApprovalRequest waitForApproval(UUID approvalId, UUID taskId) {
-        int maxWaitSeconds = 600; // 10 minutes
-        int pollIntervalMs = 2000;
-        int waited = 0;
+    // ─── Pause / Resume state machine ─────────────────────────────────────────
 
-        while (waited < maxWaitSeconds * 1000) {
-            if (isCancelled(taskId)) return null;
-            
-            try { Thread.sleep(pollIntervalMs); } catch (InterruptedException e) { return null; }
-            waited += pollIntervalMs;
+    private static final int PAUSE_TIMEOUT_SECONDS = 30 * 60; // 30 minutes
+    private static final int PAUSE_POLL_INTERVAL_MS = 2000;
+
+    record PauseResult(
+        boolean resumed,
+        String failureReason,
+        String currentUrl,
+        String pageTitle,
+        String pageText,
+        String observationId,
+        java.util.List<java.util.Map<String, Object>> interactiveElements
+    ) {
+        static PauseResult failed(String reason) {
+            return new PauseResult(false, reason, null, null, null, null, null);
+        }
+        static PauseResult success(ActionResult unparkResult) {
+            return new PauseResult(true, null,
+                unparkResult.currentUrl(), unparkResult.pageTitle(),
+                unparkResult.pageText(), unparkResult.observationId(),
+                unparkResult.interactiveElements());
+        }
+    }
+
+    /**
+     * Pause the task for user interaction. Parks the browser session (keeps it alive),
+     * transitions to WAITING_FOR_USER, emits a "waiting" SSE event, and polls the
+     * approval record until resolved or the 30-minute timeout expires.
+     *
+     * On resume: unparks the session (gets fresh page state) and transitions back to RUNNING.
+     * On timeout: fails the task with WAIT_TIMEOUT.
+     */
+    PauseResult pauseForUser(Task task, String sessionId, UUID approvalId,
+                             String reason, String proposedAction, int currentStep) {
+        UUID taskId = task.getId();
+        log.info("Task {} pausing for user at step {} — reason: {}", taskId, currentStep, reason);
+
+        // Park the browser session so it stays alive during the wait
+        browserWorkerClient.parkSession(taskId);
+
+        // Persist the pause state
+        task.setCurrentStep(currentStep);
+        updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
+
+        // Emit events
+        publishEvent(TaskEvent.approvalRequired(taskId, approvalId, reason, proposedAction));
+        publishEvent(TaskEvent.waiting(taskId, reason, Map.of(
+            "approvalId", approvalId.toString(),
+            "proposedAction", proposedAction != null ? proposedAction : "",
+            "step", currentStep,
+            "timeoutSeconds", PAUSE_TIMEOUT_SECONDS
+        )));
+
+        // Poll for resolution
+        int waited = 0;
+        while (waited < PAUSE_TIMEOUT_SECONDS * 1000) {
+            if (isCancelled(taskId)) {
+                return PauseResult.failed("Task cancelled while waiting for user");
+            }
+
+            try { Thread.sleep(PAUSE_POLL_INTERVAL_MS); } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return PauseResult.failed("Interrupted while waiting for user");
+            }
+            waited += PAUSE_POLL_INTERVAL_MS;
 
             ApprovalRequest approval = approvalRepository.findById(approvalId).orElse(null);
-            if (approval == null) return null;
-            if ("APPROVED".equals(approval.getStatus()) || "REJECTED".equals(approval.getStatus())) {
-                return approval;
+            if (approval == null) {
+                return PauseResult.failed("Approval request disappeared");
             }
+
+            if ("APPROVED".equals(approval.getStatus())) {
+                log.info("Task {} approval {} approved — resuming", taskId, approvalId);
+                // Unpark the browser and get fresh state
+                ActionResult unparkResult = browserWorkerClient.unparkSession(taskId);
+                if (!unparkResult.success()) {
+                    return PauseResult.failed("Browser session lost during wait: " + unparkResult.error());
+                }
+                updateTaskStatus(task, TaskStatus.RUNNING, null);
+                publishEvent(TaskEvent.statusChange(taskId, "RUNNING", "Resumed after user approval"));
+                return PauseResult.success(unparkResult);
+            }
+
+            if ("REJECTED".equals(approval.getStatus())) {
+                return PauseResult.failed("Action rejected by user" +
+                    (approval.getUserResponse() != null ? ": " + approval.getUserResponse() : ""));
+            }
+
             if (approval.isExpired()) {
                 approval.setStatus("EXPIRED");
                 approvalRepository.save(approval);
-                return approval;
+                return PauseResult.failed("Approval expired while waiting for user response");
             }
         }
-        return null;
+
+        // 30-minute timeout
+        log.warn("Task {} WAIT_TIMEOUT after {}s", taskId, PAUSE_TIMEOUT_SECONDS);
+        return PauseResult.failed("WAIT_TIMEOUT: no user response within " + (PAUSE_TIMEOUT_SECONDS / 60) + " minutes");
     }
 
     private void saveEvidence(UUID taskId, String type, String label, String content, String sourceUrl) {

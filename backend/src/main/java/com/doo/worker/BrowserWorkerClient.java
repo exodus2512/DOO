@@ -153,6 +153,60 @@ public class BrowserWorkerClient {
     }
 
     /**
+     * Park a browser session (keep alive during WAITING_FOR_USER).
+     * The session's idle timeout is extended to 35 minutes.
+     */
+    public boolean parkSession(UUID taskId) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/park")
+                .bodyValue(Map.of("taskId", taskId.toString()))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(10))
+                .block();
+            return response != null && Boolean.TRUE.equals(response.get("success"));
+        } catch (Exception e) {
+            log.warn("Could not park session for task {}: {}", taskId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Unpark a browser session and get fresh page state for resuming.
+     * Returns the current observation so the backend can continue from where it stopped.
+     */
+    public ActionResult unparkSession(UUID taskId) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/unpark")
+                .bodyValue(Map.of("taskId", taskId.toString()))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(15))
+                .block();
+
+            if (response == null) return ActionResult.failure("Empty unpark response");
+
+            boolean success = Boolean.TRUE.equals(response.get("success"));
+            String currentUrl = (String) response.get("currentUrl");
+            String pageTitle = (String) response.get("pageTitle");
+            String pageText = (String) response.get("pageText");
+            String observationId = (String) response.get("observationId");
+            String screenshot = (String) response.get("screenshot");
+            @SuppressWarnings("unchecked")
+            java.util.List<java.util.Map<String, Object>> interactiveElements =
+                (java.util.List<java.util.Map<String, Object>>) response.get("interactiveElements");
+
+            return new ActionResult(success, "Session unparked", null, screenshot,
+                currentUrl, pageTitle, pageText, null, observationId, interactiveElements);
+        } catch (Exception e) {
+            log.warn("Could not unpark session for task {}: {}", taskId, e.getMessage());
+            return ActionResult.failure("Unpark failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * Cancel all pending operations for a task (idempotent).
      */
     public void cancelTask(UUID taskId) {

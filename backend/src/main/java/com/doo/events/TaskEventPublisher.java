@@ -57,7 +57,8 @@ public class TaskEventPublisher {
         taskEmitters.removeAll(deadEmitters);
 
         if ("completed".equalsIgnoreCase(event.eventType()) || "error".equalsIgnoreCase(event.eventType())
-            || "COMPLETED".equalsIgnoreCase(event.status()) || "FAILED".equalsIgnoreCase(event.status())) {
+            || "COMPLETED".equalsIgnoreCase(event.status()) || "FAILED".equalsIgnoreCase(event.status())
+            || "CANCELLED".equalsIgnoreCase(event.status())) {
             for (SseEmitter emitter : taskEmitters) {
                 try {
                     emitter.complete();
@@ -124,6 +125,10 @@ public class TaskEventPublisher {
 
         public static TaskEvent completed(UUID taskId, String summary) {
             return new TaskEvent(taskId, "completed", "COMPLETED", summary, Map.of(), Instant.now());
+        }
+
+        public static TaskEvent waiting(UUID taskId, String reason, Map<String, Object> data) {
+            return new TaskEvent(taskId, "waiting", "WAITING_FOR_USER", reason, data != null ? data : Map.of(), Instant.now());
         }
 
         public static TaskEvent debug(UUID taskId, String message, Map<String, Object> data) {
