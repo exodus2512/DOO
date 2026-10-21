@@ -75,3 +75,71 @@ describe('Perception Module', () => {
     assert.ok(source.includes('Strategy 5: By bounding box'));
   });
 });
+
+describe('Challenge detection logic', () => {
+  // These tests validate the isVisible guard and bot_block text pattern
+  // by inspecting the source directly (no real browser required).
+  const fs = require('fs');
+  const source = fs.readFileSync(require.resolve('../perception'), 'utf8');
+
+  test('isVisible requires minimum 100x40 bounding box', () => {
+    // The guard must check width < 100 || height < 40
+    assert.ok(source.includes('r.width < 100'), 'width guard missing');
+    assert.ok(source.includes('r.height < 40'), 'height guard missing');
+  });
+
+  test('isVisible checks display, visibility, and opacity', () => {
+    assert.ok(source.includes("s.display !== 'none'"), 'display guard missing');
+    assert.ok(source.includes("s.visibility !== 'hidden'"), 'visibility guard missing');
+    assert.ok(source.includes("s.opacity !== '0'"), 'opacity guard missing');
+  });
+
+  test('reCAPTCHA detection gates on visible iframe or .g-recaptcha, not bare data-sitekey', () => {
+    // Must require isVisible on the iframe/widget, not just any [data-sitekey]
+    assert.ok(source.includes('iframe[src*="recaptcha/api2"]'), 'must target api2 iframe');
+    assert.ok(source.includes('.g-recaptcha'), 'must check .g-recaptcha widget');
+    // Old pattern was [data-sitekey] without visibility check — must NOT exist alone
+    assert.ok(!source.includes("'[data-sitekey]'"), 'bare data-sitekey selector must be gone');
+  });
+
+  test('hCaptcha detection gates on visible iframe or .h-captcha', () => {
+    assert.ok(source.includes('iframe[src*="hcaptcha"]'), 'hcaptcha iframe missing');
+    assert.ok(source.includes('.h-captcha'), '.h-captcha widget missing');
+  });
+
+  test('Turnstile detection gates on visible iframe or .cf-turnstile', () => {
+    assert.ok(source.includes('iframe[src*="challenges.cloudflare"]'), 'turnstile iframe missing');
+    assert.ok(source.includes('.cf-turnstile'), '.cf-turnstile widget missing');
+  });
+
+  test('bot_block pattern covers standard block-page phrases', () => {
+    const match = source.match(/BOT_BLOCK_RE\s*=\s*\/(.+?)\//);
+    assert.ok(match, 'BOT_BLOCK_RE pattern not found');
+    const re = new RegExp(match[1], 'i');
+    const phrases = [
+      'unusual traffic',
+      'access denied',
+      'verify you are human',
+      'just a moment',
+      'press & hold',
+      'are you a robot',
+    ];
+    for (const phrase of phrases) {
+      assert.ok(re.test(phrase), `BOT_BLOCK_RE should match: "${phrase}"`);
+    }
+  });
+
+  test('bot_block result has type and reason fields', () => {
+    assert.ok(source.includes("type: 'bot_block'"), "bot_block type missing");
+    assert.ok(source.includes('reason:'), 'bot_block reason missing');
+  });
+
+  test('generic captcha fallback only triggers for visible elements', () => {
+    // Must call isVisible() inside the for loop, not just querySelector
+    const genericSection = source.slice(
+      source.indexOf('Generic visible CAPTCHA'),
+      source.indexOf('Bot-block detection')
+    );
+    assert.ok(genericSection.includes('isVisible(el)'), 'generic captcha must check isVisible');
+  });
+});

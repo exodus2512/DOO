@@ -225,25 +225,59 @@ async function buildObservation(page, taskId, options = {}) {
   try {
     challenges = await page.evaluate(() => {
       const found = [];
-      // reCAPTCHA v2/v3
-      if (document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey]')) {
+
+      /**
+       * Check whether an element is user-visible: has a bounding box of at
+       * least 100×40 px and is not hidden by CSS. Ignores invisible reCAPTCHA
+       * v3 badges and bare [data-sitekey] containers without a visible widget.
+       */
+      function isVisible(el) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 100 || r.height < 40) return false;
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+      }
+
+      // reCAPTCHA v2: require a visible iframe or visible .g-recaptcha container.
+      // reCAPTCHA v3 only has an invisible badge — skip it (no user interaction needed).
+      const rcIframe = document.querySelector('iframe[src*="recaptcha/api2"]');
+      const rcWidget = document.querySelector('.g-recaptcha');
+      if ((rcIframe && isVisible(rcIframe)) || (rcWidget && isVisible(rcWidget))) {
         found.push({ type: 'captcha', provider: 'recaptcha' });
       }
+
       // hCaptcha
-      if (document.querySelector('iframe[src*="hcaptcha"], .h-captcha, [data-hcaptcha-sitekey]')) {
+      const hcIframe = document.querySelector('iframe[src*="hcaptcha"]');
+      const hcWidget = document.querySelector('.h-captcha');
+      if ((hcIframe && isVisible(hcIframe)) || (hcWidget && isVisible(hcWidget))) {
         found.push({ type: 'captcha', provider: 'hcaptcha' });
       }
+
       // Cloudflare Turnstile
-      if (document.querySelector('iframe[src*="challenges.cloudflare"], .cf-turnstile, [data-turnstile-sitekey]')) {
+      const cfIframe = document.querySelector('iframe[src*="challenges.cloudflare"]');
+      const cfWidget = document.querySelector('.cf-turnstile');
+      if ((cfIframe && isVisible(cfIframe)) || (cfWidget && isVisible(cfWidget))) {
         found.push({ type: 'captcha', provider: 'turnstile' });
       }
-      // Generic CAPTCHA patterns
+
+      // Generic visible CAPTCHA containers (fallback, not invisible badge)
       if (!found.length) {
-        const captchaKeywords = document.querySelectorAll('[class*="captcha" i], [id*="captcha" i], [data-captcha]');
-        if (captchaKeywords.length > 0) {
-          found.push({ type: 'captcha', provider: 'unknown' });
+        const captchaEls = document.querySelectorAll('[class*="captcha" i], [id*="captcha" i], [data-captcha]');
+        for (const el of captchaEls) {
+          if (isVisible(el)) {
+            found.push({ type: 'captcha', provider: 'unknown' });
+            break;
+          }
         }
       }
+
+      // Bot-block detection: page-level access denial or challenge walls
+      const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+      const BOT_BLOCK_RE = /unusual traffic|access denied|verify you are human|just a moment|press & hold|are you a robot/i;
+      if (BOT_BLOCK_RE.test(bodyText.substring(0, 3000))) {
+        found.push({ type: 'bot_block', reason: 'visible block text detected' });
+      }
+
       // OTP / 2FA input patterns
       const inputs = document.querySelectorAll('input');
       for (const inp of inputs) {
@@ -255,9 +289,22 @@ async function buildObservation(page, taskId, options = {}) {
           break;
         }
       }
+
       return found;
     });
   } catch { /* continue without challenge detection */ }
+
+  // Supplement bot_block detection from HTTP status code where available
+  try {
+    const status = page.url() ? await page.evaluate(() => {
+      // performance.getEntriesByType gives us the navigation timing with status
+      const nav = performance.getEntriesByType('navigation')[0];
+      return nav ? null : null; // status not directly accessible via JS
+    }) : null;
+    // Playwright doesn't expose HTTP status in page.evaluate; we rely on the
+    // visible-text detection above for bot_block. The caller (server.js) can
+    // supplement with the response status from page.on('response').
+  } catch { /* ignore */ }
 
   // Scroll position and page dimensions — lets the AI decide whether to scroll for more content
   let scrollInfo = { scrollY: 0, pageHeight: 0, viewportHeight: 0 };
