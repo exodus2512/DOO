@@ -339,7 +339,7 @@ public class TaskExecutorService {
                 if (decision.requiresApproval()) {
                     ApprovalRequest approval = requestApproval(task, decision);
                     PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
-                        decision.approvalReason(), decision.actionType(), step);
+                        decision.approvalReason(), decision.actionType(), step, approval.getParameters());
                     if (!pauseResult.resumed) {
                         failTask(task, pauseResult.failureReason);
                         return;
@@ -841,7 +841,8 @@ public class TaskExecutorService {
      * On timeout: fails the task with WAIT_TIMEOUT.
      */
     PauseResult pauseForUser(Task task, String sessionId, UUID approvalId,
-                             String reason, String proposedAction, int currentStep) {
+                             String reason, String proposedAction, int currentStep,
+                             Map<String, Object> parameters) {
         UUID taskId = task.getId();
         log.info("Task {} pausing for user at step {} — reason: {}", taskId, currentStep, reason);
 
@@ -853,7 +854,7 @@ public class TaskExecutorService {
         updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
 
         // Emit events
-        publishEvent(TaskEvent.approvalRequired(taskId, approvalId, reason, proposedAction));
+        publishEvent(TaskEvent.approvalRequired(taskId, approvalId, reason, proposedAction, parameters));
         publishEvent(TaskEvent.waiting(taskId, reason, Map.of(
             "approvalId", approvalId.toString(),
             "proposedAction", proposedAction != null ? proposedAction : "",
@@ -994,9 +995,10 @@ public class TaskExecutorService {
         // We need to init the browser first for the pause to work, or handle pre-browser pause
         if (sessionId == null) {
             // We haven't launched the browser yet — do a lightweight pause without parking
+            log.info("[GATE] login detected — waiting for credentials (domain={})", domain);
             updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
             publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
-                "Login required for " + domain, "CREDENTIAL_REQUEST"));
+                "Login required for " + domain, "CREDENTIAL_REQUEST", approval.getParameters()));
             publishEvent(TaskEvent.waiting(taskId, "Login required for " + domain, Map.of(
                 "approvalId", approval.getId().toString(),
                 "type", "credential_request",
@@ -1047,7 +1049,7 @@ public class TaskExecutorService {
 
         // Browser already running — use full pause/resume
         PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
-            "Login required for " + domain, "CREDENTIAL_REQUEST", task.getCurrentStep());
+            "Login required for " + domain, "CREDENTIAL_REQUEST", task.getCurrentStep(), approval.getParameters());
         if (!pauseResult.resumed) {
             failTask(task, pauseResult.failureReason());
             return new CredentialGateResult(true, false, Map.of());
@@ -1276,7 +1278,7 @@ public class TaskExecutorService {
         approval = approvalRepository.save(approval);
 
         PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
-            prompt, approvalType.toUpperCase(), currentStep);
+            prompt, approvalType.toUpperCase(), currentStep, params);
 
         if (!pauseResult.resumed) {
             return ChallengeHandleResult.failed(pauseResult.failureReason());

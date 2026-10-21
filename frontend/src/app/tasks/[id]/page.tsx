@@ -99,6 +99,20 @@ export default function TaskDetailPage() {
     loadTaskData();
   }, [taskId]);
 
+  // Poll for pending approvals while WAITING_FOR_USER so any tab (even opened late) picks up the prompt
+  useEffect(() => {
+    if (task?.status !== 'WAITING_FOR_USER' || pendingApproval) return;
+    const interval = setInterval(async () => {
+      try {
+        const approvals = await api.getPendingApprovals(taskId);
+        if (approvals.length > 0) {
+          setPendingApproval(approvals[0]);
+        }
+      } catch { /* ignore */ }
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [task?.status, pendingApproval, taskId]);
+
   // Reactive SSE listener
   useTaskStream(taskId, (event: TaskStreamEvent) => {
     if (event.eventType === 'debug') {
@@ -168,7 +182,23 @@ export default function TaskDetailPage() {
     }
 
     if (event.eventType === 'approval_required' && event.data) {
-      setPendingApproval(event.data as unknown as ApprovalRequest);
+      const d = event.data as any;
+      const normalized: ApprovalRequest = {
+        id: d.id || d.approvalId || '',
+        taskId: taskId,
+        prompt: d.prompt || event.message || '',
+        proposedAction: d.proposedAction || null,
+        actionDescription: d.proposedAction || d.prompt || event.message || null,
+        reason: d.prompt || event.message || null,
+        parameters: d.parameters || {},
+        status: d.status || 'PENDING',
+        userResponse: null,
+        createdAt: d.createdAt || new Date().toISOString(),
+        expiresAt: d.expiresAt || new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        resolvedAt: null,
+      };
+      console.log('[GATE] login detected — waiting for credentials', normalized);
+      setPendingApproval(normalized);
     }
 
     if (

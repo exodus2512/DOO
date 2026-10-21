@@ -53,7 +53,7 @@ public class ApprovalRequest {
     @PrePersist
     protected void onCreate() {
         if (createdAt == null) createdAt = Instant.now();
-        if (expiresAt == null) expiresAt = createdAt.plusSeconds(600); // 10 min
+        if (expiresAt == null) expiresAt = createdAt.plusSeconds(1800); // 30 min
         if (status == null) status = "PENDING";
     }
 

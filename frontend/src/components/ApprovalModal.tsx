@@ -28,6 +28,19 @@ export default function ApprovalModal({
   const [saveToVault, setSaveToVault] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [otpCode, setOtpCode] = useState('');
+  const [timeLeft, setTimeLeft] = useState<number | null>(null);
+
+  React.useEffect(() => {
+    if (!approval || approval.status !== 'PENDING') { setTimeLeft(null); return; }
+    const update = () => {
+      const exp = approval.expiresAt ? new Date(approval.expiresAt).getTime() : Date.now() + 30 * 60 * 1000;
+      const remaining = Math.max(0, Math.floor((exp - Date.now()) / 1000));
+      setTimeLeft(remaining);
+    };
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  }, [approval]);
 
   if (!approval || approval.status !== 'PENDING') {
     return null;
@@ -168,7 +181,14 @@ export default function ApprovalModal({
 
           <div className="flex items-center space-x-2 text-xs text-slate-400 bg-slate-800/40 p-2.5 rounded-lg">
             <Clock className="w-4 h-4 text-slate-400 shrink-0" />
-            <span>Task execution is suspended until you submit a response.</span>
+            <span>
+              Task execution is suspended.
+              {timeLeft != null && (
+                <> Expires in <span className={`font-mono font-semibold ${timeLeft < 120 ? 'text-rose-400' : 'text-amber-300'}`}>
+                  {Math.floor(timeLeft / 60)}:{String(timeLeft % 60).padStart(2, '0')}
+                </span></>
+              )}
+            </span>
           </div>
         </div>
 

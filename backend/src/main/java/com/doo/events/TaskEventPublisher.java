@@ -114,9 +114,16 @@ public class TaskEventPublisher {
                 Map.of("image", base64Image, "label", label), Instant.now());
         }
 
-        public static TaskEvent approvalRequired(UUID taskId, UUID approvalId, String prompt, String proposedAction) {
-            return new TaskEvent(taskId, "approval_required", "WAITING_FOR_USER", prompt,
-                Map.of("approvalId", approvalId.toString(), "proposedAction", proposedAction != null ? proposedAction : ""), Instant.now());
+        public static TaskEvent approvalRequired(UUID taskId, UUID approvalId, String prompt,
+                                                   String proposedAction, Map<String, Object> parameters) {
+            Map<String, Object> data = new java.util.HashMap<>();
+            data.put("id", approvalId.toString());
+            data.put("approvalId", approvalId.toString());
+            data.put("status", "PENDING");
+            data.put("prompt", prompt != null ? prompt : "");
+            data.put("proposedAction", proposedAction != null ? proposedAction : "");
+            if (parameters != null) data.put("parameters", parameters);
+            return new TaskEvent(taskId, "approval_required", "WAITING_FOR_USER", prompt, data, Instant.now());
         }
 
         public static TaskEvent error(UUID taskId, String message) {
