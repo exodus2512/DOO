@@ -165,6 +165,25 @@ public class BrowserWorkerClient {
     }
 
     /**
+     * Get a structured observation from the browser worker.
+     */
+    public Map<String, Object> observe(UUID taskId, boolean includeScreenshot) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/observe")
+                .bodyValue(Map.of("taskId", taskId.toString(), "includeScreenshot", includeScreenshot))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(15))
+                .block();
+            return response != null ? response : Map.of();
+        } catch (Exception e) {
+            log.warn("Could not get observation for task {}: {}", taskId, e.getMessage());
+            return Map.of();
+        }
+    }
+
+    /**
      * Check if browser worker is healthy.
      */
     public boolean isHealthy() {

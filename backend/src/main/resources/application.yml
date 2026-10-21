@@ -33,8 +33,14 @@ doo:
   ai:
     provider: ${AI_PROVIDER:gemini}
     gemini:
-      api-key: ${GEMINI_API_KEY:your_gemini_api_key_here}
-      model: ${GEMINI_MODEL:gemini-3.5-flash}
+      api-key: ${GEMINI_API_KEY_1:}
+      api-key-2: ${GEMINI_API_KEY_2:}
+      api-key-3: ${GEMINI_API_KEY_3:}
+      model: ${GEMINI_MODEL:gemini-3.8-flash}
+      max-retries: ${GEMINI_MAX_RETRIES:6}
+      min-call-interval-ms: ${GEMINI_MIN_INTERVAL_MS:4000}
+      max-rpm: ${GEMINI_MAX_RPM:10}
+      key-cooldown-seconds: ${GEMINI_KEY_COOLDOWN_SECONDS:30}
     demo-mode: ${DEMO_MODE:false}
   browser-worker:
     url: ${BROWSER_WORKER_URL:http://localhost:3001}
@@ -43,6 +49,7 @@ doo:
   task:
     max-steps: ${TASK_MAX_STEPS:30}
     max-retries: ${TASK_MAX_RETRIES:3}
+    max-ai-calls: ${TASK_MAX_AI_CALLS:40}
     execution-timeout-minutes: ${TASK_TIMEOUT_MINUTES:10}
     stale-running-minutes: ${TASK_STALE_MINUTES:15}
 

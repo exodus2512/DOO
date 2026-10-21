@@ -68,8 +68,16 @@ public interface AiProvider {
         String finalUrl,
         String finalPageContent,
         List<String> visitedUrls,
-        String synthesizedResult
-    ) {}
+        String synthesizedResult,
+        List<String> evidenceSummary
+    ) {
+        public VerificationRequest(String userRequest, String successCriteria, String workflowType,
+                                   String finalUrl, String finalPageContent, List<String> visitedUrls,
+                                   String synthesizedResult) {
+            this(userRequest, successCriteria, workflowType, finalUrl, finalPageContent,
+                 visitedUrls, synthesizedResult, List.of());
+        }
+    }
 
     record VerificationResult(boolean passed, String notes, double confidence) {}
 

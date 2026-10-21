@@ -191,9 +191,6 @@ export const api = {
     }),
 
   streamUrl: (id: string) => {
-    if (typeof window !== 'undefined' && !API_BASE) {
-      return `http://${window.location.hostname}:8082/api/tasks/${id}/stream`;
-    }
     return `${API_BASE}/api/tasks/${id}/stream`;
   },
 };

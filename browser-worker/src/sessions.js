@@ -5,10 +5,32 @@
 
 const { chromium } = require('playwright');
 
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;  // 60min absolute
+const SESSION_IDLE_MS = Number(process.env.SESSION_IDLE_MS) || 15 * 60 * 1000; // 15min idle
+const REAPER_INTERVAL_MS = 60 * 1000;
+
 class SessionManager {
   constructor() {
     this.browser = null;
-    this.sessions = new Map(); // taskId -> { context, page, sessionId, cancelToken }
+    this.sessions = new Map(); // taskId -> { context, page, sessionId, cancelToken, createdAt, lastActivity }
+    this._startReaper();
+  }
+
+  _startReaper() {
+    this._reaperTimer = setInterval(() => this._reapExpiredSessions(), REAPER_INTERVAL_MS);
+    if (this._reaperTimer.unref) this._reaperTimer.unref();
+  }
+
+  async _reapExpiredSessions() {
+    const now = Date.now();
+    for (const [taskId, session] of this.sessions) {
+      const age = now - session.createdAt;
+      const idle = now - session.lastActivity;
+      if (age > SESSION_TTL_MS || idle > SESSION_IDLE_MS) {
+        console.log(`[BrowserWorker] Reaping expired session for task ${taskId} (age=${Math.round(age/1000)}s, idle=${Math.round(idle/1000)}s)`);
+        await this.closeSession(taskId);
+      }
+    }
   }
 
   async ensureBrowser() {
@@ -22,7 +44,6 @@ class SessionManager {
           '--disable-dev-shm-usage',
           '--disable-gpu',
           '--disable-blink-features=AutomationControlled',
-          '--disable-web-security', // Allow cross-origin for research tasks
         ]
       });
       console.log('[BrowserWorker] Browser ready');
@@ -69,15 +90,18 @@ class SessionManager {
 
     const sessionId = `session-${taskId}-${Date.now()}`;
     const cancelToken = { cancelled: false };
+    const now = Date.now();
 
-    this.sessions.set(taskId, { context, page, sessionId, cancelToken });
+    this.sessions.set(taskId, { context, page, sessionId, cancelToken, createdAt: now, lastActivity: now });
     
     console.log(`[BrowserWorker] Session ${sessionId} initialized for task ${taskId}`);
     return sessionId;
   }
 
   getSession(taskId) {
-    return this.sessions.get(taskId);
+    const session = this.sessions.get(taskId);
+    if (session) session.lastActivity = Date.now();
+    return session;
   }
 
   async closeSession(taskId) {
@@ -106,6 +130,7 @@ class SessionManager {
   }
 
   async closeAll() {
+    if (this._reaperTimer) clearInterval(this._reaperTimer);
     for (const [taskId] of this.sessions) {
       await this.closeSession(taskId);
     }

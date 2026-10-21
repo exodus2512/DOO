@@ -1,6 +1,8 @@
 package com.doo.service;
 
+import com.doo.ai.AiCallStats;
 import com.doo.ai.AiProvider;
+import com.doo.ai.GeminiAiProvider;
 import com.doo.domain.*;
 import com.doo.events.TaskEventPublisher;
 import com.doo.events.TaskEventPublisher.TaskEvent;
@@ -15,6 +17,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -44,13 +47,22 @@ public class TaskExecutorService {
     @Value("${doo.task.max-retries:3}")
     private int maxRetries;
 
+    @Value("${doo.task.execution-timeout-minutes:10}")
+    private int executionTimeoutMinutes;
+
+    @Value("${doo.task.max-ai-calls:40}")
+    private int maxAiCalls;
+
+    private static final int NO_PROGRESS_WINDOW = 5;
+    private static final int NO_PROGRESS_THRESHOLD = 3;
+
     // Track cancelled tasks to prevent actions being dispatched after cancellation
     private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
 
     // Allowed action types (allowlist)
     private static final List<String> ALLOWED_ACTIONS = List.of(
         "NAVIGATE", "CLICK", "FILL", "EXTRACT_TEXT", "SCREENSHOT",
-        "SCROLL", "WAIT", "DONE", "GO_BACK"
+        "SCROLL", "WAIT", "DONE", "GO_BACK", "SELECT_OPTION", "PRESS_KEY"
     );
 
     // Actions that are NOT allowed (block harmful actions even if AI suggests them)
@@ -84,22 +96,30 @@ public class TaskExecutorService {
         List<String> textSnippets = new ArrayList<>();
         List<String> recentActions = new ArrayList<>();
 
+        int aiCallCount = 0;
+
         try {
             // Transition to RUNNING
             updateTaskStatus(task, TaskStatus.RUNNING, null);
 
             // Step 1: Classify workflow and generate plan
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Analyzing your request...", 0, Map.of()));
-            
+
+            publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — starting", Map.of("phase", "CLASSIFY", "keyPool", getKeyPoolState())));
             AiProvider.WorkflowClassification classification = aiProvider.classifyWorkflow(task.getUserRequest());
+            aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — result: " + classification.workflowType(), Map.of("phase", "CLASSIFY", "result", classification.workflowType())));
             task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
             task.setSuccessCriteria(classification.successCriteria());
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — generating", Map.of("phase", "PLAN", "keyPool", getKeyPoolState())));
             AiProvider.TaskPlan plan = aiProvider.generatePlan(
                 task.getUserRequest(),
                 classification.successCriteria(),
                 new AiProvider.WorkflowContext(classification.workflowType())
             );
+            aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — " + plan.steps().size() + " steps", Map.of("phase", "PLAN", "steps", plan.steps().size())));
 
             String planText = String.join("\n", plan.steps().stream()
                 .map((s) -> (plan.steps().indexOf(s) + 1) + ". " + s)
@@ -128,14 +148,33 @@ public class TaskExecutorService {
             String pageText = "";
             String accessibilityTree = "";
             int consecutiveFailures = 0;
+            int observationEpoch = 0;
+            String lastObservationHash = "";
+            Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
+            List<String> recentActionFingerprints = new ArrayList<>();
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
+                // Wall-clock budget enforcement
+                if (Instant.now().isAfter(deadline)) {
+                    log.warn("Task {} exceeded {}min wall-clock budget at step {}", taskId, executionTimeoutMinutes, step);
+                    failTask(task, "TASK_DEADLINE_EXCEEDED: exceeded " + executionTimeoutMinutes + " minute execution budget");
+                    return;
+                }
+
+                // AI call budget enforcement
+                if (aiCallCount >= maxAiCalls) {
+                    log.warn("Task {} exceeded AI call budget ({}) at step {}", taskId, maxAiCalls, step);
+                    failTask(task, "AI_CALL_BUDGET_EXCEEDED: used " + aiCallCount + "/" + maxAiCalls + " AI calls");
+                    return;
+                }
+
                 task.setCurrentStep(step);
                 taskRepository.save(task);
 
-                log.debug("Task {} step {}/{}", taskId, step, maxSteps);
+                log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
 
                 // Select next action
+                publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — step " + step + ", url=" + truncate(currentUrl, 60), Map.of("phase", "SELECT_ACTION", "step", step, "keyPool", getKeyPoolState())));
                 AiProvider.ActionDecision decision = aiProvider.selectNextAction(
                     new AiProvider.ActionSelectionRequest(
                         task.getUserRequest(),
@@ -151,12 +190,27 @@ public class TaskExecutorService {
                         task.getWorkflowType().name()
                     )
                 );
+                aiCallCount++;
+                publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — chose: " + decision.actionType(), Map.of("phase", "SELECT_ACTION", "action", decision.actionType())));
 
                 // Check for DONE
                 if ("DONE".equals(decision.actionType())) {
                     publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
                         "Agent completed all planned steps", step, Map.of()));
                     break;
+                }
+
+                // No-progress detection: fingerprint = actionType + sorted key args
+                String fingerprint = computeActionFingerprint(decision);
+                recentActionFingerprints.add(fingerprint);
+                if (detectNoProgress(recentActionFingerprints)) {
+                    log.warn("Task {} stuck: action '{}' repeated {} times in last {} steps",
+                        taskId, decision.actionType(), NO_PROGRESS_THRESHOLD, NO_PROGRESS_WINDOW);
+                    publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                        "No progress detected — agent is repeating the same action", step, Map.of()));
+                    failTask(task, "Agent made no progress: repeated '" + decision.actionType()
+                        + "' action " + NO_PROGRESS_THRESHOLD + " times without advancing");
+                    return;
                 }
 
                 // Validate action
@@ -176,7 +230,6 @@ public class TaskExecutorService {
                         decision.approvalReason(), decision.actionType()));
                     updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
 
-                    // Wait for approval (poll DB)
                     ApprovalRequest resolved = waitForApproval(approval.getId(), taskId);
                     if (resolved == null || "REJECTED".equals(resolved.getStatus())) {
                         failTask(task, "Action was rejected by user or approval expired");
@@ -185,12 +238,16 @@ public class TaskExecutorService {
                     updateTaskStatus(task, TaskStatus.RUNNING, null);
                 }
 
-                // Record step
+                // Record step with observation epoch
+                Map<String, Object> enrichedArgs = new HashMap<>(decision.args() != null ? decision.args() : Map.of());
+                enrichedArgs.put("_observationEpoch", observationEpoch);
+                enrichedArgs.put("_observationHash", lastObservationHash);
+
                 TaskStep taskStep = TaskStep.builder()
                     .taskId(taskId)
                     .stepIndex(step)
                     .actionType(decision.actionType())
-                    .actionArgs(decision.args())
+                    .actionArgs(enrichedArgs)
                     .status("RUNNING")
                     .build();
                 taskStepRepository.save(taskStep);
@@ -220,6 +277,13 @@ public class TaskExecutorService {
                     consecutiveFailures = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
 
+                    // Update observation epoch on state change
+                    String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
+                    if (!newObsHash.equals(lastObservationHash)) {
+                        observationEpoch++;
+                        lastObservationHash = newObsHash;
+                    }
+
                     if (result.currentUrl() != null && !result.currentUrl().equals(currentUrl)) {
                         currentUrl = result.currentUrl();
                         if (!visitedUrls.contains(currentUrl)) {
@@ -233,7 +297,6 @@ public class TaskExecutorService {
                         pageTitle = result.pageTitle() != null ? result.pageTitle() : "";
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
 
-                        // Save text snippet for significant content
                         if (result.pageText().length() > 100) {
                             String snippet = result.pageText().substring(0, Math.min(2000, result.pageText().length()));
                             textSnippets.add("[" + result.pageTitle() + "] " + snippet);
@@ -244,17 +307,21 @@ public class TaskExecutorService {
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
-                    
+
                     if (consecutiveFailures >= maxRetries) {
                         failTask(task, "Browser action failed " + maxRetries + " times: " + result.error());
                         return;
                     }
-                    // Don't blindly retry; update state and re-observe
                     BrowserState state = browserWorkerClient.getState(taskId, sessionId);
                     if (state.currentUrl() != null) {
                         currentUrl = state.currentUrl();
                         pageText = state.pageText() != null ? state.pageText() : "";
                         pageTitle = state.pageTitle() != null ? state.pageTitle() : "";
+                        String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        if (!newObsHash.equals(lastObservationHash)) {
+                            observationEpoch++;
+                            lastObservationHash = newObsHash;
+                        }
                     }
                 }
             }
@@ -269,6 +336,7 @@ public class TaskExecutorService {
             updateTaskStatus(task, TaskStatus.VERIFYING, null);
             publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Synthesizing results...", maxSteps, Map.of()));
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — " + visitedUrls.size() + " URLs, " + textSnippets.size() + " snippets", Map.of("phase", "SYNTHESIZE", "keyPool", getKeyPoolState())));
             String synthesized = aiProvider.synthesizeResult(
                 new AiProvider.SynthesisRequest(
                     task.getUserRequest(),
@@ -278,9 +346,22 @@ public class TaskExecutorService {
                     recentActions
                 )
             );
+            aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — done", Map.of("phase", "SYNTHESIZE")));
 
-            // Step 5: Verify
-            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome...", maxSteps, Map.of()));
+            // Step 5: Evidence-based verification
+            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome against evidence...", maxSteps, Map.of()));
+
+            List<String> evidenceSummary = new ArrayList<>();
+            evidenceSummary.add("Visited " + visitedUrls.size() + " URLs");
+            evidenceSummary.add("Collected " + textSnippets.size() + " text snippets");
+            evidenceSummary.add("Executed " + recentActions.size() + " actions");
+            evidenceSummary.add("Observation epochs: " + observationEpoch);
+            if (!visitedUrls.isEmpty()) {
+                evidenceSummary.add("Final URL: " + currentUrl);
+            }
+
+            publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — checking evidence", Map.of("phase", "VERIFY", "keyPool", getKeyPoolState())));
             AiProvider.VerificationResult verification = aiProvider.verify(
                 new AiProvider.VerificationRequest(
                     task.getUserRequest(),
@@ -289,9 +370,12 @@ public class TaskExecutorService {
                     currentUrl,
                     pageText,
                     visitedUrls,
-                    synthesized
+                    synthesized,
+                    evidenceSummary
                 )
             );
+            aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — passed=" + verification.passed() + ", confidence=" + verification.confidence(), Map.of("phase", "VERIFY", "passed", verification.passed())));
 
             saveEvidence(taskId, "VERIFICATION_RESULT", "Verification",
                 "Passed: " + verification.passed() + "\n" + verification.notes(), null);
@@ -329,6 +413,16 @@ public class TaskExecutorService {
                 browserWorkerClient.closeSession(taskId, sessionId);
             }
             cancelledTasks.remove(taskId);
+
+            // Log AI call stats
+            String taskLabel = task != null ? truncate(task.getUserRequest(), 60) : taskId.toString();
+            log.info("Task {} AI call stats: total={}, breakdown=classify/plan/action/synth/verify/retry",
+                taskId, aiCallCount);
+            if (aiProvider instanceof GeminiAiProvider gp) {
+                AiCallStats stats = gp.getOrCreateStats(taskLabel);
+                log.info("Task {} model call breakdown: {}", taskId, stats.snapshot());
+                gp.clearStats(taskLabel);
+            }
         }
     }
 
@@ -469,11 +563,54 @@ public class TaskExecutorService {
         }
     }
 
+    private String computeActionFingerprint(AiProvider.ActionDecision decision) {
+        String type = decision.actionType();
+        Map<String, Object> args = decision.args() != null ? decision.args() : Map.of();
+        String keyArgs = args.entrySet().stream()
+            .filter(e -> !e.getKey().startsWith("_"))
+            .sorted(Map.Entry.comparingByKey())
+            .map(e -> e.getKey() + "=" + e.getValue())
+            .reduce((a, b) -> a + "&" + b)
+            .orElse("");
+        return type + "|" + keyArgs;
+    }
+
+    private boolean detectNoProgress(List<String> fingerprints) {
+        if (fingerprints.size() < NO_PROGRESS_THRESHOLD) return false;
+        int windowStart = Math.max(0, fingerprints.size() - NO_PROGRESS_WINDOW);
+        List<String> window = fingerprints.subList(windowStart, fingerprints.size());
+        Map<String, Integer> counts = new HashMap<>();
+        for (String fp : window) {
+            int count = counts.merge(fp, 1, Integer::sum);
+            if (count >= NO_PROGRESS_THRESHOLD) return true;
+        }
+        return false;
+    }
+
+    private String computeObservationHash(String url, String title, String text) {
+        String input = (url != null ? url : "") + "|"
+            + (title != null ? title : "") + "|"
+            + (text != null ? text.substring(0, Math.min(500, text.length())) : "");
+        return Integer.toHexString(input.hashCode());
+    }
+
+    private String truncate(String text, int maxLength) {
+        if (text == null) return "";
+        return text.length() > maxLength ? text.substring(0, maxLength) : text;
+    }
+
     private void publishEvent(TaskEvent event) {
         try {
             eventPublisher.publish(event);
         } catch (Exception e) {
             log.debug("Event publish failed: {}", e.getMessage());
         }
+    }
+
+    private String getKeyPoolState() {
+        if (aiProvider instanceof GeminiAiProvider gp) {
+            return gp.getKeyPool().getKeyStates().toString();
+        }
+        return "N/A";
     }
 }

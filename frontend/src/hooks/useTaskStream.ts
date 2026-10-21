@@ -49,7 +49,7 @@ export function useTaskStream(
     // Listen for all named events
     const eventTypes = [
       'connected', 'status_change', 'step_update',
-      'screenshot', 'approval_required', 'error', 'completed'
+      'screenshot', 'approval_required', 'error', 'completed', 'debug'
     ];
     eventTypes.forEach(type => es.addEventListener(type, handleEvent));
 

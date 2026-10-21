@@ -41,8 +41,7 @@ function AiModeIndicator() {
   const [aiMode, setAiMode] = useState<string | null>(null);
 
   useEffect(() => {
-    const baseUrl = process.env.NEXT_PUBLIC_API_URL || `http://${window.location.hostname}:8082`;
-    fetch(`${baseUrl}/api/tasks/health`)
+    fetch(`/api/tasks/health`)
       .then(res => res.json())
       .then(data => setAiMode(data.aiMode || null))
       .catch(() => setAiMode(null));

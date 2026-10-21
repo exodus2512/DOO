@@ -101,7 +101,12 @@ export default function TaskDetailPage() {
 
   // Reactive SSE listener
   useTaskStream(taskId, (event: TaskStreamEvent) => {
-    console.log('SSE Event received:', event);
+    if (event.eventType === 'debug') {
+      const data = event.data as any;
+      const keyPool = data?.keyPool || '';
+      console.log(`%c[DOO] ${event.message}`, 'color: #38bdf8; font-weight: bold', keyPool ? `| keys: ${keyPool}` : '');
+      return;
+    }
 
     if (event.status) {
       setTask((prev) => (prev ? { ...prev, status: event.status as any } : null));
@@ -430,6 +435,32 @@ export default function TaskDetailPage() {
       {result && (
         <div className="space-y-4 animate-fade-in">
           <ResultCard result={result} taskStatus={task?.status} />
+        </div>
+      )}
+
+      {/* Failure reason when no result card */}
+      {!result && task?.status === 'FAILED' && task.failureReason && (
+        <div className="glass-panel rounded-2xl p-6 space-y-3 border border-rose-800/30">
+          <div className="flex items-center space-x-2">
+            <XCircle className="w-5 h-5 text-rose-400" />
+            <h3 className="text-sm font-bold text-rose-300">Task Failed</h3>
+          </div>
+          <p className="text-xs text-slate-300 font-mono bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 leading-relaxed">
+            {task.failureReason}
+          </p>
+        </div>
+      )}
+
+      {/* Cancelled notice */}
+      {task?.status === 'CANCELLED' && !result && (
+        <div className="glass-panel rounded-2xl p-6 space-y-3 border border-slate-700/30">
+          <div className="flex items-center space-x-2">
+            <Ban className="w-5 h-5 text-slate-400" />
+            <h3 className="text-sm font-bold text-slate-300">Task Cancelled</h3>
+          </div>
+          <p className="text-xs text-slate-400">
+            This task was cancelled before completion. Any evidence collected up to that point is shown below.
+          </p>
         </div>
       )}
 

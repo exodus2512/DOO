@@ -22,7 +22,8 @@ const BLOCKED_SCHEMES = ['file:', 'data:', 'javascript:', 'ftp:', 'blob:'];
 
 const ALLOWED_ACTIONS = new Set([
   'NAVIGATE', 'CLICK', 'FILL', 'EXTRACT_TEXT', 'SCREENSHOT',
-  'SCROLL', 'WAIT', 'DONE', 'GO_BACK', 'GET_CONTENT'
+  'SCROLL', 'WAIT', 'DONE', 'GO_BACK', 'GET_CONTENT',
+  'SELECT_OPTION', 'PRESS_KEY',
 ]);
 
 const BLOCKED_ACTIONS = new Set([

@@ -125,5 +125,9 @@ public class TaskEventPublisher {
         public static TaskEvent completed(UUID taskId, String summary) {
             return new TaskEvent(taskId, "completed", "COMPLETED", summary, Map.of(), Instant.now());
         }
+
+        public static TaskEvent debug(UUID taskId, String message, Map<String, Object> data) {
+            return new TaskEvent(taskId, "debug", null, message, data != null ? data : Map.of(), Instant.now());
+        }
     }
 }
