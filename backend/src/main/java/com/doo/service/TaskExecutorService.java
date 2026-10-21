@@ -353,7 +353,7 @@ public class TaskExecutorService {
                     if (pauseResult.pageTitle != null) pageTitle = pauseResult.pageTitle;
                     if (pauseResult.pageText != null) {
                         pageText = pauseResult.pageText;
-                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                         observationEpoch++;
                     }
                 }
@@ -470,7 +470,7 @@ public class TaskExecutorService {
                     if (challengeResult.pageTitle != null) pageTitle = challengeResult.pageTitle;
                     if (challengeResult.pageText != null) {
                         pageText = challengeResult.pageText;
-                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                         observationEpoch++;
                     }
                     recentActions.add("CHALLENGE_RESOLVED: user completed " +
@@ -497,7 +497,7 @@ public class TaskExecutorService {
                         pageText = result.pageText();
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
                     }
-                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                     if (!newObsHash.equals(lastObservationHash)) {
                         observationEpoch++;
                         lastObservationHash = newObsHash;
@@ -538,7 +538,7 @@ public class TaskExecutorService {
                     }
 
                     // Update observation epoch on state change
-                    String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
+                    String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText(), lastInteractiveElements);
                     if (!newObsHash.equals(lastObservationHash)) {
                         observationEpoch++;
                         lastObservationHash = newObsHash;
@@ -584,7 +584,7 @@ public class TaskExecutorService {
                         pageText = result.pageText();
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
                     }
-                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                     if (!newObsHash.equals(lastObservationHash)) {
                         observationEpoch++;
                         lastObservationHash = newObsHash;
@@ -599,7 +599,7 @@ public class TaskExecutorService {
                         currentUrl = state.currentUrl();
                         pageText = state.pageText() != null ? state.pageText() : "";
                         pageTitle = state.pageTitle() != null ? state.pageTitle() : "";
-                        String updatedHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        String updatedHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                         if (!updatedHash.equals(lastObservationHash)) {
                             observationEpoch++;
                             lastObservationHash = updatedHash;
@@ -1195,10 +1195,23 @@ public class TaskExecutorService {
     }
 
     private String computeObservationHash(String url, String title, String text) {
-        String input = (url != null ? url : "") + "|"
-            + (title != null ? title : "") + "|"
-            + (text != null ? text.substring(0, Math.min(500, text.length())) : "");
-        return Integer.toHexString(input.hashCode());
+        return computeObservationHash(url, title, text, null);
+    }
+
+    private String computeObservationHash(String url, String title, String text, List<Map<String, Object>> elements) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(url != null ? url : "").append("|")
+          .append(title != null ? title : "").append("|")
+          .append(text != null ? text.substring(0, Math.min(500, text.length())) : "");
+        if (elements != null) {
+            for (Map<String, Object> el : elements) {
+                Object v = el.get("value");
+                if (v != null && !v.toString().isBlank()) {
+                    sb.append("|").append(el.get("index")).append("=").append(v);
+                }
+            }
+        }
+        return Integer.toHexString(sb.toString().hashCode());
     }
 
     private String truncate(String text, int maxLength) {
