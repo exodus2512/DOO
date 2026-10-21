@@ -257,6 +257,18 @@ public class GeminiAiProvider implements AiProvider {
 
         String credBlock = request.credentialHints() != null ? request.credentialHints() : "";
 
+        String scrollBlock = "";
+        if (request.scroll() != null) {
+            Object scrollY = request.scroll().getOrDefault("scrollY", 0);
+            Object pageHeight = request.scroll().getOrDefault("pageHeight", 0);
+            Object viewportHeight = request.scroll().getOrDefault("viewportHeight", 0);
+            scrollBlock = String.format("Scroll position: %s/%spx (viewport %spx)", scrollY, pageHeight, viewportHeight);
+        }
+
+        String extractionProgress = request.extractedSnippetCount() > 0
+            ? "Extracted snippets so far: " + request.extractedSnippetCount()
+            : "";
+
         String prompt = """
             You are DOO, an AI browser agent selecting the next browser action.
 
@@ -264,6 +276,8 @@ public class GeminiAiProvider implements AiProvider {
             Current plan step %d: %s
             Current URL: %s
             Page title: %s
+            %s
+            %s
             %s
             Recent actions: %s
             %s
@@ -301,6 +315,8 @@ public class GeminiAiProvider implements AiProvider {
             - Comparison: visit each item's page → EXTRACT_TEXT same fields from each → let SYNTHESIZE combine
             - QA audit: NAVIGATE each page → check links/forms/content → EXTRACT_TEXT findings
             - Pagination: after extracting, look for "Next" or page number links and CLICK to continue
+            - Long page: if scroll position shows content below viewport, SCROLL down → EXTRACT_TEXT → repeat
+            - Multi-tab: use GO_BACK to return after visiting a sub-page, rather than re-navigating from scratch
 
             RULES:
             - FILL only puts text into a single field. It does NOT submit the form.
@@ -334,6 +350,7 @@ public class GeminiAiProvider implements AiProvider {
                 request.currentUrl(),
                 request.pageTitle(),
                 pageStateBlock,
+                scrollBlock + (extractionProgress.isEmpty() ? "" : "\n            " + extractionProgress),
                 String.join(", ", request.recentActions().stream().limit(5).toList()),
                 obsIdLine,
                 credBlock
@@ -520,6 +537,68 @@ public class GeminiAiProvider implements AiProvider {
         } catch (Exception e) {
             log.error("[LLM_ONLY] Failed: {}", e.getMessage());
             throw new RuntimeException("AI provider error during direct answer: " + e.getMessage(), e);
+        }
+    }
+
+    @Override
+    public TaskPlan replan(ReplanRequest request) {
+        if (!isAvailable()) {
+            return new TaskPlan(List.of(
+                "[NAVIGATE] Go to a search engine",
+                "[EXTRACT] Try alternative approach",
+                "[SYNTHESIZE] Produce result from available data"
+            ), "Recover from failure and complete the task");
+        }
+        String prompt = """
+            You are DOO, a general-purpose AI browser agent. The original plan hit a problem and you need to replan.
+
+            User request: "%s"
+            Workflow type: %s
+            Original plan steps: %s
+            Failed at step %d: %s
+            Current URL: %s
+            Current page title: %s
+            Actions completed so far: %s
+
+            Create a NEW plan that picks up from the current state. Do NOT repeat steps that already succeeded.
+            Use the same step type prefixes: [NAVIGATE], [SEARCH], [EXTRACT], [INTERACT], [COMPARE], [ASK_USER], [SYNTHESIZE], [VERIFY].
+
+            Rules:
+            - Maximum 6 remaining steps.
+            - If the failure was a navigation error, try an alternative URL or search approach.
+            - If the failure was an interaction error, try a different element or approach.
+            - If enough data has already been collected, skip to [SYNTHESIZE].
+            - Do NOT repeat the exact same action that failed.
+
+            Respond in JSON format ONLY:
+            {
+              "steps": ["[TYPE] step description", ...],
+              "successCriteria": "refined testable criteria"
+            }
+            """.formatted(
+                request.userRequest(),
+                request.workflowType(),
+                String.join("; ", request.originalSteps()),
+                request.failedAtStep(),
+                request.failureReason(),
+                request.currentUrl() != null ? request.currentUrl() : "none",
+                request.pageTitle() != null ? request.pageTitle() : "none",
+                String.join("; ", request.completedActions().stream().limit(10).toList())
+            );
+
+        try {
+            String taskLabel = truncate(request.userRequest(), 60);
+            log.info("[REPLAN] Replanning after failure at step {}: {}", request.failedAtStep(), request.failureReason());
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.PLAN);
+            String response = callGemini(prompt, taskLabel);
+            JsonNode json = objectMapper.readTree(extractJson(response));
+            List<String> steps = new ArrayList<>();
+            json.path("steps").forEach(n -> steps.add(n.asText()));
+            log.info("[REPLAN] New plan: {} steps", steps.size());
+            return new TaskPlan(steps, json.path("successCriteria").asText(""));
+        } catch (Exception e) {
+            log.error("[REPLAN] Failed: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during replanning: " + e.getMessage(), e);
         }
     }
 

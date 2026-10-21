@@ -58,6 +58,7 @@ public class TaskExecutorService {
     private static final int NO_PROGRESS_WINDOW = 5;
     private static final int NO_PROGRESS_THRESHOLD = 3;
     private static final int IDENTICAL_CONSECUTIVE_LIMIT = 2;
+    private static final int MAX_REPLANS = 2;
 
     // Track cancelled tasks to prevent actions being dispatched after cancellation
     private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
@@ -121,22 +122,20 @@ public class TaskExecutorService {
             publishEvent(TaskEvent.taskUpdated(taskId, classification.workflowType()));
 
             publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — generating", Map.of("phase", "PLAN", "keyPool", getKeyPoolState())));
-            AiProvider.TaskPlan plan = aiProvider.generatePlan(
+            final AiProvider.TaskPlan[] planHolder = { aiProvider.generatePlan(
                 task.getUserRequest(),
                 classification.successCriteria(),
                 new AiProvider.WorkflowContext(classification.workflowType())
-            );
+            ) };
             aiCallCount++;
-            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — " + plan.steps().size() + " steps", Map.of("phase", "PLAN", "steps", plan.steps().size())));
+            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — " + planHolder[0].steps().size() + " steps", Map.of("phase", "PLAN", "steps", planHolder[0].steps().size())));
 
-            String planText = String.join("\n", plan.steps().stream()
-                .map((s) -> (plan.steps().indexOf(s) + 1) + ". " + s)
-                .toList());
+            String planText = formatPlanText(planHolder[0]);
             task.setPlan(planText);
             taskRepository.save(task);
 
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
-                "Plan created: " + plan.steps().size() + " steps", 0,
+                "Plan created: " + planHolder[0].steps().size() + " steps", 0,
                 Map.of("plan", planText)));
 
             // ── Routing: decide execution path based on workflow type ──
@@ -185,7 +184,7 @@ public class TaskExecutorService {
             // Credential hints for the AI prompt — placeholders, never actual passwords
             String credentialHints = null;
             if (wfType.requiresBrowser()) {
-                CredentialGateResult credResult = checkCredentialGate(task, plan.steps(), sessionId);
+                CredentialGateResult credResult = checkCredentialGate(task, planHolder[0].steps(), sessionId);
                 if (credResult.needsPause && !credResult.resolved) {
                     return;
                 }
@@ -220,8 +219,10 @@ public class TaskExecutorService {
             final int MAX_RESOLVER_RETRIES = 2;
             int screenshotCount = 0;
             List<String> screenshotLog = new ArrayList<>();
+            Map<String, Object> lastScrollInfo = null;
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
+            int replanCount = 0;
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -250,7 +251,7 @@ public class TaskExecutorService {
                         task.getUserRequest(),
                         task.getPlan(),
                         step,
-                        plan.steps(),
+                        planHolder[0].steps(),
                         currentUrl,
                         pageTitle,
                         pageText,
@@ -260,7 +261,9 @@ public class TaskExecutorService {
                         task.getWorkflowType().name(),
                         lastObservationId,
                         lastInteractiveElements,
-                        credentialHints
+                        credentialHints,
+                        lastScrollInfo,
+                        textSnippets.size()
                     )
                 );
                 aiCallCount++;
@@ -594,12 +597,15 @@ public class TaskExecutorService {
                         lastObservationId = result.observationId();
                         lastInteractiveElements = result.interactiveElements();
                     }
+                    if (result.scroll() != null) {
+                        lastScrollInfo = result.scroll();
+                    }
 
                     // For EXTRACT_TEXT, save the action's direct result as primary evidence
                     if ("EXTRACT_TEXT".equals(decision.actionType()) && result.result() != null && result.result().length() > 50) {
                         String extractLabel = (String) decision.args().getOrDefault("label", "Extracted content");
-                        String extractSnippet = result.result().substring(0, Math.min(4000, result.result().length()));
-                        textSnippets.add("[" + extractLabel + "] " + extractSnippet);
+                        String extractSnippet = result.result().substring(0, Math.min(6000, result.result().length()));
+                        textSnippets.add("[" + extractLabel + " — " + currentUrl + "] " + extractSnippet);
                         saveEvidence(taskId, "TEXT_SNIPPET", extractLabel, extractSnippet, currentUrl);
                     }
 
@@ -657,7 +663,34 @@ public class TaskExecutorService {
                     }
 
                     if (consecutiveFailures >= maxRetries) {
-                        failTask(task, "Browser action failed " + maxRetries + " times: " + result.error());
+                        if (replanCount < MAX_REPLANS) {
+                            replanCount++;
+                            log.info("Task {} — {} consecutive failures, attempting replan {}/{}", taskId, consecutiveFailures, replanCount, MAX_REPLANS);
+                            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                                "Replanning after " + consecutiveFailures + " failures...", step, Map.of()));
+                            try {
+                                AiProvider.TaskPlan newPlan = aiProvider.replan(new AiProvider.ReplanRequest(
+                                    task.getUserRequest(), task.getWorkflowType().name(),
+                                    planHolder[0].steps(), step, result.error() != null ? result.error() : "action failed",
+                                    currentUrl, pageTitle, recentActions
+                                ));
+                                aiCallCount++;
+                                planHolder[0] = newPlan;
+                                String newPlanText = formatPlanText(newPlan);
+                                task.setPlan(newPlanText);
+                                task.setSuccessCriteria(newPlan.successCriteria());
+                                taskRepository.save(task);
+                                publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                                    "Replanned: " + newPlan.steps().size() + " new steps", step, Map.of("plan", newPlanText)));
+                                consecutiveFailures = 0;
+                                step = -1; // will be incremented to 0 by the loop
+                                recentActionFingerprints.clear();
+                                continue;
+                            } catch (Exception replanEx) {
+                                log.warn("Task {} — replan failed: {}", taskId, replanEx.getMessage());
+                            }
+                        }
+                        failTask(task, "Browser action failed " + maxRetries + " times (after " + replanCount + " replans): " + result.error());
                         return;
                     }
                     BrowserState state = browserWorkerClient.getState(taskId, sessionId);
@@ -1282,6 +1315,16 @@ public class TaskExecutorService {
             }
         }
         return Integer.toHexString(sb.toString().hashCode());
+    }
+
+    private static String formatPlanText(AiProvider.TaskPlan plan) {
+        List<String> steps = plan.steps();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < steps.size(); i++) {
+            if (i > 0) sb.append("\n");
+            sb.append(i + 1).append(". ").append(steps.get(i));
+        }
+        return sb.toString();
     }
 
     private String truncate(String text, int maxLength) {

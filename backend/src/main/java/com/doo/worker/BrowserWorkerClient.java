@@ -98,8 +98,12 @@ public class BrowserWorkerClient {
             java.util.List<java.util.Map<String, Object>> challenges =
                 (java.util.List<java.util.Map<String, Object>>) response.get("challenges");
 
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, Object> scroll =
+                (java.util.Map<String, Object>) response.get("scroll");
+
             return new ActionResult(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                accessibilityTree, observationId, interactiveElements, challenges);
+                accessibilityTree, observationId, interactiveElements, challenges, scroll);
         } catch (WebClientResponseException e) {
             log.error("Browser worker HTTP error {}: {}", e.getStatusCode(), e.getMessage());
             return ActionResult.failure("Browser worker error: " + e.getStatusCode() + " " + e.getResponseBodyAsString());
@@ -306,18 +310,28 @@ public class BrowserWorkerClient {
         String accessibilityTree,
         String observationId,
         java.util.List<java.util.Map<String, Object>> interactiveElements,
-        java.util.List<java.util.Map<String, Object>> challenges
+        java.util.List<java.util.Map<String, Object>> challenges,
+        java.util.Map<String, Object> scroll
     ) {
         /** Convenience constructor without perception fields (for tests and simple callers). */
         public ActionResult(boolean success, String result, String error, String screenshot,
                             String currentUrl, String pageTitle, String pageText,
                             String accessibilityTree) {
             this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                 accessibilityTree, null, null, null);
+                 accessibilityTree, null, null, null, null);
+        }
+
+        public ActionResult(boolean success, String result, String error, String screenshot,
+                            String currentUrl, String pageTitle, String pageText,
+                            String accessibilityTree, String observationId,
+                            java.util.List<java.util.Map<String, Object>> interactiveElements,
+                            java.util.List<java.util.Map<String, Object>> challenges) {
+            this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
+                 accessibilityTree, observationId, interactiveElements, challenges, null);
         }
 
         public static ActionResult failure(String error) {
-            return new ActionResult(false, null, error, null, null, null, null, null, null, null, null);
+            return new ActionResult(false, null, error, null, null, null, null, null, null, null, null, null);
         }
     }
 

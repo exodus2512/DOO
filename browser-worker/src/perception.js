@@ -248,6 +248,16 @@ async function buildObservation(page, taskId, options = {}) {
     });
   } catch { /* continue without challenge detection */ }
 
+  // Scroll position and page dimensions — lets the AI decide whether to scroll for more content
+  let scrollInfo = { scrollY: 0, pageHeight: 0, viewportHeight: 0 };
+  try {
+    scrollInfo = await page.evaluate(() => ({
+      scrollY: Math.round(window.scrollY),
+      pageHeight: Math.round(document.documentElement.scrollHeight),
+      viewportHeight: Math.round(window.innerHeight),
+    }));
+  } catch { /* continue with defaults */ }
+
   return {
     schema_version: SCHEMA_VERSION,
     observation_id: observationId,
@@ -262,6 +272,7 @@ async function buildObservation(page, taskId, options = {}) {
     interactive_elements: interactiveElements,
     screenshot: screenshotData,
     challenges: challenges.length > 0 ? challenges : null,
+    scroll: scrollInfo,
     metadata: {
       interactive_elements_count: interactiveElements.length,
       interactive_elements_truncated: elementsTruncated,

@@ -38,6 +38,22 @@ public interface AiProvider {
      */
     String directAnswer(String userRequest);
 
+    /**
+     * Replan from the current state after a failure or when the original plan can't proceed.
+     */
+    TaskPlan replan(ReplanRequest request);
+
+    record ReplanRequest(
+        String userRequest,
+        String workflowType,
+        List<String> originalSteps,
+        int failedAtStep,
+        String failureReason,
+        String currentUrl,
+        String pageTitle,
+        List<String> completedActions
+    ) {}
+
     record WorkflowClassification(
         String workflowType,
         String rationale,
@@ -80,7 +96,11 @@ public interface AiProvider {
         String observationId,
         List<java.util.Map<String, Object>> interactiveElements,
         // Credential hints for vault/gate — placeholders, never actual passwords
-        String credentialHints
+        String credentialHints,
+        // Scroll position: {scrollY, pageHeight, viewportHeight}
+        java.util.Map<String, Object> scroll,
+        // How many text extractions have been collected so far
+        int extractedSnippetCount
     ) {
         // Backward-compat constructor for tests that don't have observation data
         public ActionSelectionRequest(
@@ -89,7 +109,18 @@ public interface AiProvider {
             List<String> recentActions, List<String> allowedActionTypes, String workflowType) {
             this(userRequest, currentPlan, currentStep, planSteps, currentUrl, pageTitle,
                  pageText, accessibilityTree, recentActions, allowedActionTypes, workflowType,
-                 null, null, null);
+                 null, null, null, null, 0);
+        }
+
+        public ActionSelectionRequest(
+            String userRequest, String currentPlan, int currentStep, List<String> planSteps,
+            String currentUrl, String pageTitle, String pageText, String accessibilityTree,
+            List<String> recentActions, List<String> allowedActionTypes, String workflowType,
+            String observationId, List<java.util.Map<String, Object>> interactiveElements,
+            String credentialHints) {
+            this(userRequest, currentPlan, currentStep, planSteps, currentUrl, pageTitle,
+                 pageText, accessibilityTree, recentActions, allowedActionTypes, workflowType,
+                 observationId, interactiveElements, credentialHints, null, 0);
         }
     }
 

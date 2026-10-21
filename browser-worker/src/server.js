@@ -171,6 +171,10 @@ app.post('/action/execute', async (req, res) => {
       if (obs.challenges) {
         result.challenges = obs.challenges;
       }
+      // Forward scroll position for pagination awareness
+      if (obs.scroll) {
+        result.scroll = obs.scroll;
+      }
     }
 
     console.log(`[/action/execute] Task ${taskId} | ${actionType} | success=${result.success} | obsId=${result.observationId || 'none'} | url=${(result.currentUrl || '').substring(0, 60)}`);

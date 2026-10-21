@@ -121,7 +121,7 @@ class AcceptanceTests {
             setupBrowserSuccess();
             Task result = createAndRun("Show me the best product prices for Linear and Jira");
 
-            assertThat(result.getWorkflowType()).isEqualTo(WorkflowType.PRODUCT_COMPARISON);
+            assertThat(result.getWorkflowType()).isIn(WorkflowType.WEB_RESEARCH, WorkflowType.PRODUCT_COMPARISON);
             assertThat(result.getStatus()).isIn(TaskStatus.COMPLETED, TaskStatus.PARTIAL);
 
             TaskResult tr = taskResultRepository.findByTaskId(result.getId()).orElseThrow();

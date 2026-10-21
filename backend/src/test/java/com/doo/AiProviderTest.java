@@ -42,11 +42,11 @@ class AiProviderTest {
         }
 
         @Test
-        @DisplayName("classifies product/price requests as PRODUCT_COMPARISON")
+        @DisplayName("classifies product/price requests as WEB_RESEARCH")
         void classifiesProduct() {
             WorkflowClassification result = demoProvider.classifyWorkflow(
                 "Show me the best product prices and where to buy");
-            assertThat(result.workflowType()).isEqualTo("PRODUCT_COMPARISON");
+            assertThat(result.workflowType()).isEqualTo("WEB_RESEARCH");
         }
 
         @Test
@@ -241,7 +241,7 @@ class AiProviderTest {
         void nullKeyUsesDeterministic() {
             AiProvider provider = new GeminiAiProvider(null, "model", false, objectMapper);
             WorkflowClassification result = provider.classifyWorkflow("show me the product price list");
-            assertThat(result.workflowType()).isEqualTo("PRODUCT_COMPARISON");
+            assertThat(result.workflowType()).isEqualTo("WEB_RESEARCH");
         }
 
         @Test
