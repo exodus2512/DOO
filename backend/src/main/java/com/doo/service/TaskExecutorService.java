@@ -175,6 +175,17 @@ public class TaskExecutorService {
                 return;
             }
 
+            // ── Credential gate: detect login steps and resolve credentials ──
+            Map<String, String> taskCredentials = new HashMap<>(); // domain -> credentials resolved for this run
+            if (wfType.requiresBrowser()) {
+                CredentialGateResult credResult = checkCredentialGate(task, plan.steps(), sessionId);
+                if (credResult.needsPause && !credResult.resolved) {
+                    // Failed to get credentials — task was already failed inside checkCredentialGate
+                    return;
+                }
+                taskCredentials.putAll(credResult.credentials);
+            }
+
             // ── Browser path: WEB_RESEARCH, PRODUCT_COMPARISON, UI_INTERACTION ──
             // Step 2: Initialize browser session
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Launching browser...", 0, Map.of()));
@@ -838,6 +849,195 @@ public class TaskExecutorService {
         // 30-minute timeout
         log.warn("Task {} WAIT_TIMEOUT after {}s", taskId, PAUSE_TIMEOUT_SECONDS);
         return PauseResult.failed("WAIT_TIMEOUT: no user response within " + (PAUSE_TIMEOUT_SECONDS / 60) + " minutes");
+    }
+
+    // ─── Credential gate (PIECE 1) ──────────────────────────────────────────────
+
+    private static final java.util.regex.Pattern LOGIN_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)(log\\s*in|sign\\s*in|authenticate|enter.*password|enter.*credentials|provide.*username)"
+    );
+
+    record CredentialGateResult(
+        boolean needsPause,
+        boolean resolved,
+        Map<String, String> credentials // domain -> "username:password" (only for this run)
+    ) {
+        static CredentialGateResult noop() {
+            return new CredentialGateResult(false, true, Map.of());
+        }
+    }
+
+    /**
+     * Scan plan steps for login/sign-in indicators. If found, try to extract credentials
+     * from the task instruction. If not present, pause to ask the user.
+     *
+     * SECURITY: credentials from the instruction are used for THIS RUN ONLY and never persisted to the vault.
+     */
+    CredentialGateResult checkCredentialGate(Task task, List<String> planSteps, String sessionId) {
+        UUID taskId = task.getId();
+        String userRequest = task.getUserRequest();
+
+        // 1. Do any plan steps involve login?
+        boolean hasLoginStep = planSteps.stream().anyMatch(s -> LOGIN_PATTERN.matcher(s).find());
+        if (!hasLoginStep) {
+            // Also check if the user request itself mentions login
+            if (!LOGIN_PATTERN.matcher(userRequest).find()) {
+                return CredentialGateResult.noop();
+            }
+        }
+
+        log.info("Task {} — credential gate triggered: login step detected in plan", taskId);
+
+        // 2. Try to extract a target domain from the user request
+        String targetDomain = extractDomain(userRequest);
+
+        // 3. Check if credentials are embedded in the user request
+        Map<String, String> extractedCreds = extractCredentialsFromInstruction(userRequest);
+        if (!extractedCreds.isEmpty()) {
+            log.info("Task {} — credentials found in instruction for domain(s): {}", taskId, extractedCreds.keySet());
+            publishEvent(TaskEvent.debug(taskId, "Credentials found in instruction — using for this run only",
+                Map.of("domains", extractedCreds.keySet().toString())));
+            return new CredentialGateResult(true, true, extractedCreds);
+        }
+
+        // 4. No credentials in instruction — pause and ask the user
+        log.info("Task {} — no credentials in instruction, pausing for user", taskId);
+
+        String domain = targetDomain != null ? targetDomain : "unknown site";
+        ApprovalRequest approval = ApprovalRequest.builder()
+            .taskId(taskId)
+            .prompt("Login required for " + domain)
+            .proposedAction("CREDENTIAL_REQUEST")
+            .parameters(Map.of(
+                "type", "credential_request",
+                "domain", domain,
+                "fields", List.of("username", "password"),
+                "saveToVault", false
+            ))
+            .status("PENDING")
+            .build();
+        approval = approvalRepository.save(approval);
+
+        // Use the pause/resume machine (but sessionId may be null if we haven't launched browser yet)
+        // We need to init the browser first for the pause to work, or handle pre-browser pause
+        if (sessionId == null) {
+            // We haven't launched the browser yet — do a lightweight pause without parking
+            updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
+            publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
+                "Login required for " + domain, "CREDENTIAL_REQUEST"));
+            publishEvent(TaskEvent.waiting(taskId, "Login required for " + domain, Map.of(
+                "approvalId", approval.getId().toString(),
+                "type", "credential_request",
+                "domain", domain,
+                "timeoutSeconds", PAUSE_TIMEOUT_SECONDS
+            )));
+
+            // Poll for resolution
+            int waited = 0;
+            while (waited < PAUSE_TIMEOUT_SECONDS * 1000) {
+                if (isCancelled(taskId)) {
+                    failTask(task, "Task cancelled while waiting for credentials");
+                    return new CredentialGateResult(true, false, Map.of());
+                }
+                try { Thread.sleep(PAUSE_POLL_INTERVAL_MS); } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    failTask(task, "Interrupted while waiting for credentials");
+                    return new CredentialGateResult(true, false, Map.of());
+                }
+                waited += PAUSE_POLL_INTERVAL_MS;
+
+                ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+                if (resolved == null) {
+                    failTask(task, "Credential request disappeared");
+                    return new CredentialGateResult(true, false, Map.of());
+                }
+                if ("APPROVED".equals(resolved.getStatus())) {
+                    updateTaskStatus(task, TaskStatus.RUNNING, null);
+                    publishEvent(TaskEvent.statusChange(taskId, "RUNNING", "Credentials received"));
+                    // Extract credentials from the approval response
+                    Map<String, String> creds = parseCredentialResponse(resolved, domain);
+                    return new CredentialGateResult(true, true, creds);
+                }
+                if ("REJECTED".equals(resolved.getStatus())) {
+                    failTask(task, "User declined to provide credentials");
+                    return new CredentialGateResult(true, false, Map.of());
+                }
+                if (resolved.isExpired()) {
+                    resolved.setStatus("EXPIRED");
+                    approvalRepository.save(resolved);
+                    failTask(task, "Credential request expired");
+                    return new CredentialGateResult(true, false, Map.of());
+                }
+            }
+            failTask(task, "WAIT_TIMEOUT: no credentials provided within " + (PAUSE_TIMEOUT_SECONDS / 60) + " minutes");
+            return new CredentialGateResult(true, false, Map.of());
+        }
+
+        // Browser already running — use full pause/resume
+        PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
+            "Login required for " + domain, "CREDENTIAL_REQUEST", task.getCurrentStep());
+        if (!pauseResult.resumed) {
+            failTask(task, pauseResult.failureReason());
+            return new CredentialGateResult(true, false, Map.of());
+        }
+        ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+        Map<String, String> creds = resolved != null ? parseCredentialResponse(resolved, domain) : Map.of();
+        return new CredentialGateResult(true, true, creds);
+    }
+
+    private String extractDomain(String text) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+            "(?:https?://)?([a-zA-Z0-9][-a-zA-Z0-9]*\\.[a-zA-Z]{2,}(?:\\.[a-zA-Z]{2,})?)"
+        ).matcher(text);
+        return m.find() ? m.group(1).toLowerCase() : null;
+    }
+
+    /**
+     * Extract credentials from the user's instruction text.
+     * Looks for patterns like "username: X, password: Y" or "login with X / Y".
+     * Returns domain -> "username\npassword" mapping.
+     */
+    private Map<String, String> extractCredentialsFromInstruction(String text) {
+        Map<String, String> result = new HashMap<>();
+        String domain = extractDomain(text);
+        if (domain == null) domain = "default";
+
+        // Pattern: username: X password: Y (or user/pass variants)
+        java.util.regex.Matcher userMatcher = java.util.regex.Pattern.compile(
+            "(?i)(?:user(?:name)?|login|email)[:\\s]+[\"']?([^\"',\\s]+)[\"']?"
+        ).matcher(text);
+        java.util.regex.Matcher passMatcher = java.util.regex.Pattern.compile(
+            "(?i)(?:pass(?:word)?|secret|pin)[:\\s]+[\"']?([^\"',\\s]+)[\"']?"
+        ).matcher(text);
+
+        if (userMatcher.find() && passMatcher.find()) {
+            result.put(domain, userMatcher.group(1) + "\n" + passMatcher.group(1));
+        }
+        return result;
+    }
+
+    private Map<String, String> parseCredentialResponse(ApprovalRequest approval, String domain) {
+        Map<String, String> creds = new HashMap<>();
+        String response = approval.getUserResponse();
+        Map<String, Object> params = approval.getParameters();
+
+        // The frontend sends credentials as JSON in userResponse
+        if (response != null && !response.isBlank()) {
+            try {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> parsed = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(response, Map.class);
+                String username = (String) parsed.getOrDefault("username", "");
+                String password = (String) parsed.getOrDefault("password", "");
+                if (!username.isBlank() && !password.isBlank()) {
+                    creds.put(domain, username + "\n" + password);
+                }
+                // Note: "saveToVault" is handled by PIECE 2
+            } catch (Exception e) {
+                log.warn("Could not parse credential response: {}", e.getMessage());
+            }
+        }
+        return creds;
     }
 
     private void saveEvidence(UUID taskId, String type, String label, String content, String sourceUrl) {
