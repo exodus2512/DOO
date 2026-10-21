@@ -118,9 +118,11 @@ app.post('/action/execute', async (req, res) => {
   console.log(`[/action/execute] Task ${taskId} | ${actionType} | args: ${JSON.stringify(args || {}).substring(0, 100)}`);
 
   try {
-    const result = await executeAction(session.page, actionType, args || {}, taskId);
+    const result = await executeAction(session.page, actionType, args || {}, taskId, session);
 
     if (result.observation) {
+      // Cache full observation on the session for stale-check and element resolution
+      session.lastObservation = result.observation;
       const obs = result.observation;
       // Flatten into legacy fields for backward compat
       result.currentUrl = obs.url;

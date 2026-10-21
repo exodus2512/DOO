@@ -18,7 +18,7 @@ public enum TaskStatus {
         return switch (this) {
             case QUEUED -> next == RUNNING || next == CANCELLED;
             case RUNNING -> next == WAITING_FOR_USER || next == VERIFYING
-                    || next == PARTIAL || next == FAILED || next == CANCELLED;
+                    || next == COMPLETED || next == PARTIAL || next == FAILED || next == CANCELLED;
             case WAITING_FOR_USER -> next == RUNNING || next == CANCELLED || next == FAILED;
             case VERIFYING -> next == COMPLETED || next == PARTIAL || next == FAILED;
             case COMPLETED, PARTIAL, FAILED, CANCELLED -> false;

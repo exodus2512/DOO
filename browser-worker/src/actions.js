@@ -11,23 +11,49 @@ const { buildObservation, resolveElement } = require('./perception');
  * Execute a single action in the given Playwright page.
  * Returns { success, result, error, observation, screenshot }
  */
-async function executeAction(page, actionType, args = {}, taskId = null) {
+async function executeAction(page, actionType, args = {}, taskId = null, session = null) {
   const validatedAction = validateActionType(actionType);
 
-  // Stale-observation guard: if the caller references an observation_id,
-  // verify the page hasn't navigated away since that observation.
-  if (args.observation_id && args.element_index !== undefined) {
-    const currentUrl = page.url();
-    const currentTitle = await page.title().catch(() => '');
-    const refObs = args._observation;
-    if (refObs && (refObs.url !== currentUrl || refObs.title !== currentTitle)) {
+  // Resolve element_index against the session's stored observation.
+  // The backend sends observation_id + element_index; we look up the full
+  // cached observation (with _locator data) by matching the id.
+  let resolvedObservation = args._observation || null;
+  if (args.observation_id && session && session.lastObservation) {
+    const cached = session.lastObservation;
+    if (cached.observation_id === args.observation_id) {
+      resolvedObservation = cached;
+    } else {
+      // observation_id doesn't match — page changed since the AI saw it
+      const currentUrl = page.url();
       const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
       return {
         success: false,
-        error: 'STALE_OBSERVATION: page changed since observation ' + args.observation_id +
-               ' (was ' + refObs.url + ', now ' + currentUrl + ')',
+        error: 'STALE_OBSERVATION: observation ' + args.observation_id +
+               ' is stale (page is now ' + currentUrl + ')',
         observation: freshObs,
       };
+    }
+  }
+
+  // Inject the resolved observation into args so the action handlers can use it
+  if (resolvedObservation && args.element_index !== undefined) {
+    args = { ...args, _observation: resolvedObservation };
+  }
+
+  // Legacy stale check using URL comparison when no cached observation
+  if (args.observation_id && args.element_index !== undefined && !resolvedObservation) {
+    const refObs = args._observation;
+    if (refObs) {
+      const currentUrl = page.url();
+      const currentTitle = await page.title().catch(() => '');
+      if (refObs.url !== currentUrl || refObs.title !== currentTitle) {
+        const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
+        return {
+          success: false,
+          error: 'STALE_OBSERVATION: page changed (was ' + refObs.url + ', now ' + currentUrl + ')',
+          observation: freshObs,
+        };
+      }
     }
   }
 

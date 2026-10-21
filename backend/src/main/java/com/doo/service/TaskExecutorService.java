@@ -196,6 +196,8 @@ public class TaskExecutorService {
             // Structured perception state — updated after each action
             String lastObservationId = null;
             List<Map<String, Object>> lastInteractiveElements = null;
+            int staleRetries = 0;
+            final int MAX_STALE_RETRIES = 2;
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
 
@@ -371,16 +373,20 @@ public class TaskExecutorService {
 
                 // Handle STALE_OBSERVATION: re-observe and retry the step without incrementing step counter
                 if (!result.success() && result.error() != null && result.error().startsWith("STALE_OBSERVATION")) {
-                    log.info("Task {} step {}: stale observation detected, refreshing perception", taskId, step);
+                    staleRetries++;
+                    log.info("Task {} step {}: stale observation (retry {}/{})", taskId, step, staleRetries, MAX_STALE_RETRIES);
                     if (result.observationId() != null) {
                         lastObservationId = result.observationId();
                         lastInteractiveElements = result.interactiveElements();
                     }
-                    // Don't count as a failure — force the loop to re-select with fresh observation
-                    // by decrementing step so the same slot is retried with updated state
-                    step--;
-                    continue;
+                    if (staleRetries <= MAX_STALE_RETRIES) {
+                        step--; // retry this slot with fresh observation
+                        continue;
+                    }
+                    // Max stale retries hit — treat as normal failure
+                    staleRetries = 0;
                 }
+                staleRetries = 0; // reset on non-stale result
 
                 if (result.success()) {
                     consecutiveFailures = 0;
@@ -744,8 +750,9 @@ public class TaskExecutorService {
     private String computeActionFingerprint(AiProvider.ActionDecision decision) {
         String type = decision.actionType();
         Map<String, Object> args = decision.args() != null ? decision.args() : Map.of();
+        // Exclude internal/transient keys: _ prefix and observation_id (changes every step)
         String keyArgs = args.entrySet().stream()
-            .filter(e -> !e.getKey().startsWith("_"))
+            .filter(e -> !e.getKey().startsWith("_") && !"observation_id".equals(e.getKey()))
             .sorted(Map.Entry.comparingByKey())
             .map(e -> e.getKey() + "=" + e.getValue())
             .reduce((a, b) -> a + "&" + b)

@@ -92,7 +92,11 @@ class SessionManager {
     const cancelToken = { cancelled: false };
     const now = Date.now();
 
-    this.sessions.set(taskId, { context, page, sessionId, cancelToken, createdAt: now, lastActivity: now });
+    this.sessions.set(taskId, {
+      context, page, sessionId, cancelToken,
+      createdAt: now, lastActivity: now,
+      lastObservation: null, // stores the most recent full doo.perception.v1 observation
+    });
     
     console.log(`[BrowserWorker] Session ${sessionId} initialized for task ${taskId}`);
     return sessionId;
