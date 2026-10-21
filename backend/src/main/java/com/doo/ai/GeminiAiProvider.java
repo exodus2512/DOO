@@ -4,49 +4,103 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Primary;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
 
+import jakarta.annotation.PostConstruct;
+
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
-/**
- * Google Gemini implementation of AiProvider.
- * Uses gemini-1.5-flash by default (cost-effective for research tasks).
- */
 @Slf4j
 @Component
 @Primary
 public class GeminiAiProvider implements AiProvider {
 
     private static final String GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+    private static final Set<String> KNOWN_MODELS = Set.of(
+        "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash",
+        "gemini-3.5-flash", "gemini-3.5-flash-lite"
+    );
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
-    private final String apiKey;
     private final String model;
     private final boolean demoMode;
+    private final GeminiKeyPool keyPool;
+    private final GeminiThrottle throttle;
+    private final int maxRetries;
 
+    private final ConcurrentHashMap<String, AiCallStats> activeStats = new ConcurrentHashMap<>();
+
+    @Autowired
     public GeminiAiProvider(
         @Value("${doo.ai.gemini.api-key:}") String apiKey,
-        @Value("${doo.ai.gemini.model:gemini-1.5-flash}") String model,
+        @Value("${doo.ai.gemini.model:gemini-3.8-flash}") String model,
         @Value("${doo.ai.demo-mode:false}") boolean demoMode,
-        ObjectMapper objectMapper
+        ObjectMapper objectMapper,
+        @Value("${doo.ai.gemini.api-key-2:}") String apiKey2,
+        @Value("${doo.ai.gemini.api-key-3:}") String apiKey3,
+        @Value("${doo.ai.gemini.min-call-interval-ms:4000}") long minIntervalMs,
+        @Value("${doo.ai.gemini.max-rpm:10}") int maxRpm,
+        @Value("${doo.ai.gemini.key-cooldown-seconds:120}") long cooldownSeconds,
+        @Value("${doo.ai.gemini.max-retries:2}") int maxRetries
     ) {
-        this.apiKey = apiKey;
         this.model = model;
         this.demoMode = demoMode;
         this.objectMapper = objectMapper;
+        this.maxRetries = maxRetries;
         this.webClient = WebClient.builder()
             .baseUrl(GEMINI_BASE_URL)
             .defaultHeader("Content-Type", "application/json")
             .build();
+
+        List<String> allKeys = new ArrayList<>();
+        allKeys.add(apiKey);
+        allKeys.add(apiKey2);
+        allKeys.add(apiKey3);
+        this.keyPool = new GeminiKeyPool(allKeys, Duration.ofSeconds(cooldownSeconds));
+        this.throttle = new GeminiThrottle(
+            Duration.ofMillis(minIntervalMs),
+            maxRpm
+        );
+
+        log.info("GeminiAiProvider: model={}, demoMode={}, keys={}, minInterval={}ms, maxRpm={}, cooldown={}s",
+            model, demoMode, keyPool.size(), minIntervalMs, maxRpm, cooldownSeconds);
+    }
+
+    @PostConstruct
+    void validateModel() {
+        if (!KNOWN_MODELS.contains(model)) {
+            log.error("Configured model '{}' is not in the known-good list {}. " +
+                "This will likely produce 404 errors. Switching to gemini-3.8-flash.", model, KNOWN_MODELS);
+        }
+    }
+
+    public GeminiAiProvider(String apiKey, String model, boolean demoMode, ObjectMapper objectMapper) {
+        this(apiKey, model, demoMode, objectMapper, "", "", 100, 60, 10, 2);
     }
 
     private boolean isAvailable() {
-        return !demoMode && apiKey != null && !apiKey.isBlank();
+        return !demoMode && keyPool.hasKeys();
     }
+
+    public AiCallStats getOrCreateStats(String taskLabel) {
+        return activeStats.computeIfAbsent(taskLabel, AiCallStats::new);
+    }
+
+    public void clearStats(String taskLabel) {
+        activeStats.remove(taskLabel);
+    }
+
+    // ─── AiProvider interface ──────────────────────────────────────────────
 
     @Override
     public WorkflowClassification classifyWorkflow(String userRequest) {
@@ -68,15 +122,20 @@ public class GeminiAiProvider implements AiProvider {
             """.formatted(userRequest);
 
         try {
-            String response = callGemini(prompt);
+            String taskLabel = truncate(userRequest, 60);
+            log.info("[STEP 1/5] CLASSIFY — starting for: {}", taskLabel);
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.CLASSIFY);
+            String response = callGemini(prompt, taskLabel);
             JsonNode json = objectMapper.readTree(extractJson(response));
+            String wfType = json.path("workflowType").asText("UNKNOWN");
+            log.info("[STEP 1/5] CLASSIFY — result: {}", wfType);
             return new WorkflowClassification(
-                json.path("workflowType").asText("UNKNOWN"),
+                wfType,
                 json.path("rationale").asText(""),
                 json.path("successCriteria").asText("")
             );
         } catch (Exception e) {
-            log.error("Live AI provider failed to classify workflow: {}", e.getMessage());
+            log.error("[STEP 1/5] CLASSIFY — FAILED: {}", e.getMessage());
             throw new RuntimeException("AI provider error during classification: " + e.getMessage(), e);
         }
     }
@@ -96,7 +155,7 @@ public class GeminiAiProvider implements AiProvider {
 
             Rules:
             - Each step should be a concrete browser action or observation
-            - Maximum 15 steps
+            - Maximum 10 steps
             - For WEB_RESEARCH: start with search, visit pages, extract info, synthesize
             - For PRODUCT_COMPARISON: visit each product URL, extract specs/price, compare
             - For UI_INTERACTION: navigate to test form, fill fields, submit, verify
@@ -110,13 +169,17 @@ public class GeminiAiProvider implements AiProvider {
             """.formatted(userRequest, context.workflowType(), successCriteria);
 
         try {
-            String response = callGemini(prompt);
+            String taskLabel = truncate(userRequest, 60);
+            log.info("[STEP 2/5] PLAN — generating for: {}", taskLabel);
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.PLAN);
+            String response = callGemini(prompt, taskLabel);
             JsonNode json = objectMapper.readTree(extractJson(response));
             List<String> steps = new ArrayList<>();
             json.path("steps").forEach(n -> steps.add(n.asText()));
+            log.info("[STEP 2/5] PLAN — {} steps generated", steps.size());
             return new TaskPlan(steps, json.path("successCriteria").asText(successCriteria));
         } catch (Exception e) {
-            log.error("Live AI provider failed to generate plan: {}", e.getMessage());
+            log.error("[STEP 2/5] PLAN — FAILED: {}", e.getMessage());
             throw new RuntimeException("AI provider error during planning: " + e.getMessage(), e);
         }
     }
@@ -128,7 +191,7 @@ public class GeminiAiProvider implements AiProvider {
         }
         String prompt = """
             You are DOO, an AI browser agent selecting the next browser action.
-            
+
             Task: "%s"
             Current plan step %d: %s
             Current URL: %s
@@ -136,7 +199,7 @@ public class GeminiAiProvider implements AiProvider {
             Page content (truncated): %s
             Recent actions: %s
             Allowed action types: %s
-            
+
             Select ONE action from the allowed types. Respond in JSON format ONLY:
             {
               "actionType": "NAVIGATE|CLICK|FILL|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE",
@@ -145,7 +208,7 @@ public class GeminiAiProvider implements AiProvider {
               "requiresApproval": false,
               "approvalReason": ""
             }
-            
+
             Action args by type:
             - NAVIGATE: {"url": "https://..."}
             - CLICK: {"selector": "css or xpath", "description": "what element"}
@@ -155,7 +218,7 @@ public class GeminiAiProvider implements AiProvider {
             - SCROLL: {"direction": "down|up", "amount": 500}
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
-            
+
             IMPORTANT: Never navigate to file:// URLs or private IPs (10.x, 172.16-31.x, 192.168.x).
             localhost URLs are allowed when specified in the task.
             Never fill password fields. Never click purchase/checkout/buy/subscribe buttons.
@@ -171,22 +234,34 @@ public class GeminiAiProvider implements AiProvider {
                 String.join(", ", request.allowedActionTypes())
             );
 
-        try {
-            String response = callGemini(prompt);
-            JsonNode json = objectMapper.readTree(extractJson(response));
-            Map<String, Object> args = objectMapper.convertValue(
-                json.path("args"), new TypeReference<Map<String, Object>>() {});
-            return new ActionDecision(
-                json.path("actionType").asText("SCREENSHOT"),
-                args != null ? args : Map.of(),
-                json.path("rationale").asText(""),
-                json.path("requiresApproval").asBoolean(false),
-                json.path("approvalReason").asText("")
-            );
-        } catch (Exception e) {
-            log.error("Live AI provider failed to select action: {}", e.getMessage());
-            throw new RuntimeException("AI provider error during action selection: " + e.getMessage(), e);
+        String taskLabel = truncate(request.userRequest(), 60);
+        log.info("[STEP 3/5] SELECT_ACTION — step {}, url={}", request.currentStep(), truncate(request.currentUrl(), 80));
+        getOrCreateStats(taskLabel).record(AiCallStats.Phase.SELECT_ACTION);
+
+        for (int jsonRetry = 0; jsonRetry < 2; jsonRetry++) {
+            try {
+                String response = callGemini(prompt, taskLabel);
+                JsonNode json = objectMapper.readTree(extractJson(response));
+                String actionType = json.path("actionType").asText("SCREENSHOT");
+                Map<String, Object> args = objectMapper.convertValue(
+                    json.path("args"), new TypeReference<Map<String, Object>>() {});
+                log.info("[STEP 3/5] SELECT_ACTION — chose: {}", actionType);
+                return new ActionDecision(
+                    actionType,
+                    args != null ? args : Map.of(),
+                    json.path("rationale").asText(""),
+                    json.path("requiresApproval").asBoolean(false),
+                    json.path("approvalReason").asText("")
+                );
+            } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+                log.warn("[STEP 3/5] SELECT_ACTION — malformed JSON from model, retrying ({}/2)", jsonRetry + 1);
+                if (jsonRetry == 1) throw new RuntimeException("AI provider error during action selection: " + e.getMessage(), e);
+            } catch (Exception e) {
+                log.error("[STEP 3/5] SELECT_ACTION — FAILED: {}", e.getMessage());
+                throw new RuntimeException("AI provider error during action selection: " + e.getMessage(), e);
+            }
         }
+        throw new RuntimeException("AI provider error during action selection: exhausted retries");
     }
 
     @Override
@@ -235,15 +310,21 @@ public class GeminiAiProvider implements AiProvider {
             );
 
         try {
-            String response = callGemini(prompt);
+            String taskLabel = truncate(request.userRequest(), 60);
+            log.info("[STEP 5/5] VERIFY — checking against: {}", truncate(request.successCriteria(), 80));
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.VERIFY);
+            String response = callGemini(prompt, taskLabel);
             JsonNode json = objectMapper.readTree(extractJson(response));
+            boolean passed = json.path("passed").asBoolean(false);
+            double confidence = json.path("confidence").asDouble(0.5);
+            log.info("[STEP 5/5] VERIFY — passed={}, confidence={}", passed, confidence);
             return new VerificationResult(
-                json.path("passed").asBoolean(false),
+                passed,
                 json.path("notes").asText(""),
-                json.path("confidence").asDouble(0.5)
+                confidence
             );
         } catch (Exception e) {
-            log.error("Live AI provider failed to verify: {}", e.getMessage());
+            log.error("[STEP 5/5] VERIFY — FAILED: {}", e.getMessage());
             throw new RuntimeException("AI provider error during verification: " + e.getMessage(), e);
         }
     }
@@ -273,81 +354,218 @@ public class GeminiAiProvider implements AiProvider {
             );
 
         try {
-            return callGemini(prompt);
+            String taskLabel = truncate(request.userRequest(), 60);
+            log.info("[STEP 4/5] SYNTHESIZE — {} URLs, {} snippets", request.visitedUrls().size(), request.textSnippets().size());
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.SYNTHESIZE);
+            String result = callGemini(prompt, taskLabel);
+            log.info("[STEP 4/5] SYNTHESIZE — done, {} chars", result.length());
+            return result;
         } catch (Exception e) {
             log.error("Live AI provider failed to synthesize result: {}", e.getMessage());
             throw new RuntimeException("AI provider error during synthesis: " + e.getMessage(), e);
         }
     }
 
-    private String callGemini(String prompt) {
-        Set<String> candidateModels = new LinkedHashSet<>();
-        if (this.model != null && !this.model.isBlank()) {
-            candidateModels.add(this.model);
-        }
-        candidateModels.add("gemini-3.5-flash");
+    // ─── Core API caller with throttle, key rotation, backoff ──────────────
+
+    String callGemini(String prompt, String taskLabel) {
         Exception lastException = null;
+        GeminiKeyPool.KeyEntry stickyKey = null;
+        int consecutive503 = 0;
 
-        for (String targetModel : candidateModels) {
-            for (int attempt = 1; attempt <= 3; attempt++) {
-                try {
-                    Map<String, Object> body = Map.of(
-                        "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
-                        "generationConfig", Map.of(
-                            "temperature", 0.2,
-                            "maxOutputTokens", 2048
-                        )
-                    );
+        for (int attempt = 0; attempt <= maxRetries; attempt++) {
+            GeminiKeyPool.KeyEntry keyEntry = stickyKey != null ? stickyKey : keyPool.nextHealthyKey();
+            stickyKey = null;
+            if (keyEntry == null) {
+                throw new AllKeysExhaustedException("All API keys exhausted (dead or cooling down): " +
+                    keyPool.getKeyStates());
+            }
 
-                    Map response = webClient.post()
-                        .uri("/models/" + targetModel + ":generateContent?key=" + apiKey)
-                        .bodyValue(body)
-                        .retrieve()
-                        .bodyToMono(Map.class)
-                        .timeout(java.time.Duration.ofSeconds(30))
-                        .block();
+            log.info("[API] Using {} | model={} | attempt {}/{}", keyEntry.label(), model, attempt + 1, maxRetries + 1);
 
-                    if (response == null) continue;
+            try {
+                throttle.acquirePermit();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted while waiting for throttle permit", e);
+            }
+            log.info("[API] Throttle permit acquired, sending request...");
 
-                    List candidates = (List) response.get("candidates");
-                    if (candidates == null || candidates.isEmpty()) continue;
+            if (attempt > 0) {
+                AiCallStats stats = activeStats.get(taskLabel);
+                if (stats != null) stats.record(AiCallStats.Phase.RETRY);
+            }
 
-                    Map candidate = (Map) candidates.get(0);
-                    Map content = (Map) candidate.get("content");
-                    if (content == null) continue;
+            try {
+                Map<String, Object> body = Map.of(
+                    "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
+                    "generationConfig", Map.of(
+                        "temperature", 0.2,
+                        "maxOutputTokens", 4096
+                    )
+                );
 
-                    List parts = (List) content.get("parts");
-                    if (parts == null || parts.isEmpty()) continue;
+                GeminiResponse geminiResponse = webClient.post()
+                    .uri("/models/" + model + ":generateContent?key=" + keyEntry.key())
+                    .bodyValue(body)
+                    .exchangeToMono(response -> handleResponse(response, keyEntry))
+                    .timeout(Duration.ofSeconds(30))
+                    .block();
 
-                    return (String) ((Map) parts.get(0)).get("text");
-                } catch (Exception e) {
-                    lastException = e;
-                    log.warn("Gemini call failed (model={}, attempt={}/3): {}", targetModel, attempt, e.getMessage());
-                    try {
-                        long backoff = (long) Math.pow(2, attempt) * 1000L + (long) (Math.random() * 500);
-                        Thread.sleep(backoff);
-                    } catch (InterruptedException ie) {
+                if (geminiResponse == null || geminiResponse.body == null) {
+                    throw new RuntimeException("Empty response from Gemini API");
+                }
+
+                if (geminiResponse.retryAfterSeconds > 0) {
+                    long sleepMs = geminiResponse.retryAfterSeconds * 1000L;
+                    log.warn("[API] 429 Retry-After={}s on {}, rotating key", geminiResponse.retryAfterSeconds, keyEntry.label());
+                    keyPool.markCooldown(keyEntry.label(), "429 with Retry-After");
+                    Thread.sleep(Math.min(sleepMs, 30_000));
+                    lastException = new RuntimeException("429 Too Many Requests");
+                    continue;
+                }
+
+                Map responseMap = objectMapper.readValue(geminiResponse.body, Map.class);
+                List candidates = (List) responseMap.get("candidates");
+                if (candidates == null || candidates.isEmpty()) {
+                    throw new RuntimeException("No candidates in Gemini response");
+                }
+
+                Map candidate = (Map) candidates.get(0);
+                Map content = (Map) candidate.get("content");
+                if (content == null) throw new RuntimeException("No content in candidate");
+
+                List parts = (List) content.get("parts");
+                if (parts == null || parts.isEmpty()) throw new RuntimeException("No parts in content");
+
+                String text = (String) ((Map) parts.get(0)).get("text");
+                log.info("[API] Response OK from {} — {} chars", keyEntry.label(), text.length());
+                consecutive503 = 0;
+                return text;
+
+            } catch (AllKeysExhaustedException e) {
+                throw e;
+            } catch (GeminiApiException e) {
+                lastException = e;
+                log.warn("[API] Error {}={} attempt {}/{}: {}", keyEntry.label(), e.statusCode, attempt + 1, maxRetries + 1, truncate(e.getMessage(), 120));
+
+                if (e.statusCode == 401 || e.statusCode == 403) {
+                    keyPool.markDead(keyEntry.label(), e.statusCode + " " + e.getMessage());
+                    continue;
+                }
+                if (e.statusCode == 404) {
+                    throw new RuntimeException("Model '" + model + "' not found (404). Check configured model ID.", e);
+                }
+                if (e.statusCode == 429) {
+                    if (e.isDailyQuota) {
+                        keyPool.markDead(keyEntry.label(), "Daily quota exhausted");
+                        continue;
+                    }
+                    // Rate-limited: rotate to next key, short cooldown
+                    keyPool.markCooldown(keyEntry.label(), "429 rate limit");
+                    continue;
+                }
+                if (e.statusCode == 503 || e.statusCode == 500) {
+                    consecutive503++;
+                    if (consecutive503 >= 2) {
+                        log.info("[API] {} — {} consecutive server errors on {}, rotating to next key", e.statusCode, consecutive503, keyEntry.label());
+                        consecutive503 = 0;
+                        stickyKey = null;
+                    } else {
+                        log.info("[API] {} — server overload, retrying same key after backoff", e.statusCode);
+                        stickyKey = keyEntry;
+                    }
+                    if (attempt < maxRetries) {
+                        long backoff = (long) Math.pow(2, attempt + 1) * 1000L + (long) (Math.random() * 1000);
+                        try { Thread.sleep(Math.min(backoff, 15_000)); } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new RuntimeException("Interrupted during backoff", ie);
+                        }
+                    }
+                    continue;
+                }
+                if (attempt < maxRetries) {
+                    long backoff = (long) Math.pow(2, attempt + 1) * 1000L + (long) (Math.random() * 500);
+                    try { Thread.sleep(backoff); } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
-                        throw new RuntimeException("Interrupted during Gemini call", ie);
+                        throw new RuntimeException("Interrupted during backoff", ie);
+                    }
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new RuntimeException("Interrupted during Gemini call", e);
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("Gemini call error ({}={}, attempt={}/{}): {}",
+                    keyEntry.label(), model, attempt + 1, maxRetries + 1, e.getMessage());
+                if (attempt < maxRetries) {
+                    long backoff = (long) Math.pow(2, attempt + 1) * 1000L + (long) (Math.random() * 500);
+                    try { Thread.sleep(backoff); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted during backoff", ie);
                     }
                 }
             }
         }
 
-        log.error("All Gemini API attempts failed: {}", lastException != null ? lastException.getMessage() : "unknown");
-        throw new RuntimeException("AI provider error: " + (lastException != null ? lastException.getMessage() : "All models unavailable"), lastException);
+        String msg = lastException != null ? lastException.getMessage() : "All attempts failed";
+        log.error("All Gemini API attempts failed: {}", msg);
+        throw new RuntimeException("AI provider error: " + msg, lastException);
     }
+
+    private record GeminiResponse(String body, int retryAfterSeconds) {}
+
+    private Mono<GeminiResponse> handleResponse(ClientResponse response, GeminiKeyPool.KeyEntry keyEntry) {
+        HttpStatusCode status = response.statusCode();
+        if (status.is2xxSuccessful()) {
+            return response.bodyToMono(String.class)
+                .map(body -> new GeminiResponse(body, 0));
+        }
+
+        int code = status.value();
+        return response.bodyToMono(String.class).map(body -> {
+            boolean isDailyQuota = body != null && (
+                body.contains("PerDay") ||
+                body.contains("per_day") ||
+                (body.contains("quota") && body.contains("daily")) ||
+                (body.contains("exceeded your current quota") && !body.contains("PerMinute"))
+            );
+            int retryAfter = 0;
+            String retryHeader = response.headers().asHttpHeaders().getFirst("Retry-After");
+            if (retryHeader != null) {
+                try { retryAfter = Integer.parseInt(retryHeader); } catch (NumberFormatException ignored) {}
+            }
+            throw new GeminiApiException(code, body, isDailyQuota, retryAfter);
+        });
+    }
+
+    static class GeminiApiException extends RuntimeException {
+        final int statusCode;
+        final boolean isDailyQuota;
+        final int retryAfterSeconds;
+
+        GeminiApiException(int statusCode, String body, boolean isDailyQuota, int retryAfterSeconds) {
+            super(statusCode + " " + (body != null ? truncateStatic(body, 200) : ""));
+            this.statusCode = statusCode;
+            this.isDailyQuota = isDailyQuota;
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+    }
+
+    public static class AllKeysExhaustedException extends RuntimeException {
+        public AllKeysExhaustedException(String msg) { super(msg); }
+    }
+
+    // ─── JSON + string helpers ──────────────────────────────────────────────
 
     private String extractJson(String text) {
         if (text == null) return "{}";
-        // Strip markdown code fences if present
         text = text.trim();
         if (text.startsWith("```")) {
             int start = text.indexOf('\n') + 1;
             int end = text.lastIndexOf("```");
             if (end > start) text = text.substring(start, end).trim();
         }
-        // Find first { or [
         int start = -1;
         for (int i = 0; i < text.length(); i++) {
             char c = text.charAt(i);
@@ -362,7 +580,12 @@ public class GeminiAiProvider implements AiProvider {
         return text.length() > maxLength ? text.substring(0, maxLength) + "..." : text;
     }
 
-    // ─── Deterministic fallbacks (demo/test mode) ──────────────────────────────
+    private static String truncateStatic(String text, int maxLength) {
+        if (text == null) return "";
+        return text.length() > maxLength ? text.substring(0, maxLength) + "..." : text;
+    }
+
+    // ─── Deterministic fallbacks (demo/test mode) ──────────────────────────
 
     private WorkflowClassification deterministic_classifyWorkflow(String request) {
         String lower = request.toLowerCase();
@@ -422,13 +645,11 @@ public class GeminiAiProvider implements AiProvider {
     }
 
     private ActionDecision deterministic_selectAction(ActionSelectionRequest request) {
-        // Simple deterministic: if no URL yet, navigate to a safe starting point
         if (request.currentUrl() == null || request.currentUrl().isBlank()) {
             return new ActionDecision("NAVIGATE",
                 Map.of("url", "https://en.wikipedia.org/wiki/Main_Page"),
                 "Starting navigation (demo mode)", false, "");
         }
-        // Otherwise take a screenshot and mark done
         if (request.currentStep() >= 2) {
             return new ActionDecision("DONE",
                 Map.of("reason", "Demo mode: task simulated successfully"),
@@ -462,4 +683,9 @@ public class GeminiAiProvider implements AiProvider {
         }
         return sb.toString();
     }
+
+    // ─── Accessors for testing ──────────────────────────────────────────────
+
+    public GeminiKeyPool getKeyPool() { return keyPool; }
+    public GeminiThrottle getThrottle() { return throttle; }
 }

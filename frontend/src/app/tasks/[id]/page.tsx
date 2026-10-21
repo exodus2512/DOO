@@ -101,7 +101,12 @@ export default function TaskDetailPage() {
 
   // Reactive SSE listener
   useTaskStream(taskId, (event: TaskStreamEvent) => {
-    console.log('SSE Event received:', event);
+    if (event.eventType === 'debug') {
+      const data = event.data as any;
+      const keyPool = data?.keyPool || '';
+      console.log(`%c[DOO] ${event.message}`, 'color: #38bdf8; font-weight: bold', keyPool ? `| keys: ${keyPool}` : '');
+      return;
+    }
 
     if (event.status) {
       setTask((prev) => (prev ? { ...prev, status: event.status as any } : null));

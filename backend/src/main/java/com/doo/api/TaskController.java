@@ -20,6 +20,7 @@ import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 /**
  * Main REST API for task management.
@@ -133,9 +134,11 @@ public class TaskController {
     @GetMapping("/health")
     public ResponseEntity<Map<String, String>> health() {
         String aiProvider = System.getenv("AI_PROVIDER");
+        boolean hasKey = Stream.of("GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3")
+            .anyMatch(k -> { String v = System.getenv(k); return v != null && !v.isBlank(); });
         boolean isDemo = "demo".equalsIgnoreCase(aiProvider)
             || "true".equalsIgnoreCase(System.getenv("DEMO_MODE"))
-            || (System.getenv("GEMINI_API_KEY") == null || System.getenv("GEMINI_API_KEY").isBlank());
+            || !hasKey;
         return ResponseEntity.ok(Map.of(
             "status", "ok",
             "service", "doo-backend",

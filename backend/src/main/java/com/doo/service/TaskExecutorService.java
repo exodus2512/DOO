@@ -1,6 +1,8 @@
 package com.doo.service;
 
+import com.doo.ai.AiCallStats;
 import com.doo.ai.AiProvider;
+import com.doo.ai.GeminiAiProvider;
 import com.doo.domain.*;
 import com.doo.events.TaskEventPublisher;
 import com.doo.events.TaskEventPublisher.TaskEvent;
@@ -103,17 +105,21 @@ public class TaskExecutorService {
             // Step 1: Classify workflow and generate plan
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Analyzing your request...", 0, Map.of()));
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — starting", Map.of("phase", "CLASSIFY", "keyPool", getKeyPoolState())));
             AiProvider.WorkflowClassification classification = aiProvider.classifyWorkflow(task.getUserRequest());
             aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — result: " + classification.workflowType(), Map.of("phase", "CLASSIFY", "result", classification.workflowType())));
             task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
             task.setSuccessCriteria(classification.successCriteria());
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — generating", Map.of("phase", "PLAN", "keyPool", getKeyPoolState())));
             AiProvider.TaskPlan plan = aiProvider.generatePlan(
                 task.getUserRequest(),
                 classification.successCriteria(),
                 new AiProvider.WorkflowContext(classification.workflowType())
             );
             aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — " + plan.steps().size() + " steps", Map.of("phase", "PLAN", "steps", plan.steps().size())));
 
             String planText = String.join("\n", plan.steps().stream()
                 .map((s) -> (plan.steps().indexOf(s) + 1) + ". " + s)
@@ -168,6 +174,7 @@ public class TaskExecutorService {
                 log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
 
                 // Select next action
+                publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — step " + step + ", url=" + truncate(currentUrl, 60), Map.of("phase", "SELECT_ACTION", "step", step, "keyPool", getKeyPoolState())));
                 AiProvider.ActionDecision decision = aiProvider.selectNextAction(
                     new AiProvider.ActionSelectionRequest(
                         task.getUserRequest(),
@@ -184,6 +191,7 @@ public class TaskExecutorService {
                     )
                 );
                 aiCallCount++;
+                publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — chose: " + decision.actionType(), Map.of("phase", "SELECT_ACTION", "action", decision.actionType())));
 
                 // Check for DONE
                 if ("DONE".equals(decision.actionType())) {
@@ -328,6 +336,7 @@ public class TaskExecutorService {
             updateTaskStatus(task, TaskStatus.VERIFYING, null);
             publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Synthesizing results...", maxSteps, Map.of()));
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — " + visitedUrls.size() + " URLs, " + textSnippets.size() + " snippets", Map.of("phase", "SYNTHESIZE", "keyPool", getKeyPoolState())));
             String synthesized = aiProvider.synthesizeResult(
                 new AiProvider.SynthesisRequest(
                     task.getUserRequest(),
@@ -338,6 +347,7 @@ public class TaskExecutorService {
                 )
             );
             aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 4/5] SYNTHESIZE — done", Map.of("phase", "SYNTHESIZE")));
 
             // Step 5: Evidence-based verification
             publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome against evidence...", maxSteps, Map.of()));
@@ -351,6 +361,7 @@ public class TaskExecutorService {
                 evidenceSummary.add("Final URL: " + currentUrl);
             }
 
+            publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — checking evidence", Map.of("phase", "VERIFY", "keyPool", getKeyPoolState())));
             AiProvider.VerificationResult verification = aiProvider.verify(
                 new AiProvider.VerificationRequest(
                     task.getUserRequest(),
@@ -364,6 +375,7 @@ public class TaskExecutorService {
                 )
             );
             aiCallCount++;
+            publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — passed=" + verification.passed() + ", confidence=" + verification.confidence(), Map.of("phase", "VERIFY", "passed", verification.passed())));
 
             saveEvidence(taskId, "VERIFICATION_RESULT", "Verification",
                 "Passed: " + verification.passed() + "\n" + verification.notes(), null);
@@ -401,6 +413,16 @@ public class TaskExecutorService {
                 browserWorkerClient.closeSession(taskId, sessionId);
             }
             cancelledTasks.remove(taskId);
+
+            // Log AI call stats
+            String taskLabel = task != null ? truncate(task.getUserRequest(), 60) : taskId.toString();
+            log.info("Task {} AI call stats: total={}, breakdown=classify/plan/action/synth/verify/retry",
+                taskId, aiCallCount);
+            if (aiProvider instanceof GeminiAiProvider gp) {
+                AiCallStats stats = gp.getOrCreateStats(taskLabel);
+                log.info("Task {} model call breakdown: {}", taskId, stats.snapshot());
+                gp.clearStats(taskLabel);
+            }
         }
     }
 
@@ -572,11 +594,23 @@ public class TaskExecutorService {
         return Integer.toHexString(input.hashCode());
     }
 
+    private String truncate(String text, int maxLength) {
+        if (text == null) return "";
+        return text.length() > maxLength ? text.substring(0, maxLength) : text;
+    }
+
     private void publishEvent(TaskEvent event) {
         try {
             eventPublisher.publish(event);
         } catch (Exception e) {
             log.debug("Event publish failed: {}", e.getMessage());
         }
+    }
+
+    private String getKeyPoolState() {
+        if (aiProvider instanceof GeminiAiProvider gp) {
+            return gp.getKeyPool().getKeyStates().toString();
+        }
+        return "N/A";
     }
 }
