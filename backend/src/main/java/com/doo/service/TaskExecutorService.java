@@ -199,7 +199,9 @@ public class TaskExecutorService {
             // ── Browser path: WEB_RESEARCH, PRODUCT_COMPARISON, UI_INTERACTION ──
             // Step 2: Initialize browser session
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Launching browser...", 0, Map.of()));
-            SessionResult session = browserWorkerClient.initSession(taskId);
+            // Pass target domain so the worker can load saved storage state
+            String targetDomainForSession = extractDomain(task.getUserRequest());
+            SessionResult session = browserWorkerClient.initSession(taskId, targetDomainForSession);
 
             if (!session.success()) {
                 failTask(task, "Could not launch browser: " + session.error());
@@ -239,6 +241,8 @@ public class TaskExecutorService {
             // Approval dedup cache: keyed by (proposedAction + sorted field names).
             // Stores the JSON response string so repeated asks reuse the prior answer.
             Map<String, String> approvalAnswerCache = new HashMap<>();
+            // Domains where auth has been handled this session — prevents repeated auth cards.
+            Set<String> authHandledDomains = new HashSet<>();
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -259,6 +263,102 @@ public class TaskExecutorService {
                 taskRepository.save(task);
 
                 log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
+
+                // ── Auth surface gate ──────────────────────────────────────────────────────
+                // After observing a new page, detect auth surfaces in the DOM and show a card
+                // matching what is actually available. This replaces plan-text credential scanning.
+                if (lastInteractiveElements != null && currentUrl != null && !currentUrl.isBlank()) {
+                    String authDomain = extractDomain(currentUrl);
+                    if (authDomain != null && !authHandledDomains.contains(authDomain)
+                            && !taskCredentials.containsKey(authDomain)) {
+                        AuthSurface authSurface = detectAuthSurface(lastInteractiveElements, pageText, currentUrl);
+                        if (authSurface.isAuthPage()) {
+                            log.info("Task {} step {} | AUTH GATE: auth surface on {} (password={}, oauth={}, emailOnly={})",
+                                taskId, step, authDomain, authSurface.hasPasswordForm(),
+                                authSurface.oauthProviders(), authSurface.hasEmailOnlyForm());
+
+                            List<Map<String, Object>> authOptions = new ArrayList<>();
+                            authOptions.add(Map.of("value", "handoff", "label", "Sign in in the browser window",
+                                "description", "I'll complete the login myself in the browser."));
+                            if (authSurface.hasPasswordForm()) {
+                                authOptions.add(Map.of("value", "password", "label", "Enter username + password",
+                                    "description", "Provide credentials and the agent will fill them."));
+                            }
+                            if (authSurface.hasEmailOnlyForm()) {
+                                authOptions.add(Map.of("value", "email_link", "label", "Enter email address",
+                                    "description", "Receive a magic link or verification code."));
+                            }
+                            if (!authSurface.oauthProviders().isEmpty()) {
+                                authOptions.add(Map.of("value", "oauth_note",
+                                    "label", "OAuth: " + String.join(", ", authSurface.oauthProviders()),
+                                    "description", "Choose 'Sign in in the browser' to use a social login."));
+                            }
+                            String authMethods = !authSurface.oauthProviders().isEmpty()
+                                ? String.join(", ", authSurface.oauthProviders())
+                                    + (authSurface.hasPasswordForm() ? ", Email+Password" : "")
+                                    + (authSurface.hasEmailOnlyForm() ? ", Email link" : "")
+                                : (authSurface.hasPasswordForm() ? "Email+Password"
+                                    : (authSurface.hasEmailOnlyForm() ? "Email link" : "Phone/OTP"));
+                            String authReason = "Login required. Available sign-in methods: " + authMethods;
+                            Map<String, Object> authParams = new HashMap<>();
+                            authParams.put("type", "auth_gate");
+                            authParams.put("authMethods", authMethods);
+                            authParams.put("options", authOptions);
+                            authParams.put("hasPasswordForm", authSurface.hasPasswordForm());
+                            authParams.put("oauthProviders", authSurface.oauthProviders());
+                            authParams.put("domain", authDomain);
+                            authParams.put("reason", authReason);
+
+                            String authDedupKey = "AUTH_GATE:" + authDomain;
+                            String cachedAuthResponse = approvalAnswerCache.get(authDedupKey);
+                            if (cachedAuthResponse != null) {
+                                log.info("Task {} — AUTH GATE: reusing cached auth response for {}", taskId, authDomain);
+                                handleAuthGateResponse(cachedAuthResponse, authDomain, taskCredentials,
+                                    knownValues, authHandledDomains, taskId);
+                                credentialHints = buildFullHints(taskCredentials, knownValues);
+                                continue;
+                            }
+
+                            // Bring window to front for OAuth/handoff scenarios
+                            if (!authSurface.hasPasswordForm() || !authSurface.oauthProviders().isEmpty()) {
+                                browserWorkerClient.bringToFront(taskId);
+                            }
+
+                            ApprovalRequest authApproval = findOrCreateApproval(taskId, "AUTH_GATE",
+                                authReason, authParams);
+                            PauseResult authPause = pauseForUser(task, sessionId, authApproval.getId(),
+                                authReason, "AUTH_GATE", step, authParams);
+                            if (!authPause.resumed) { failTask(task, authPause.failureReason()); return; }
+
+                            ApprovalRequest authResolved = approvalRepository.findById(authApproval.getId()).orElse(null);
+                            if (authResolved != null && authResolved.getUserResponse() != null) {
+                                handleAuthGateResponse(authResolved.getUserResponse(), authDomain,
+                                    taskCredentials, knownValues, authHandledDomains, taskId);
+                                approvalAnswerCache.put(authDedupKey, authResolved.getUserResponse());
+                                // Save storage state so next task on this domain skips login
+                                String domainForSave = extractDomain(authPause.currentUrl() != null
+                                    ? authPause.currentUrl() : currentUrl);
+                                if (domainForSave != null) browserWorkerClient.saveStorageState(taskId, domainForSave);
+                            } else {
+                                authHandledDomains.add(authDomain);
+                            }
+                            credentialHints = buildFullHints(taskCredentials, knownValues);
+                            if (authPause.observationId() != null) {
+                                lastObservationId = authPause.observationId();
+                                lastInteractiveElements = authPause.interactiveElements();
+                            }
+                            if (authPause.currentUrl() != null) currentUrl = authPause.currentUrl();
+                            if (authPause.pageTitle() != null) pageTitle = authPause.pageTitle();
+                            if (authPause.pageText() != null) {
+                                pageText = authPause.pageText();
+                                lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                                observationEpoch++;
+                            }
+                            recentActions.add("AUTH_GATE: user handled auth for " + authDomain);
+                            continue;
+                        }
+                    }
+                }
 
                 // ── Step B: Deterministic form gate ─────────────────────────────
                 // Before consulting the AI, scan the current page for empty required/
@@ -1193,6 +1293,120 @@ public class TaskExecutorService {
         "(?i)(finish|place.?order|submit|complete|confirm|pay|buy|checkout|send|purchase)"
     );
 
+    // ─── Auth surface detection ───────────────────────────────────────────────────
+
+    record AuthSurface(
+        boolean hasPasswordForm,    // input[type=password] + identifier field present
+        boolean hasEmailOnlyForm,   // email input but no password
+        List<String> oauthProviders,// detected SSO provider names (Google, Apple, etc.)
+        boolean hasPhoneOtp,        // tel/OTP input
+        boolean isAuthPage          // any of the above is true
+    ) {}
+
+    private static final java.util.regex.Pattern OAUTH_PROVIDER_PATTERN =
+        java.util.regex.Pattern.compile(
+            "(?i)\\b(google|apple|facebook|github|microsoft|twitter|linkedin|slack|gitlab|bitbucket|yahoo)\\b"
+        );
+    private static final java.util.regex.Pattern OAUTH_URL_PATTERN =
+        java.util.regex.Pattern.compile(
+            "(?i)(accounts\\.google\\.com|appleid\\.apple\\.com|connect\\.facebook|github\\.com/login/oauth|login\\.microsoftonline|twitter\\.com/i/oauth)"
+        );
+
+    private static AuthSurface detectAuthSurface(
+            List<Map<String, Object>> elements, String pageText, String url) {
+        if (elements == null) return new AuthSurface(false, false, List.of(), false, false);
+        boolean hasPassword = false;
+        boolean hasIdentifier = false;
+        Set<String> oauth = new LinkedHashSet<>();
+        boolean hasPhoneOtp = false;
+
+        for (Map<String, Object> el : elements) {
+            String type = String.valueOf(el.getOrDefault("type", ""));
+            String role = String.valueOf(el.getOrDefault("role", ""));
+            String label = String.valueOf(el.getOrDefault("label", "")).toLowerCase();
+            String text = String.valueOf(el.getOrDefault("text", "")).toLowerCase();
+            String href = el.get("href") != null ? el.get("href").toString() : "";
+            String elName = el.get("name") != null ? el.get("name").toString().toLowerCase() : "";
+            String autocomplete = el.get("autocomplete") != null ? el.get("autocomplete").toString().toLowerCase() : "";
+
+            if ("password".equals(type) || "current-password".equals(autocomplete)) {
+                hasPassword = true;
+            }
+            if ("email".equals(type) || "email".equals(autocomplete)
+                    || label.contains("email") || elName.contains("email")
+                    || label.contains("username") || label.contains("user name")
+                    || elName.contains("username") || elName.contains("user")
+                    || "username".equals(autocomplete)) {
+                hasIdentifier = true;
+            }
+            if (("tel".equals(type) || "tel".equals(autocomplete))
+                    && (label.contains("phone") || label.contains("mobile")
+                        || elName.contains("phone") || elName.contains("otp")
+                        || elName.contains("code"))) {
+                hasPhoneOtp = true;
+            }
+            if ("button".equals(role) || "link".equals(role)) {
+                String combined = text + " " + label;
+                java.util.regex.Matcher om = OAUTH_PROVIDER_PATTERN.matcher(combined);
+                while (om.find()) oauth.add(capitalizeFirst(om.group(1)));
+                if (!href.isEmpty() && OAUTH_URL_PATTERN.matcher(href).find()) {
+                    java.util.regex.Matcher hm = OAUTH_PROVIDER_PATTERN.matcher(combined + " " + href);
+                    while (hm.find()) oauth.add(capitalizeFirst(hm.group(1)));
+                    if (oauth.isEmpty()) oauth.add("SSO");
+                }
+            }
+        }
+        if (pageText != null) {
+            String sample = pageText.substring(0, Math.min(2000, pageText.length()));
+            java.util.regex.Matcher pm = OAUTH_PROVIDER_PATTERN.matcher(sample);
+            while (pm.find()) {
+                String p = capitalizeFirst(pm.group(1));
+                if (!oauth.contains(p) && oauth.size() < 8) oauth.add(p);
+            }
+        }
+        boolean hasEmailOnly = hasIdentifier && !hasPassword && !hasPhoneOtp;
+        boolean isAuth = hasPassword || hasEmailOnly || !oauth.isEmpty() || hasPhoneOtp;
+        return new AuthSurface(hasPassword && hasIdentifier, hasEmailOnly,
+            new ArrayList<>(oauth), hasPhoneOtp, isAuth);
+    }
+
+    private static String capitalizeFirst(String s) {
+        if (s == null || s.isEmpty()) return s;
+        return Character.toUpperCase(s.charAt(0)) + s.substring(1).toLowerCase();
+    }
+
+    private void handleAuthGateResponse(String jsonResponse, String domain,
+            Map<String, String> taskCredentials, Map<String, String> knownValues,
+            Set<String> authHandledDomains, UUID taskId) {
+        authHandledDomains.add(domain);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> resp = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(jsonResponse, Map.class);
+            String choice = String.valueOf(resp.getOrDefault("choice", "handoff"));
+            if ("password".equals(choice)) {
+                String username = String.valueOf(resp.getOrDefault("username", ""));
+                String password = String.valueOf(resp.getOrDefault("password", ""));
+                if (!username.isBlank() && !password.isBlank()) {
+                    taskCredentials.put(domain, username + "\n" + password);
+                    log.info("Task {} — AUTH GATE: credentials provided for {}", taskId, domain);
+                }
+            } else if ("email_link".equals(choice)) {
+                String email = String.valueOf(resp.getOrDefault("email", ""));
+                if (!email.isBlank()) {
+                    knownValues.put("email", email);
+                    log.info("Task {} — AUTH GATE: email provided for {}", taskId, domain);
+                }
+            } else {
+                log.info("Task {} — AUTH GATE: handoff choice for {} — user handles auth", taskId, domain);
+            }
+        } catch (Exception e) {
+            log.warn("Task {} — AUTH GATE: could not parse auth response: {}", taskId, e.getMessage());
+        }
+    }
+
+    // ─── Confirmation signal patterns ─────────────────────────────────────────────
+
     /**
      * Generic patterns that indicate a task has reached its final confirmation state.
      * Site-agnostic: matches standard confirmation signals across any domain.
@@ -1615,36 +1829,20 @@ public class TaskExecutorService {
     }
 
     /**
-     * Scan plan steps for login/sign-in indicators. If found, try to extract credentials
-     * from the task instruction. If not present, pause to ask the user.
+     * Extract credentials from the vault or task instruction text if available.
+     * Auth gates are now handled at observation time via detectAuthSurface() —
+     * this method no longer pauses and asks the user interactively.
      *
-     * SECURITY: credentials from the instruction are used for THIS RUN ONLY and never persisted to the vault.
+     * SECURITY: credentials from the instruction are used for THIS RUN ONLY and never persisted.
      */
     CredentialGateResult checkCredentialGate(Task task, List<String> planSteps, String sessionId) {
         UUID taskId = task.getId();
         String userRequest = task.getUserRequest();
-
-        // 1. Do any plan steps involve login?
-        boolean hasLoginStep = planSteps.stream().anyMatch(s -> LOGIN_PATTERN.matcher(s).find());
-        if (!hasLoginStep) {
-            // Also check if the user request itself mentions login
-            if (!LOGIN_PATTERN.matcher(userRequest).find()) {
-                return CredentialGateResult.noop();
-            }
-        }
-
-        log.info("Task {} — credential gate triggered: login step detected in plan", taskId);
-
-        // 2. Try to extract a target domain from the user request
         String targetDomain = extractDomain(userRequest);
 
-        // 3. Check the vault for stored credentials
+        // 1. Check vault for stored credentials
         if (targetDomain != null && credentialVaultService.hasDomain(targetDomain)) {
-            log.info("Task {} — vault has credentials for domain={}, skipping approval", taskId, targetDomain);
-            publishEvent(TaskEvent.debug(taskId, "Using vault credentials for " + targetDomain,
-                Map.of("domain", targetDomain)));
-            // Resolve vault credentials — the actual password stays in the vault service,
-            // we just pass a reference that the worker will resolve at fill time
+            log.info("Task {} — vault has credentials for domain={}", taskId, targetDomain);
             var resolved = credentialVaultService.resolve(targetDomain);
             if (resolved.isPresent()) {
                 Map<String, String> creds = new HashMap<>();
@@ -1653,99 +1851,15 @@ public class TaskExecutorService {
             }
         }
 
-        // 4. Check if credentials are embedded in the user request
+        // 2. Extract credentials from instruction text (user passed them inline)
         Map<String, String> extractedCreds = extractCredentialsFromInstruction(userRequest);
         if (!extractedCreds.isEmpty()) {
             log.info("Task {} — credentials found in instruction for domain(s): {}", taskId, extractedCreds.keySet());
-            publishEvent(TaskEvent.debug(taskId, "Credentials found in instruction — using for this run only",
-                Map.of("domains", extractedCreds.keySet().toString())));
             return new CredentialGateResult(true, true, extractedCreds);
         }
 
-        // 5. No credentials in instruction or vault — pause and ask the user
-        log.info("Task {} — no credentials in instruction, pausing for user", taskId);
-
-        String domain = targetDomain != null ? targetDomain : "unknown site";
-        ApprovalRequest approval = ApprovalRequest.builder()
-            .taskId(taskId)
-            .prompt("Login required for " + domain)
-            .proposedAction("CREDENTIAL_REQUEST")
-            .parameters(Map.of(
-                "type", "credential_request",
-                "domain", domain,
-                "fields", List.of("username", "password"),
-                "saveToVault", false
-            ))
-            .status("PENDING")
-            .build();
-        approval = approvalRepository.save(approval);
-
-        // Use the pause/resume machine (but sessionId may be null if we haven't launched browser yet)
-        // We need to init the browser first for the pause to work, or handle pre-browser pause
-        if (sessionId == null) {
-            // We haven't launched the browser yet — do a lightweight pause without parking
-            log.info("[GATE] {} — pausing for user (domain={})", approval.getProposedAction(), domain);
-            updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
-            publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
-                "Login required for " + domain, "CREDENTIAL_REQUEST", approval.getParameters()));
-            publishEvent(TaskEvent.waiting(taskId, "Login required for " + domain, Map.of(
-                "approvalId", approval.getId().toString(),
-                "type", "credential_request",
-                "domain", domain,
-                "timeoutSeconds", PAUSE_TIMEOUT_SECONDS
-            )));
-
-            // Poll for resolution
-            int waited = 0;
-            while (waited < PAUSE_TIMEOUT_SECONDS * 1000) {
-                if (isCancelled(taskId)) {
-                    failTask(task, "Task cancelled while waiting for credentials");
-                    return new CredentialGateResult(true, false, Map.of());
-                }
-                try { Thread.sleep(PAUSE_POLL_INTERVAL_MS); } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    failTask(task, "Interrupted while waiting for credentials");
-                    return new CredentialGateResult(true, false, Map.of());
-                }
-                waited += PAUSE_POLL_INTERVAL_MS;
-
-                ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
-                if (resolved == null) {
-                    failTask(task, "Credential request disappeared");
-                    return new CredentialGateResult(true, false, Map.of());
-                }
-                if ("APPROVED".equals(resolved.getStatus())) {
-                    updateTaskStatus(task, TaskStatus.RUNNING, null);
-                    publishEvent(TaskEvent.statusChange(taskId, "RUNNING", "Credentials received"));
-                    // Extract credentials from the approval response
-                    Map<String, String> creds = parseCredentialResponse(resolved, domain);
-                    return new CredentialGateResult(true, true, creds);
-                }
-                if ("REJECTED".equals(resolved.getStatus())) {
-                    failTask(task, "User declined to provide credentials");
-                    return new CredentialGateResult(true, false, Map.of());
-                }
-                if (resolved.isExpired()) {
-                    resolved.setStatus("EXPIRED");
-                    approvalRepository.save(resolved);
-                    failTask(task, "Credential request expired");
-                    return new CredentialGateResult(true, false, Map.of());
-                }
-            }
-            failTask(task, "WAIT_TIMEOUT: no credentials provided within " + (PAUSE_TIMEOUT_SECONDS / 60) + " minutes");
-            return new CredentialGateResult(true, false, Map.of());
-        }
-
-        // Browser already running — use full pause/resume
-        PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
-            "Login required for " + domain, "CREDENTIAL_REQUEST", task.getCurrentStep(), approval.getParameters());
-        if (!pauseResult.resumed) {
-            failTask(task, pauseResult.failureReason());
-            return new CredentialGateResult(true, false, Map.of());
-        }
-        ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
-        Map<String, String> creds = resolved != null ? parseCredentialResponse(resolved, domain) : Map.of();
-        return new CredentialGateResult(true, true, creds);
+        // No pre-supplied credentials — auth gate will handle it at observation time
+        return CredentialGateResult.noop();
     }
 
     private String extractDomain(String text) {

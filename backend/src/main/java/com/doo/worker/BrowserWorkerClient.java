@@ -43,12 +43,20 @@ public class BrowserWorkerClient {
 
     /**
      * Initialize a browser session for a task.
+     * Passing a domain allows the worker to load saved storage state for that domain.
      */
     public SessionResult initSession(UUID taskId) {
+        return initSession(taskId, null);
+    }
+
+    public SessionResult initSession(UUID taskId, String domain) {
         try {
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("taskId", taskId.toString());
+            if (domain != null && !domain.isBlank()) body.put("domain", domain);
             Map response = webClient.post()
                 .uri("/session/init")
-                .bodyValue(Map.of("taskId", taskId.toString()))
+                .bodyValue(body)
                 .retrieve()
                 .bodyToMono(Map.class)
                 .timeout(Duration.ofSeconds(30))
@@ -241,6 +249,44 @@ public class BrowserWorkerClient {
         } catch (Exception e) {
             log.warn("Could not fill OTP for task {}: {}", taskId, e.getMessage());
             return ActionResult.failure("OTP fill failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Bring the browser window to the front (best-effort, for human handoff with HEADLESS=false).
+     */
+    public boolean bringToFront(UUID taskId) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/bring-to-front")
+                .bodyValue(Map.of("taskId", taskId.toString()))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(5))
+                .block();
+            return response != null && Boolean.TRUE.equals(response.get("success"));
+        } catch (Exception e) {
+            log.debug("bringToFront not available for task {}: {}", taskId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Save Playwright storage state for a domain to disk (for session reuse on next task).
+     */
+    public boolean saveStorageState(UUID taskId, String domain) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/save-storage")
+                .bodyValue(Map.of("taskId", taskId.toString(), "domain", domain))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(10))
+                .block();
+            return response != null && Boolean.TRUE.equals(response.get("success"));
+        } catch (Exception e) {
+            log.debug("saveStorageState failed for task {} domain {}: {}", taskId, domain, e.getMessage());
+            return false;
         }
     }
 

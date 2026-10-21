@@ -347,6 +347,7 @@ public class GeminiAiProvider implements AiProvider {
             - You MUST use EXTRACT_TEXT at least once before DONE.
             - For EXTRACT_TEXT, set the "label" field to describe WHAT you're extracting (e.g. "pricing table", "product features", "form error messages").
             - Never navigate to file:// URLs or private IPs.
+            - NEVER click OAuth/SSO buttons (Continue with Google, Sign in with Apple/Facebook/GitHub, etc.) — OAuth providers block automated browsers. The auth gate handles social logins via human handoff.
 
             SAFETY GATES — set requiresApproval=true for any of these:
             - Submitting a form that sends data externally (contact form, signup, purchase, subscription)
