@@ -1,0 +1,36 @@
+services:
+  # Optional local PostgreSQL if not using Neon Cloud DB
+  postgres:
+    image: postgres:17-alpine
+    container_name: doo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: doodb
+      POSTGRES_USER: doo_user
+      POSTGRES_PASSWORD: doo_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U doo_user -d doodb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Browser Worker (Playwright Execution Engine)
+  browser-worker:
+    build:
+      context: ./browser-worker
+      dockerfile: Dockerfile
+    container_name: doo-browser-worker
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: 3001
+      WORKER_SECRET: doo-secure-worker-secret-key-phase1
+      HEADLESS: "true"
+
+volumes:
+  pgdata:

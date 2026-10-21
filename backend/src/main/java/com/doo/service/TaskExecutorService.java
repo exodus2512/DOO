@@ -1,0 +1,479 @@
+package com.doo.service;
+
+import com.doo.ai.AiProvider;
+import com.doo.domain.*;
+import com.doo.events.TaskEventPublisher;
+import com.doo.events.TaskEventPublisher.TaskEvent;
+import com.doo.repository.*;
+import com.doo.security.UrlValidator;
+import com.doo.worker.BrowserWorkerClient;
+import com.doo.worker.BrowserWorkerClient.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * The core agent execution loop.
+ * Runs asynchronously per task: plan → observe → act → verify → complete.
+ */
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TaskExecutorService {
+
+    private final TaskRepository taskRepository;
+    private final TaskStepRepository taskStepRepository;
+    private final EvidenceArtifactRepository evidenceRepository;
+    private final TaskResultRepository taskResultRepository;
+    private final ApprovalRequestRepository approvalRepository;
+    private final AiProvider aiProvider;
+    private final BrowserWorkerClient browserWorkerClient;
+    private final TaskEventPublisher eventPublisher;
+    private final UrlValidator urlValidator;
+
+    @Value("${doo.task.max-steps:30}")
+    private int maxSteps;
+
+    @Value("${doo.task.max-retries:3}")
+    private int maxRetries;
+
+    // Track cancelled tasks to prevent actions being dispatched after cancellation
+    private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
+
+    // Allowed action types (allowlist)
+    private static final List<String> ALLOWED_ACTIONS = List.of(
+        "NAVIGATE", "CLICK", "FILL", "EXTRACT_TEXT", "SCREENSHOT",
+        "SCROLL", "WAIT", "DONE", "GO_BACK"
+    );
+
+    // Actions that are NOT allowed (block harmful actions even if AI suggests them)
+    private static final List<String> BLOCKED_ACTIONS = List.of(
+        "EXECUTE_SCRIPT", "SHELL_COMMAND", "FILE_WRITE", "HTTP_REQUEST",
+        "PURCHASE", "CHECKOUT", "SUBSCRIBE", "DELETE", "LOGIN"
+    );
+
+    @Async
+    public void executeTask(UUID taskId) {
+        log.info("Starting execution for task {}", taskId);
+        
+        Task task = null;
+        for (int i = 0; i < 20; i++) {
+            task = taskRepository.findById(taskId).orElse(null);
+            if (task != null) break;
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        if (task == null) {
+            log.error("Task {} not found for execution after waiting for commit", taskId);
+            return;
+        }
+
+        String sessionId = null;
+        List<String> visitedUrls = new ArrayList<>();
+        List<String> textSnippets = new ArrayList<>();
+        List<String> recentActions = new ArrayList<>();
+
+        try {
+            // Transition to RUNNING
+            updateTaskStatus(task, TaskStatus.RUNNING, null);
+
+            // Step 1: Classify workflow and generate plan
+            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Analyzing your request...", 0, Map.of()));
+            
+            AiProvider.WorkflowClassification classification = aiProvider.classifyWorkflow(task.getUserRequest());
+            task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
+            task.setSuccessCriteria(classification.successCriteria());
+
+            AiProvider.TaskPlan plan = aiProvider.generatePlan(
+                task.getUserRequest(),
+                classification.successCriteria(),
+                new AiProvider.WorkflowContext(classification.workflowType())
+            );
+
+            String planText = String.join("\n", plan.steps().stream()
+                .map((s) -> (plan.steps().indexOf(s) + 1) + ". " + s)
+                .toList());
+            task.setPlan(planText);
+            taskRepository.save(task);
+
+            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                "Plan created: " + plan.steps().size() + " steps", 0,
+                Map.of("plan", planText)));
+
+            // Step 2: Initialize browser session
+            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Launching browser...", 0, Map.of()));
+            SessionResult session = browserWorkerClient.initSession(taskId);
+            
+            if (!session.success()) {
+                failTask(task, "Could not launch browser: " + session.error());
+                return;
+            }
+            sessionId = session.sessionId();
+            publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Browser ready", 0, Map.of()));
+
+            // Step 3: Execution loop
+            String currentUrl = "";
+            String pageTitle = "";
+            String pageText = "";
+            String accessibilityTree = "";
+            int consecutiveFailures = 0;
+
+            for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
+                task.setCurrentStep(step);
+                taskRepository.save(task);
+
+                log.debug("Task {} step {}/{}", taskId, step, maxSteps);
+
+                // Select next action
+                AiProvider.ActionDecision decision = aiProvider.selectNextAction(
+                    new AiProvider.ActionSelectionRequest(
+                        task.getUserRequest(),
+                        task.getPlan(),
+                        step,
+                        plan.steps(),
+                        currentUrl,
+                        pageTitle,
+                        pageText,
+                        accessibilityTree,
+                        recentActions,
+                        ALLOWED_ACTIONS,
+                        task.getWorkflowType().name()
+                    )
+                );
+
+                // Check for DONE
+                if ("DONE".equals(decision.actionType())) {
+                    publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                        "Agent completed all planned steps", step, Map.of()));
+                    break;
+                }
+
+                // Validate action
+                if (!validateAction(decision, task)) {
+                    consecutiveFailures++;
+                    if (consecutiveFailures >= maxRetries) {
+                        failTask(task, "Too many invalid actions proposed by AI");
+                        return;
+                    }
+                    continue;
+                }
+
+                // Check if approval required
+                if (decision.requiresApproval()) {
+                    ApprovalRequest approval = requestApproval(task, decision);
+                    publishEvent(TaskEvent.approvalRequired(taskId, approval.getId(),
+                        decision.approvalReason(), decision.actionType()));
+                    updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
+
+                    // Wait for approval (poll DB)
+                    ApprovalRequest resolved = waitForApproval(approval.getId(), taskId);
+                    if (resolved == null || "REJECTED".equals(resolved.getStatus())) {
+                        failTask(task, "Action was rejected by user or approval expired");
+                        return;
+                    }
+                    updateTaskStatus(task, TaskStatus.RUNNING, null);
+                }
+
+                // Record step
+                TaskStep taskStep = TaskStep.builder()
+                    .taskId(taskId)
+                    .stepIndex(step)
+                    .actionType(decision.actionType())
+                    .actionArgs(decision.args())
+                    .status("RUNNING")
+                    .build();
+                taskStepRepository.save(taskStep);
+
+                publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                    decision.rationale() + " → " + decision.actionType(), step, Map.of()));
+
+                // Execute action
+                ActionResult result = browserWorkerClient.executeAction(
+                    taskId, sessionId, decision.actionType(), decision.args());
+
+                // Update step record
+                taskStep.setStatus(result.success() ? "COMPLETED" : "FAILED");
+                taskStep.setResult(result.result());
+                taskStep.setError(result.error());
+                taskStep.setCompletedAt(Instant.now());
+                taskStepRepository.save(taskStep);
+
+                // Handle screenshot
+                if (result.screenshot() != null && !result.screenshot().isBlank()) {
+                    String label = (String) decision.args().getOrDefault("label", "Step " + step);
+                    saveEvidence(taskId, "SCREENSHOT", label, result.screenshot(), result.currentUrl());
+                    publishEvent(TaskEvent.screenshot(taskId, label, result.screenshot()));
+                }
+
+                if (result.success()) {
+                    consecutiveFailures = 0;
+                    recentActions.add(decision.actionType() + ": " + decision.rationale());
+
+                    if (result.currentUrl() != null && !result.currentUrl().equals(currentUrl)) {
+                        currentUrl = result.currentUrl();
+                        if (!visitedUrls.contains(currentUrl)) {
+                            visitedUrls.add(currentUrl);
+                            saveEvidence(taskId, "URL_VISITED", result.pageTitle(), null, currentUrl);
+                        }
+                    }
+
+                    if (result.pageText() != null && !result.pageText().isBlank()) {
+                        pageText = result.pageText();
+                        pageTitle = result.pageTitle() != null ? result.pageTitle() : "";
+                        accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
+
+                        // Save text snippet for significant content
+                        if (result.pageText().length() > 100) {
+                            String snippet = result.pageText().substring(0, Math.min(2000, result.pageText().length()));
+                            textSnippets.add("[" + result.pageTitle() + "] " + snippet);
+                            saveEvidence(taskId, "TEXT_SNIPPET", result.pageTitle(),
+                                snippet, currentUrl);
+                        }
+                    }
+                } else {
+                    consecutiveFailures++;
+                    log.warn("Task {} step {} failed: {}", taskId, step, result.error());
+                    
+                    if (consecutiveFailures >= maxRetries) {
+                        failTask(task, "Browser action failed " + maxRetries + " times: " + result.error());
+                        return;
+                    }
+                    // Don't blindly retry; update state and re-observe
+                    BrowserState state = browserWorkerClient.getState(taskId, sessionId);
+                    if (state.currentUrl() != null) {
+                        currentUrl = state.currentUrl();
+                        pageText = state.pageText() != null ? state.pageText() : "";
+                        pageTitle = state.pageTitle() != null ? state.pageTitle() : "";
+                    }
+                }
+            }
+
+            if (isCancelled(taskId)) {
+                updateTaskStatus(task, TaskStatus.CANCELLED, null);
+                publishEvent(TaskEvent.statusChange(taskId, "CANCELLED", "Task was cancelled by user"));
+                return;
+            }
+
+            // Step 4: Synthesize result
+            updateTaskStatus(task, TaskStatus.VERIFYING, null);
+            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Synthesizing results...", maxSteps, Map.of()));
+
+            String synthesized = aiProvider.synthesizeResult(
+                new AiProvider.SynthesisRequest(
+                    task.getUserRequest(),
+                    task.getWorkflowType().name(),
+                    visitedUrls,
+                    textSnippets,
+                    recentActions
+                )
+            );
+
+            // Step 5: Verify
+            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome...", maxSteps, Map.of()));
+            AiProvider.VerificationResult verification = aiProvider.verify(
+                new AiProvider.VerificationRequest(
+                    task.getUserRequest(),
+                    task.getSuccessCriteria(),
+                    task.getWorkflowType().name(),
+                    currentUrl,
+                    pageText,
+                    visitedUrls,
+                    synthesized
+                )
+            );
+
+            saveEvidence(taskId, "VERIFICATION_RESULT", "Verification",
+                "Passed: " + verification.passed() + "\n" + verification.notes(), null);
+
+            // Step 6: Save result and transition to final state
+            List<TaskResult.SourceRef> sources = visitedUrls.stream()
+                .filter(u -> u != null && !u.isBlank())
+                .map(u -> new TaskResult.SourceRef(u, ""))
+                .toList();
+
+            TaskResult taskResult = TaskResult.builder()
+                .taskId(taskId)
+                .summary(synthesized)
+                .verificationPassed(verification.passed())
+                .verificationNotes(verification.notes())
+                .sources(sources)
+                .build();
+            taskResultRepository.save(taskResult);
+
+            TaskStatus finalStatus = verification.passed() ? TaskStatus.COMPLETED : TaskStatus.PARTIAL;
+            updateTaskStatus(task, finalStatus, null);
+            
+            publishEvent(TaskEvent.completed(taskId, 
+                verification.passed() ? "Task completed successfully" : 
+                "Task partially completed: " + verification.notes()));
+
+        } catch (Exception e) {
+            log.error("Unexpected error executing task {}: {}", taskId, e.getMessage(), e);
+            Task freshTask = taskRepository.findById(taskId).orElse(null);
+            if (freshTask != null && !freshTask.getStatus().isTerminal()) {
+                failTask(freshTask, "Unexpected error: " + e.getMessage());
+            }
+        } finally {
+            if (sessionId != null) {
+                browserWorkerClient.closeSession(taskId, sessionId);
+            }
+            cancelledTasks.remove(taskId);
+        }
+    }
+
+    public void cancelTask(UUID taskId) {
+        cancelledTasks.add(taskId);
+        browserWorkerClient.cancelTask(taskId);
+        
+        Task task = taskRepository.findById(taskId).orElse(null);
+        if (task != null && !task.getStatus().isTerminal()) {
+            // Mark as CANCELLED (may be overridden by the running thread shortly)
+            try {
+                task.transitionTo(TaskStatus.CANCELLED);
+                taskRepository.save(task);
+                publishEvent(TaskEvent.statusChange(taskId, "CANCELLED", "Cancellation requested"));
+            } catch (IllegalStateException e) {
+                log.warn("Could not cancel task {}: {}", taskId, e.getMessage());
+            }
+        }
+    }
+
+    private boolean isCancelled(UUID taskId) {
+        if (cancelledTasks.contains(taskId)) return true;
+        // Also re-check DB in case of external cancellation
+        Task task = taskRepository.findById(taskId).orElse(null);
+        return task != null && task.getStatus() == TaskStatus.CANCELLED;
+    }
+
+    @Transactional
+    private void updateTaskStatus(Task task, TaskStatus newStatus, String failureReason) {
+        task.transitionTo(newStatus);
+        if (failureReason != null) task.setFailureReason(failureReason);
+        taskRepository.save(task);
+        publishEvent(TaskEvent.statusChange(task.getId(), newStatus.name(),
+            failureReason != null ? failureReason : newStatus.name().toLowerCase().replace("_", " ")));
+    }
+
+    private void failTask(Task task, String reason) {
+        try {
+            task.setFailureReason(reason);
+            if (!task.getStatus().isTerminal()) {
+                task.transitionTo(TaskStatus.FAILED);
+            }
+            taskRepository.save(task);
+            publishEvent(TaskEvent.error(task.getId(), reason));
+        } catch (Exception e) {
+            log.error("Could not mark task {} as failed: {}", task.getId(), e.getMessage());
+        }
+    }
+
+    private boolean validateAction(AiProvider.ActionDecision decision, Task task) {
+        if (decision == null || decision.actionType() == null) return false;
+        
+        String actionType = decision.actionType().toUpperCase();
+        
+        if (BLOCKED_ACTIONS.contains(actionType)) {
+            log.warn("Task {} proposed blocked action: {}", task.getId(), actionType);
+            publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING",
+                "Skipped disallowed action: " + actionType, task.getCurrentStep(), Map.of()));
+            return false;
+        }
+        
+        if (!ALLOWED_ACTIONS.contains(actionType)) {
+            log.warn("Task {} proposed unknown action: {}", task.getId(), actionType);
+            return false;
+        }
+
+        // Validate NAVIGATE URL
+        if ("NAVIGATE".equals(actionType)) {
+            String url = (String) decision.args().get("url");
+            try {
+                urlValidator.validate(url);
+            } catch (SecurityException e) {
+                log.warn("Task {} proposed invalid navigation URL '{}': {}", task.getId(), url, e.getMessage());
+                publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING",
+                    "Skipped navigation to disallowed URL", task.getCurrentStep(), Map.of()));
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private ApprovalRequest requestApproval(Task task, AiProvider.ActionDecision decision) {
+        ApprovalRequest approval = ApprovalRequest.builder()
+            .taskId(task.getId())
+            .prompt(decision.approvalReason())
+            .proposedAction(decision.actionType())
+            .parameters(decision.args())
+            .status("PENDING")
+            .build();
+        return approvalRepository.save(approval);
+    }
+
+    private ApprovalRequest waitForApproval(UUID approvalId, UUID taskId) {
+        int maxWaitSeconds = 600; // 10 minutes
+        int pollIntervalMs = 2000;
+        int waited = 0;
+
+        while (waited < maxWaitSeconds * 1000) {
+            if (isCancelled(taskId)) return null;
+            
+            try { Thread.sleep(pollIntervalMs); } catch (InterruptedException e) { return null; }
+            waited += pollIntervalMs;
+
+            ApprovalRequest approval = approvalRepository.findById(approvalId).orElse(null);
+            if (approval == null) return null;
+            if ("APPROVED".equals(approval.getStatus()) || "REJECTED".equals(approval.getStatus())) {
+                return approval;
+            }
+            if (approval.isExpired()) {
+                approval.setStatus("EXPIRED");
+                approvalRepository.save(approval);
+                return approval;
+            }
+        }
+        return null;
+    }
+
+    private void saveEvidence(UUID taskId, String type, String label, String content, String sourceUrl) {
+        try {
+            // Skip empty content
+            if ("TEXT_SNIPPET".equals(type) && (content == null || content.isBlank())) return;
+            // Limit screenshot size
+            if ("SCREENSHOT".equals(type) && content != null && content.length() > 500_000) {
+                content = content.substring(0, 500_000); // ~375KB base64 = ~280KB image
+            }
+
+            EvidenceArtifact evidence = EvidenceArtifact.builder()
+                .taskId(taskId)
+                .artifactType(type)
+                .label(label)
+                .content(content)
+                .sourceUrl(sourceUrl)
+                .build();
+            evidenceRepository.save(evidence);
+        } catch (Exception e) {
+            log.warn("Could not save evidence for task {}: {}", taskId, e.getMessage());
+        }
+    }
+
+    private void publishEvent(TaskEvent event) {
+        try {
+            eventPublisher.publish(event);
+        } catch (Exception e) {
+            log.debug("Event publish failed: {}", e.getMessage());
+        }
+    }
+}

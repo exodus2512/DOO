@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DOO Test Fixture — Multi-Step Form</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --surface: #1e293b;
+      --border: #334155;
+      --accent: #6366f1;
+      --accent-glow: rgba(99,102,241,0.25);
+      --text: #f1f5f9;
+      --muted: #94a3b8;
+      --success: #22c55e;
+      --error: #ef4444;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 16px;
+    }
+    header {
+      text-align: center;
+      margin-bottom: 32px;
+    }
+    header .badge {
+      display: inline-block;
+      background: var(--accent-glow);
+      border: 1px solid var(--accent);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      padding: 4px 12px;
+      border-radius: 99px;
+      margin-bottom: 12px;
+    }
+    h1 { font-size: 28px; font-weight: 700; }
+    h1 span { color: var(--accent); }
+    .subtitle { color: var(--muted); margin-top: 8px; font-size: 14px; }
+
+    .stepper {
+      display: flex;
+      gap: 0;
+      margin-bottom: 32px;
+      width: 100%;
+      max-width: 560px;
+    }
+    .step-indicator {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+    }
+    .step-indicator:not(:last-child)::after {
+      content: '';
+      position: absolute;
+      top: 16px;
+      left: 50%;
+      width: 100%;
+      height: 2px;
+      background: var(--border);
+      z-index: 0;
+    }
+    .step-indicator.done::after { background: var(--accent); }
+    .step-bubble {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      background: var(--surface);
+      border: 2px solid var(--border);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 13px; font-weight: 700;
+      z-index: 1;
+      transition: all 0.3s;
+    }
+    .step-indicator.active .step-bubble { border-color: var(--accent); color: var(--accent); }
+    .step-indicator.done .step-bubble { background: var(--accent); border-color: var(--accent); color: white; }
+    .step-label { font-size: 11px; color: var(--muted); margin-top: 6px; }
+    .step-indicator.active .step-label { color: var(--text); }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 32px;
+      width: 100%;
+      max-width: 560px;
+    }
+    .card h2 { font-size: 18px; margin-bottom: 24px; }
+    .field { margin-bottom: 20px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; font-weight: 500; }
+    input, select, textarea {
+      width: 100%;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      padding: 10px 14px;
+      font-size: 14px;
+      outline: none;
+      transition: border 0.2s;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    select option { background: var(--bg); }
+    .radio-group { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 6px; }
+    .radio-option {
+      flex: 1; min-width: 100px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 14px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: all 0.2s;
+    }
+    .radio-option:hover { border-color: var(--accent); }
+    .radio-option.selected { border-color: var(--accent); background: var(--accent-glow); }
+    .radio-option input { display: none; }
+
+    .btn-row { display: flex; gap: 12px; justify-content: flex-end; margin-top: 8px; }
+    button {
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.2s;
+    }
+    .btn-primary { background: var(--accent); color: white; }
+    .btn-primary:hover { filter: brightness(1.15); }
+    .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover { border-color: var(--accent); }
+    .btn-success { background: var(--success); color: white; }
+
+    .error-msg { color: var(--error); font-size: 12px; margin-top: 4px; display: none; }
+    .field.invalid .error-msg { display: block; }
+    .field.invalid input, .field.invalid select { border-color: var(--error); }
+
+    /* Confirmation */
+    #confirmation {
+      display: none;
+      text-align: center;
+    }
+    .confirm-icon {
+      width: 72px; height: 72px;
+      background: rgba(34,197,94,0.15);
+      border: 2px solid var(--success);
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 32px;
+      margin: 0 auto 20px;
+    }
+    #confirmation h2 { color: var(--success); font-size: 22px; margin-bottom: 12px; }
+    .result-table { width: 100%; border-collapse: collapse; margin: 20px 0; text-align: left; }
+    .result-table td { padding: 8px 12px; font-size: 13px; border-bottom: 1px solid var(--border); }
+    .result-table td:first-child { color: var(--muted); width: 140px; }
+    #submission-id { font-family: monospace; color: var(--accent); font-size: 13px; }
+
+    /* DOO machine-readable output */
+    #doo-result {
+      background: var(--bg);
+      border: 1px dashed var(--accent);
+      border-radius: 8px;
+      padding: 14px;
+      margin-top: 20px;
+      font-size: 12px;
+      font-family: monospace;
+      color: var(--accent);
+      text-align: left;
+      word-break: break-all;
+    }
+
+    .step-panel { display: none; }
+    .step-panel.active { display: block; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="badge">DOO Test Fixture</div>
+  <h1><span>DOO</span> Multi-Step Form</h1>
+  <p class="subtitle">Workflow C — Controlled UI Interaction Test</p>
+</header>
+
+<!-- Step indicators -->
+<div class="stepper" id="stepper">
+  <div class="step-indicator active" id="ind-1">
+    <div class="step-bubble">1</div>
+    <div class="step-label">Personal Info</div>
+  </div>
+  <div class="step-indicator" id="ind-2">
+    <div class="step-bubble">2</div>
+    <div class="step-label">Preferences</div>
+  </div>
+  <div class="step-indicator" id="ind-3">
+    <div class="step-bubble">3</div>
+    <div class="step-label">Review</div>
+  </div>
+  <div class="step-indicator" id="ind-4">
+    <div class="step-bubble">✓</div>
+    <div class="step-label">Done</div>
+  </div>
+</div>
+
+<div class="card">
+
+  <!-- STEP 1: Personal Info -->
+  <div class="step-panel active" id="step-1">
+    <h2>Step 1 — Personal Information</h2>
+    <div class="field" id="f-name">
+      <label for="full-name">Full Name</label>
+      <input type="text" id="full-name" placeholder="e.g. Alex Johnson" autocomplete="off" />
+      <div class="error-msg">Full name is required</div>
+    </div>
+    <div class="field" id="f-email">
+      <label for="email">Email Address</label>
+      <input type="text" id="email" placeholder="e.g. alex@example.com" autocomplete="off" />
+      <div class="error-msg">Valid email is required</div>
+    </div>
+    <div class="field" id="f-company">
+      <label for="company">Company / Organisation</label>
+      <input type="text" id="company" placeholder="e.g. Acme Corp" autocomplete="off" />
+      <div class="error-msg">Company name is required</div>
+    </div>
+    <div class="btn-row">
+      <button class="btn-primary" onclick="goTo2()">Next →</button>
+    </div>
+  </div>
+
+  <!-- STEP 2: Preferences -->
+  <div class="step-panel" id="step-2">
+    <h2>Step 2 — Preferences</h2>
+    <div class="field" id="f-plan">
+      <label for="plan">Select Plan</label>
+      <select id="plan">
+        <option value="">-- choose a plan --</option>
+        <option value="starter">Starter — Free</option>
+        <option value="pro">Pro — $29/mo</option>
+        <option value="enterprise">Enterprise — Contact us</option>
+      </select>
+      <div class="error-msg">Please select a plan</div>
+    </div>
+    <div class="field" id="f-use-case">
+      <label>Primary Use Case</label>
+      <div class="radio-group">
+        <label class="radio-option" id="uc-research" onclick="selectUseCase('research')">
+          <input type="radio" name="use-case" value="research" /> 🔍 Research
+        </label>
+        <label class="radio-option" id="uc-automation" onclick="selectUseCase('automation')">
+          <input type="radio" name="use-case" value="automation" /> ⚙️ Automation
+        </label>
+        <label class="radio-option" id="uc-testing" onclick="selectUseCase('testing')">
+          <input type="radio" name="use-case" value="testing" /> 🧪 Testing
+        </label>
+      </div>
+      <div class="error-msg" id="uc-error" style="display:none">Please select a use case</div>
+    </div>
+    <div class="field">
+      <label for="notes">Additional Notes (optional)</label>
+      <textarea id="notes" rows="3" placeholder="Any specific requirements..."></textarea>
+    </div>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="showStep(1)">← Back</button>
+      <button class="btn-primary" onclick="goTo3()">Next →</button>
+    </div>
+  </div>
+
+  <!-- STEP 3: Review -->
+  <div class="step-panel" id="step-3">
+    <h2>Step 3 — Review & Submit</h2>
+    <table class="result-table">
+      <tr><td>Name</td><td id="rev-name">—</td></tr>
+      <tr><td>Email</td><td id="rev-email">—</td></tr>
+      <tr><td>Company</td><td id="rev-company">—</td></tr>
+      <tr><td>Plan</td><td id="rev-plan">—</td></tr>
+      <tr><td>Use Case</td><td id="rev-use-case">—</td></tr>
+      <tr><td>Notes</td><td id="rev-notes">—</td></tr>
+    </table>
+    <div class="btn-row">
+      <button class="btn-secondary" onclick="showStep(2)">← Back</button>
+      <button class="btn-success" id="submit-btn" onclick="submitForm()">✓ Submit Registration</button>
+    </div>
+  </div>
+
+  <!-- CONFIRMATION -->
+  <div id="confirmation">
+    <div class="confirm-icon">✓</div>
+    <h2>Registration Successful!</h2>
+    <p style="color:var(--muted);font-size:14px">Your submission has been recorded.</p>
+    <table class="result-table" id="conf-table"></table>
+    <p style="font-size:12px;color:var(--muted);margin-top:8px">Submission ID: <span id="submission-id"></span></p>
+
+    <!-- Machine-readable verification output for DOO agent -->
+    <div id="doo-result" 
+         data-testid="doo-verification-result"
+         role="status"
+         aria-label="DOO verification data">
+      <!-- populated by JS -->
+    </div>
+  </div>
+
+</div>
+
+<script>
+  let selectedUseCase = '';
+  let submissionData = null;
+
+  function showStep(n) {
+    document.querySelectorAll('.step-panel').forEach(p => p.classList.remove('active'));
+    document.getElementById('step-' + n).classList.add('active');
+    // Update stepper
+    for (let i = 1; i <= 4; i++) {
+      const ind = document.getElementById('ind-' + i);
+      ind.classList.remove('active', 'done');
+      if (i < n) ind.classList.add('done');
+      else if (i === n) ind.classList.add('active');
+    }
+  }
+
+  function selectUseCase(val) {
+    selectedUseCase = val;
+    document.querySelectorAll('.radio-option').forEach(el => el.classList.remove('selected'));
+    document.getElementById('uc-' + val).classList.add('selected');
+    document.getElementById('uc-error').style.display = 'none';
+  }
+
+  function validateField(fieldId, inputId, validator) {
+    const field = document.getElementById(fieldId);
+    const val = document.getElementById(inputId).value.trim();
+    if (!validator(val)) {
+      field.classList.add('invalid');
+      return false;
+    }
+    field.classList.remove('invalid');
+    return true;
+  }
+
+  function goTo2() {
+    const n = validateField('f-name', 'full-name', v => v.length >= 2);
+    const e = validateField('f-email', 'email', v => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v));
+    const c = validateField('f-company', 'company', v => v.length >= 2);
+    if (n && e && c) showStep(2);
+  }
+
+  function goTo3() {
+    const p = validateField('f-plan', 'plan', v => v !== '');
+    let ucOk = true;
+    if (!selectedUseCase) {
+      document.getElementById('uc-error').style.display = 'block';
+      ucOk = false;
+    }
+    if (p && ucOk) {
+      // populate review
+      document.getElementById('rev-name').textContent = document.getElementById('full-name').value;
+      document.getElementById('rev-email').textContent = document.getElementById('email').value;
+      document.getElementById('rev-company').textContent = document.getElementById('company').value;
+      const planEl = document.getElementById('plan');
+      document.getElementById('rev-plan').textContent = planEl.options[planEl.selectedIndex].text;
+      document.getElementById('rev-use-case').textContent = selectedUseCase;
+      document.getElementById('rev-notes').textContent = document.getElementById('notes').value || '(none)';
+      showStep(3);
+    }
+  }
+
+  function submitForm() {
+    const btn = document.getElementById('submit-btn');
+    btn.textContent = 'Submitting...';
+    btn.disabled = true;
+
+    // Simulate async submit
+    setTimeout(() => {
+      const subId = 'DOO-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7).toUpperCase();
+      const planEl = document.getElementById('plan');
+      submissionData = {
+        submissionId: subId,
+        name: document.getElementById('full-name').value,
+        email: document.getElementById('email').value,
+        company: document.getElementById('company').value,
+        plan: planEl.options[planEl.selectedIndex].value,
+        planLabel: planEl.options[planEl.selectedIndex].text,
+        useCase: selectedUseCase,
+        notes: document.getElementById('notes').value || '',
+        submittedAt: new Date().toISOString(),
+        status: 'REGISTERED'
+      };
+
+      // Hide step panels & show confirmation
+      document.querySelectorAll('.step-panel').forEach(p => p.classList.remove('active'));
+      // Update stepper — all done
+      for (let i = 1; i <= 4; i++) {
+        const ind = document.getElementById('ind-' + i);
+        ind.classList.remove('active');
+        ind.classList.add('done');
+      }
+
+      // Build confirmation table
+      const rows = [
+        ['Name', submissionData.name],
+        ['Email', submissionData.email],
+        ['Company', submissionData.company],
+        ['Plan', submissionData.planLabel],
+        ['Use Case', submissionData.useCase],
+        ['Status', '✅ REGISTERED'],
+      ];
+      let tableHtml = '';
+      rows.forEach(([k, v]) => {
+        tableHtml += `<tr><td>${k}</td><td>${v}</td></tr>`;
+      });
+      document.getElementById('conf-table').innerHTML = tableHtml;
+      document.getElementById('submission-id').textContent = subId;
+
+      // Machine-readable JSON for DOO agent verification
+      const dooEl = document.getElementById('doo-result');
+      dooEl.textContent = JSON.stringify(submissionData, null, 2);
+
+      // Also write to localStorage so DOO can verify from page state
+      try { localStorage.setItem('doo_last_submission', JSON.stringify(submissionData)); } catch(e){}
+
+      document.getElementById('confirmation').style.display = 'block';
+    }, 800);
+  }
+</script>
+</body>
+</html>

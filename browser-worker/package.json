@@ -1,0 +1,23 @@
+{
+  "name": "doo-browser-worker",
+  "version": "1.0.0",
+  "description": "DOO Browser Worker - Playwright-based browser execution service",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "test": "node --test src/tests/*.test.js",
+    "install-browsers": "npx playwright install chromium"
+  },
+  "dependencies": {
+    "express": "^4.21.1",
+    "playwright": "^1.48.2",
+    "uuid": "^11.0.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
