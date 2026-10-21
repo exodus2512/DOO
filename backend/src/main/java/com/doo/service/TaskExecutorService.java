@@ -1200,10 +1200,9 @@ public class TaskExecutorService {
     }
 
     /**
-     * Detect empty form fields that need user input (Step B).
-     * Matches on: required attribute, autocomplete token in PERSONAL_AUTOCOMPLETE_TOKENS,
-     * or label/placeholder matching PERSONAL_FIELD_PATTERN.
-     * Excludes fields whose value already exists in knownValues or the task text.
+     * Detect empty form fields that need user input.
+     * Uses canonical key resolution (autocomplete > name > label) and the real
+     * required flag from the element. Never asks again for keys already in knownValues.
      */
     private static List<Map<String, Object>> detectMissingFields(
             List<Map<String, Object>> interactiveElements,
@@ -1211,53 +1210,141 @@ public class TaskExecutorService {
             String userRequest) {
         if (interactiveElements == null) return List.of();
         List<Map<String, Object>> fields = new ArrayList<>();
+        Set<String> seenKeys = new HashSet<>();
         for (Map<String, Object> el : interactiveElements) {
             String role = String.valueOf(el.getOrDefault("role", ""));
             if (!"textbox".equals(role) && !"combobox".equals(role)) continue;
 
-            // Skip fields that already have a value
+            // Skip fields that already have a visible non-empty value
             String value = String.valueOf(el.getOrDefault("value", ""));
             if (!value.isBlank() && !"***".equals(value)) continue;
 
-            // Skip password fields and username/login fields — handled by credential gate
+            // Skip sensitive fields — handled by credential gate
             String type = String.valueOf(el.getOrDefault("type", ""));
             if ("password".equals(type)) continue;
-            String elName = el.get("name") != null ? String.valueOf(el.get("name")).toLowerCase() : "";
-            String elAutocomplete = el.get("autocomplete") != null ? String.valueOf(el.get("autocomplete")).toLowerCase() : "";
-            if (elAutocomplete.equals("username") || elAutocomplete.equals("current-password")
-                    || elName.equals("username") || elName.equals("user") || elName.equals("login")) continue;
+            String elAc = el.get("autocomplete") != null ? el.get("autocomplete").toString().toLowerCase() : "";
+            if (elAc.equals("current-password") || elAc.equals("new-password")
+                    || elAc.equals("cc-number") || elAc.equals("cc-csc") || elAc.equals("cc-exp")) continue;
+            String elName = el.get("name") != null ? el.get("name").toString().toLowerCase() : "";
+            if (elName.equals("username") || elName.equals("user") || elName.equals("login")
+                    || elAc.equals("username")) continue;
 
-            boolean isRequired = Boolean.TRUE.equals(el.get("required"));
-            String autocomplete = el.get("autocomplete") != null ? String.valueOf(el.get("autocomplete")) : "";
-            String name = el.get("name") != null ? String.valueOf(el.get("name")) : "";
-            String label = String.valueOf(el.getOrDefault("label", ""));
-            String placeholder = el.get("placeholder") != null ? String.valueOf(el.get("placeholder")) : "";
-            String fieldHint = !label.isBlank() ? label : (!placeholder.isBlank() ? placeholder : name);
-            if (fieldHint.isBlank()) continue;
+            boolean isRequired = Boolean.TRUE.equals(el.get("required"))
+                || "true".equals(String.valueOf(el.getOrDefault("ariaRequired", "")));
+            String autocomplete = el.get("autocomplete") != null ? el.get("autocomplete").toString() : "";
+            String label = el.getOrDefault("label", "").toString();
+            String placeholder = el.get("placeholder") != null ? el.get("placeholder").toString() : "";
+            String hint = !label.isBlank() ? label : (!placeholder.isBlank() ? placeholder : elName);
+            if (hint.isBlank()) continue;
 
-            boolean isPersonalAutocomplete = !autocomplete.isBlank() && PERSONAL_AUTOCOMPLETE_TOKENS.contains(autocomplete);
-            boolean isPersonalLabel = PERSONAL_FIELD_PATTERN.matcher(fieldHint).find();
+            boolean isPersonalAc = !autocomplete.isBlank()
+                && PERSONAL_AUTOCOMPLETE_TOKENS.contains(autocomplete.toLowerCase());
+            boolean isPersonalLabel = PERSONAL_FIELD_PATTERN.matcher(hint).find();
+            if (!isRequired && !isPersonalAc && !isPersonalLabel) continue;
 
-            if (!isRequired && !isPersonalAutocomplete && !isPersonalLabel) continue;
+            // Canonical key — dedup within this scan
+            String canonicalKey = canonicalKeyForElement(el);
+            if (canonicalKey.isBlank()) continue;
+            if (seenKeys.contains(canonicalKey)) continue;
+            seenKeys.add(canonicalKey);
 
-            // Check if we already have a value for this field
-            String normalizedKey = normalizeFieldKey(fieldHint);
-            if (knownValues.containsKey(normalizedKey)) continue;
-            if (!autocomplete.isBlank() && knownValues.containsKey(autocomplete)) continue;
-            if (userRequest != null && userRequest.toLowerCase().contains(fieldHint.toLowerCase())) continue;
+            // Skip if already known (by canonical key or hint slug)
+            if (knownValues.containsKey(canonicalKey)) continue;
+            if (knownValues.containsKey(normalizeFieldKey(hint))) continue;
+            if (userRequest != null && userRequest.toLowerCase().contains(hint.toLowerCase())) continue;
 
-            fields.add(Map.of(
-                "label", fieldHint,
-                "name", normalizedKey,
-                "type", "text",
-                "required", true
-            ));
+            java.util.LinkedHashMap<String, Object> field = new java.util.LinkedHashMap<>();
+            field.put("label", hint);
+            field.put("name", canonicalKey);
+            field.put("type", "text");
+            field.put("required", isRequired);
+            fields.add(field);
         }
         return fields;
     }
 
+    // ─── Canonical field key mapping ─────────────────────────────────────────────
+
+    /** Synonym map: raw slug → canonical key. Site-agnostic; no hardcoded page strings. */
+    private static final Map<String, String> FIELD_SYNONYMS;
+    static {
+        Map<String, String> m = new java.util.LinkedHashMap<>();
+        for (String k : List.of("zip", "zipcode", "zip_code", "postal", "postcode",
+                "post_code", "pin", "pincode", "pin_code", "postal_code_zip"))
+            m.put(k, "postal_code");
+        for (String k : List.of("mobile", "cell", "cellphone", "contact_number",
+                "contact", "telephone", "phone_number", "mobile_number"))
+            m.put(k, "phone");
+        for (String k : List.of("first", "given_name", "forename", "first_name", "given"))
+            m.put(k, "first_name");
+        for (String k : List.of("last", "surname", "family_name", "family", "last_name"))
+            m.put(k, "last_name");
+        for (String k : List.of("full_name", "fullname", "name")) m.put(k, "full_name");
+        for (String k : List.of("e_mail", "email_address", "mail")) m.put(k, "email");
+        for (String k : List.of("town", "locality", "city_name")) m.put(k, "city");
+        for (String k : List.of("province", "region", "county", "state_province")) m.put(k, "state");
+        for (String k : List.of("street", "street_address", "address_line1", "address1")) m.put(k, "address");
+        FIELD_SYNONYMS = java.util.Collections.unmodifiableMap(m);
+    }
+
+    /** W3C autocomplete token → canonical key. Checked before name/label. */
+    private static final Map<String, String> AUTOCOMPLETE_TO_KEY = Map.ofEntries(
+        Map.entry("given-name", "first_name"),
+        Map.entry("additional-name", "middle_name"),
+        Map.entry("family-name", "last_name"),
+        Map.entry("name", "full_name"),
+        Map.entry("email", "email"),
+        Map.entry("tel", "phone"),
+        Map.entry("tel-national", "phone"),
+        Map.entry("street-address", "address"),
+        Map.entry("address-line1", "address"),
+        Map.entry("address-line2", "address_line2"),
+        Map.entry("address-level1", "state"),
+        Map.entry("address-level2", "city"),
+        Map.entry("postal-code", "postal_code"),
+        Map.entry("country", "country"),
+        Map.entry("country-name", "country"),
+        Map.entry("cc-name", "card_name"),
+        Map.entry("cc-number", "card_number"),
+        Map.entry("cc-exp", "card_expiry"),
+        Map.entry("cc-csc", "card_cvv"),
+        Map.entry("bday", "date_of_birth"),
+        Map.entry("username", "username"),
+        Map.entry("current-password", "password"),
+        Map.entry("new-password", "new_password"),
+        Map.entry("organization", "company"),
+        Map.entry("honorific-prefix", "title")
+    );
+
+    /**
+     * Normalize a raw string to a canonical field key.
+     * Applies the synonym table so "Zip", "postal code", "PIN" all yield postal_code.
+     */
     private static String normalizeFieldKey(String fieldHint) {
-        return fieldHint.toLowerCase().replaceAll("[^a-z0-9]+", "_").replaceAll("^_|_$", "");
+        if (fieldHint == null || fieldHint.isBlank()) return "";
+        String slug = fieldHint.toLowerCase().replaceAll("[^a-z0-9]+", "_").replaceAll("^_|_$", "");
+        return FIELD_SYNONYMS.getOrDefault(slug, slug);
+    }
+
+    /**
+     * Derive a canonical key from a full element map using priority:
+     * autocomplete attribute > name/id > label/placeholder text.
+     */
+    private static String canonicalKeyForElement(Map<String, Object> el) {
+        String ac = el.get("autocomplete") != null ? el.get("autocomplete").toString().toLowerCase().trim() : "";
+        if (!ac.isBlank()) {
+            String acKey = AUTOCOMPLETE_TO_KEY.get(ac);
+            if (acKey != null) return acKey;
+            return normalizeFieldKey(ac);
+        }
+        String name = el.get("name") != null ? el.get("name").toString() : "";
+        if (!name.isBlank()) return normalizeFieldKey(name);
+        String id = el.get("id") != null ? el.get("id").toString() : "";
+        if (!id.isBlank()) return normalizeFieldKey(id);
+        String label = el.getOrDefault("label", "").toString();
+        String placeholder = el.get("placeholder") != null ? el.get("placeholder").toString() : "";
+        String hint = !label.isBlank() ? label : placeholder;
+        return normalizeFieldKey(hint);
     }
 
     private static final java.util.regex.Pattern PAGE_ERROR_PATTERN = java.util.regex.Pattern.compile(
