@@ -129,5 +129,11 @@ public class TaskEventPublisher {
         public static TaskEvent debug(UUID taskId, String message, Map<String, Object> data) {
             return new TaskEvent(taskId, "debug", null, message, data != null ? data : Map.of(), Instant.now());
         }
+
+        /** Carries task field updates (workflowType, etc.) to the frontend without a status change. */
+        public static TaskEvent taskUpdated(UUID taskId, String workflowType) {
+            return new TaskEvent(taskId, "task_updated", null, "Task classified",
+                Map.of("workflowType", workflowType != null ? workflowType : "UNKNOWN"), Instant.now());
+        }
     }
 }

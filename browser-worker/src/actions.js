@@ -61,6 +61,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
     switch (validatedAction) {
       case 'NAVIGATE': {
         const url = args.url;
+        if (!url || !url.trim()) {
+          return { success: false, error: 'NAVIGATE requires a non-empty url' };
+        }
         validateUrl(url);
         await page.goto(url, {
           waitUntil: 'domcontentloaded',

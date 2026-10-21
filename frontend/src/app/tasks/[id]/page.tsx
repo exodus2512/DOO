@@ -108,6 +108,12 @@ export default function TaskDetailPage() {
       return;
     }
 
+    // Workflow type update (published right after classification)
+    if (event.eventType === 'task_updated' && event.data?.workflowType) {
+      setTask((prev) => prev ? { ...prev, workflowType: event.data.workflowType as any } : null);
+      return;
+    }
+
     if (event.status) {
       setTask((prev) => (prev ? { ...prev, status: event.status as any } : null));
     }
@@ -175,7 +181,7 @@ export default function TaskDetailPage() {
       api.getEvidence(taskId).then(setArtifacts).catch(console.error);
       setPendingApproval(null);
     }
-  });
+  }, loadTaskData);
 
   const handleCancel = async () => {
     if (!task || actionInProgress) return;

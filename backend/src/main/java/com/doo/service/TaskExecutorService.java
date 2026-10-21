@@ -113,6 +113,8 @@ public class TaskExecutorService {
             publishEvent(TaskEvent.debug(taskId, "[STEP 1/5] CLASSIFY — result: " + classification.workflowType(), Map.of("phase", "CLASSIFY", "result", classification.workflowType())));
             task.setWorkflowType(WorkflowType.valueOf(classification.workflowType()));
             task.setSuccessCriteria(classification.successCriteria());
+            taskRepository.save(task); // persist workflowType so the UI chip shows immediately
+            publishEvent(TaskEvent.taskUpdated(taskId, classification.workflowType()));
 
             publishEvent(TaskEvent.debug(taskId, "[STEP 2/5] PLAN — generating", Map.of("phase", "PLAN", "keyPool", getKeyPoolState())));
             AiProvider.TaskPlan plan = aiProvider.generatePlan(
@@ -242,6 +244,20 @@ public class TaskExecutorService {
                 );
                 aiCallCount++;
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — chose: " + decision.actionType(), Map.of("phase", "SELECT_ACTION", "action", decision.actionType())));
+
+                // Normalize NAVIGATE URL: add https:// if scheme is missing
+                if ("NAVIGATE".equals(decision.actionType())) {
+                    String rawUrl = decision.args() != null ? (String) decision.args().get("url") : null;
+                    if (rawUrl != null && !rawUrl.isBlank() && !rawUrl.contains("://")) {
+                        Map<String, Object> fixedArgs = new HashMap<>(decision.args());
+                        fixedArgs.put("url", "https://" + rawUrl);
+                        decision = new AiProvider.ActionDecision(
+                            decision.actionType(), fixedArgs, decision.rationale(),
+                            decision.requiresApproval(), decision.approvalReason()
+                        );
+                        log.info("Task {} NAVIGATE URL normalized: https://{}", taskId, rawUrl);
+                    }
+                }
 
                 // Check for DONE
                 if ("DONE".equals(decision.actionType())) {
@@ -673,15 +689,21 @@ public class TaskExecutorService {
             return false;
         }
 
-        // Validate NAVIGATE URL
+        // Validate NAVIGATE URL — blank or invalid URL is a hard reject
         if ("NAVIGATE".equals(actionType)) {
-            String url = (String) decision.args().get("url");
+            String url = decision.args() != null ? (String) decision.args().get("url") : null;
+            if (url == null || url.isBlank()) {
+                log.warn("Task {} proposed NAVIGATE with no URL", task.getId());
+                publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING",
+                    "NAVIGATE rejected: no URL provided", task.getCurrentStep(), Map.of()));
+                return false;
+            }
             try {
                 urlValidator.validate(url);
             } catch (SecurityException e) {
                 log.warn("Task {} proposed invalid navigation URL '{}': {}", task.getId(), url, e.getMessage());
                 publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING",
-                    "Skipped navigation to disallowed URL", task.getCurrentStep(), Map.of()));
+                    "NAVIGATE rejected: " + e.getMessage(), task.getCurrentStep(), Map.of()));
                 return false;
             }
         }

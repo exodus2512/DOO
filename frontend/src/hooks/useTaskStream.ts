@@ -13,16 +13,20 @@ export interface TaskStreamEvent {
 }
 
 const TERMINAL_STATUSES = ['COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED'];
-const RECONNECT_DELAY_MS = 3000;
-const MAX_RECONNECTS = 5;
+const MAX_RECONNECTS = 8;
+// Exponential backoff: 2s, 4s, 8s, 16s, capped at 30s
+const backoffMs = (attempt: number) => Math.min(2000 * Math.pow(2, attempt - 1), 30000);
 
 export function useTaskStream(
   taskId: string | null,
-  onEvent: (event: TaskStreamEvent) => void
+  onEvent: (event: TaskStreamEvent) => void,
+  onReconnect?: () => void,
 ) {
   const esRef = useRef<EventSource | null>(null);
   const onEventRef = useRef(onEvent);
   onEventRef.current = onEvent;
+  const onReconnectRef = useRef(onReconnect);
+  onReconnectRef.current = onReconnect;
   const reconnectCount = useRef(0);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const terminated = useRef(false);
@@ -66,7 +70,7 @@ export function useTaskStream(
     };
 
     const eventTypes = [
-      'connected', 'status_change', 'step_update',
+      'connected', 'status_change', 'step_update', 'task_updated',
       'screenshot', 'approval_required', 'error', 'completed', 'debug'
     ];
     eventTypes.forEach(type => es.addEventListener(type, handleEvent));
@@ -79,10 +83,15 @@ export function useTaskStream(
 
       if (reconnectCount.current < MAX_RECONNECTS) {
         reconnectCount.current++;
-        console.log(`[DOO] SSE disconnected, reconnecting (${reconnectCount.current}/${MAX_RECONNECTS})...`);
-        reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
+        const delay = backoffMs(reconnectCount.current);
+        console.log(`[DOO] SSE dropped (attempt ${reconnectCount.current}/${MAX_RECONNECTS}), reconnecting in ${delay}ms...`);
+        reconnectTimer.current = setTimeout(() => {
+          // Re-fetch latest state before reconnecting so the UI isn't stale
+          onReconnectRef.current?.();
+          connect();
+        }, delay);
       } else {
-        console.warn('[DOO] SSE max reconnects reached, falling back to polling');
+        console.warn('[DOO] SSE max reconnects reached — stopping auto-reconnect');
       }
     };
   }, [taskId, cleanup]);
