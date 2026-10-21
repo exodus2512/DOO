@@ -109,6 +109,9 @@ async function buildObservation(page, taskId, options = {}) {
           const text = el.innerText?.substring(0, 200)?.trim() || '';
           const value = isPassword ? '***' : (el.value?.substring(0, 200) || '');
 
+          const required = el.required || el.getAttribute('aria-required') === 'true';
+          const autocomplete = el.getAttribute('autocomplete') || null;
+
           results.push({
             role,
             label: label.substring(0, 200),
@@ -118,6 +121,8 @@ async function buildObservation(page, taskId, options = {}) {
             type: el.type || el.tagName.toLowerCase(),
             enabled: !el.disabled,
             visible: true,
+            required,
+            autocomplete,
             href: el.tagName === 'A' ? el.href : null,
             isPassword,
             boundingBox: {
@@ -132,6 +137,7 @@ async function buildObservation(page, taskId, options = {}) {
             name: el.name || null,
             className: el.className?.toString()?.substring(0, 200) || null,
             placeholder: el.getAttribute('placeholder') || null,
+            ariaRequired: el.getAttribute('aria-required') || null,
           });
 
           if (results.length >= maxElements) break;
@@ -156,6 +162,11 @@ async function buildObservation(page, taskId, options = {}) {
         enabled: el.enabled,
         visible: el.visible,
         href: el.href,
+        required: el.required || false,
+        autocomplete: el.autocomplete || null,
+        name: el.name || null,
+        id: el.id || null,
+        ariaRequired: el.ariaRequired || null,
       };
       if (includeBoundingBoxes) {
         mapped.bounding_box = el.boundingBox;
