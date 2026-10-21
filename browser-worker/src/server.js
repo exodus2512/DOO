@@ -126,6 +126,21 @@ app.post('/action/execute', async (req, res) => {
     const result = await executeAction(session.page, actionType, args || {}, taskId, session);
 
     if (result.observation) {
+      // Capture a screenshot for every action if the observation didn't include one
+      // Password fields are masked via CSS injection before capture
+      if (!result.observation.screenshot?.base64) {
+        try {
+          await session.page.evaluate(() => {
+            const s = document.createElement('style'); s.id = '__doo_pwd_mask';
+            s.textContent = 'input[type="password"]{-webkit-text-security:disc!important;color:transparent!important;text-shadow:0 0 0 #000!important}';
+            document.head.appendChild(s);
+          }).catch(() => {});
+          const buf = await session.page.screenshot({ type: 'jpeg', quality: 50, fullPage: false });
+          result.observation.screenshot = { available: true, base64: buf.toString('base64'), mime_type: 'image/jpeg' };
+          await session.page.evaluate(() => { const s = document.getElementById('__doo_pwd_mask'); if (s) s.remove(); }).catch(() => {});
+        } catch { /* best effort */ }
+      }
+
       // Cache full observation on the session for element resolution
       session.lastObservation = result.observation;
       const obs = result.observation;

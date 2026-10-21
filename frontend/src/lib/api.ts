@@ -132,11 +132,12 @@ export const api = {
 
   getEvidence: async (id: string): Promise<EvidenceArtifact[]> => {
     const list = await request<any[]>(`/api/tasks/${id}/evidence`);
+    const isScreenshot = (t: string) => t === 'SCREENSHOT' || t === 'STEP_SCREENSHOT';
     return list.map((e) => ({
       ...e,
-      base64Data: e.artifactType === 'SCREENSHOT' ? e.content : null,
-      textContent: e.artifactType !== 'SCREENSHOT' ? e.content : null,
-      description: e.label || (e.artifactType === 'SCREENSHOT' ? 'Browser Screenshot' : 'Extracted Content'),
+      base64Data: isScreenshot(e.artifactType) ? e.content : null,
+      textContent: !isScreenshot(e.artifactType) ? e.content : null,
+      description: e.label || (isScreenshot(e.artifactType) ? 'Browser Screenshot' : 'Extracted Content'),
     }));
   },
 

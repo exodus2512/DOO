@@ -215,6 +215,8 @@ public class TaskExecutorService {
             List<Map<String, Object>> lastInteractiveElements = null;
             int resolverRetries = 0;
             final int MAX_RESOLVER_RETRIES = 2;
+            int screenshotCount = 0;
+            List<String> screenshotLog = new ArrayList<>();
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
 
@@ -438,11 +440,18 @@ public class TaskExecutorService {
                     log.warn("Task {} step {} | {} | FAILED: {}", taskId, step, decision.actionType(), result.error());
                 }
 
-                // Handle screenshot
+                // Save screenshot evidence for every action (with step metadata)
                 if (result.screenshot() != null && !result.screenshot().isBlank()) {
-                    String label = (String) decision.args().getOrDefault("label", "Step " + step);
-                    saveEvidence(taskId, "SCREENSHOT", label, result.screenshot(), result.currentUrl());
-                    publishEvent(TaskEvent.screenshot(taskId, label, result.screenshot()));
+                    String screenshotLabel = "Step " + step + ": " + decision.actionType()
+                        + (result.success() ? "" : " [FAILED]");
+                    saveStepScreenshot(taskId, step, decision.actionType(),
+                        result.observationId(), result.success(), screenshotLabel,
+                        result.screenshot(), result.currentUrl());
+                    publishEvent(TaskEvent.screenshot(taskId, screenshotLabel, result.screenshot()));
+                    screenshotCount++;
+                    screenshotLog.add("Screenshot #" + screenshotCount + ": step " + step
+                        + " " + decision.actionType() + " → " + truncate(result.currentUrl(), 50)
+                        + (result.success() ? " [OK]" : " [FAIL]"));
                 }
 
                 // Handle CAPTCHA/2FA challenges: pause for user, DO NOT attempt to solve
@@ -629,10 +638,13 @@ public class TaskExecutorService {
             evidenceSummary.add("Visited " + visitedUrls.size() + " URLs");
             evidenceSummary.add("Collected " + textSnippets.size() + " text snippets");
             evidenceSummary.add("Executed " + recentActions.size() + " actions");
+            evidenceSummary.add("Captured " + screenshotCount + " step screenshots");
             evidenceSummary.add("Observation epochs: " + observationEpoch);
             if (!visitedUrls.isEmpty()) {
                 evidenceSummary.add("Final URL: " + currentUrl);
             }
+            // Add screenshot log for verification to cite specific evidence
+            evidenceSummary.addAll(screenshotLog);
 
             publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — checking evidence", Map.of("phase", "VERIFY", "keyPool", getKeyPoolState())));
             AiProvider.VerificationResult verification = aiProvider.verify(
@@ -1106,6 +1118,33 @@ public class TaskExecutorService {
             }
         }
         return creds;
+    }
+
+    private void saveStepScreenshot(UUID taskId, int stepIndex, String actionType,
+                                    String observationId, boolean success, String label,
+                                    String screenshotBase64, String sourceUrl) {
+        try {
+            String content = screenshotBase64;
+            if (content != null && content.length() > 500_000) {
+                content = content.substring(0, 500_000);
+            }
+            String metadata = String.format(
+                "{\"stepIndex\":%d,\"action\":\"%s\",\"observationId\":\"%s\",\"success\":%s,\"timestamp\":\"%s\"}",
+                stepIndex, actionType,
+                observationId != null ? observationId : "",
+                success, Instant.now().toString()
+            );
+            EvidenceArtifact evidence = EvidenceArtifact.builder()
+                .taskId(taskId)
+                .artifactType("STEP_SCREENSHOT")
+                .label(label)
+                .content(content)
+                .sourceUrl(sourceUrl)
+                .build();
+            evidenceRepository.save(evidence);
+        } catch (Exception e) {
+            log.warn("Could not save step screenshot for task {} step {}: {}", taskId, stepIndex, e.getMessage());
+        }
     }
 
     private void saveEvidence(UUID taskId, String type, String label, String content, String sourceUrl) {

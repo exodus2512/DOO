@@ -365,11 +365,13 @@ public class GeminiAiProvider implements AiProvider {
 
             IMPORTANT: Base your verdict on the specific evidence listed above.
             If evidence is insufficient to confirm the success criteria, mark as NOT passed.
+            Cite specific screenshot numbers and extracted text snippets in your notes
+            to justify your confidence level (e.g. "Screenshot #3 shows the confirmation page").
 
             Did the execution meet the success criteria? Respond in JSON format ONLY:
             {
               "passed": true|false,
-              "notes": "specific explanation referencing the evidence collected",
+              "notes": "specific explanation citing screenshots and text evidence",
               "confidence": 0.0-1.0
             }
             """.formatted(
