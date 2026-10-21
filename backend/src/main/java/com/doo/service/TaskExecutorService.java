@@ -283,6 +283,14 @@ public class TaskExecutorService {
                     consecutiveFailures = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
 
+                    // For EXTRACT_TEXT, save the action's direct result as primary evidence
+                    if ("EXTRACT_TEXT".equals(decision.actionType()) && result.result() != null && result.result().length() > 50) {
+                        String extractLabel = (String) decision.args().getOrDefault("label", "Extracted content");
+                        String extractSnippet = result.result().substring(0, Math.min(4000, result.result().length()));
+                        textSnippets.add("[" + extractLabel + "] " + extractSnippet);
+                        saveEvidence(taskId, "TEXT_SNIPPET", extractLabel, extractSnippet, currentUrl);
+                    }
+
                     // Update observation epoch on state change
                     String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
                     if (!newObsHash.equals(lastObservationHash)) {
@@ -303,7 +311,7 @@ public class TaskExecutorService {
                         pageTitle = result.pageTitle() != null ? result.pageTitle() : "";
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
 
-                        if (result.pageText().length() > 100) {
+                        if (!"EXTRACT_TEXT".equals(decision.actionType()) && result.pageText().length() > 100) {
                             String snippet = result.pageText().substring(0, Math.min(2000, result.pageText().length()));
                             textSnippets.add("[" + result.pageTitle() + "] " + snippet);
                             saveEvidence(taskId, "TEXT_SNIPPET", result.pageTitle(),

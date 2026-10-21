@@ -37,7 +37,7 @@ async function buildObservation(page, taskId, options = {}) {
   try {
     pageTextResult = await page.evaluate((maxLen) => {
       const clone = document.cloneNode(true);
-      const toRemove = clone.querySelectorAll('script, style, noscript');
+      const toRemove = clone.querySelectorAll('script, style, noscript, nav, header, footer, svg, [role="navigation"], [role="banner"], [aria-hidden="true"]');
       toRemove.forEach(el => el.remove());
       const raw = (clone.body || clone).innerText || '';
       const text = raw.substring(0, maxLen);
