@@ -113,9 +113,16 @@ public class GeminiAiProvider implements AiProvider {
 
             User request: "%s"
 
+            Workflow types:
+            - WEB_RESEARCH: needs live web data, current events, real-time information
+            - PRODUCT_COMPARISON: compare specific products using live web pages
+            - UI_INTERACTION: fill forms, click buttons, interact with a specific web page
+            - LLM_ONLY: static knowledge questions, explanations, summaries, math, code help — anything you can answer from training data without a browser
+            - UNKNOWN: ambiguous or unclear request that needs clarification
+
             Respond in JSON format ONLY (no markdown, no explanation outside JSON):
             {
-              "workflowType": "WEB_RESEARCH|PRODUCT_COMPARISON|UI_INTERACTION|UNKNOWN",
+              "workflowType": "WEB_RESEARCH|PRODUCT_COMPARISON|UI_INTERACTION|LLM_ONLY|UNKNOWN",
               "rationale": "one sentence explanation",
               "successCriteria": "specific, testable conditions for completion"
             }
@@ -382,6 +389,30 @@ public class GeminiAiProvider implements AiProvider {
         }
     }
 
+    @Override
+    public String directAnswer(String userRequest) {
+        if (!isAvailable()) {
+            return "This is a static knowledge question answered in demo mode. " +
+                "In live mode, the LLM would provide a direct answer for: " + userRequest;
+        }
+        String prompt = """
+            Answer the following question directly and concisely. Use markdown formatting.
+            If you are not confident in the answer, say so. Do not make up facts.
+
+            Question: "%s"
+            """.formatted(userRequest);
+
+        try {
+            String taskLabel = truncate(userRequest, 60);
+            log.info("[LLM_ONLY] Answering directly: {}", taskLabel);
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.SYNTHESIZE);
+            return callGemini(prompt, taskLabel);
+        } catch (Exception e) {
+            log.error("[LLM_ONLY] Failed: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during direct answer: " + e.getMessage(), e);
+        }
+    }
+
     // ─── Core API caller with throttle, key rotation, backoff ──────────────
 
     String callGemini(String prompt, String taskLabel) {
@@ -605,7 +636,13 @@ public class GeminiAiProvider implements AiProvider {
 
     private WorkflowClassification deterministic_classifyWorkflow(String request) {
         String lower = request.toLowerCase();
-        if (lower.contains("research") || lower.contains("compare") || lower.contains("difference")) {
+        if (lower.contains("form") || lower.contains("fill") || lower.contains("submit")) {
+            return new WorkflowClassification("UI_INTERACTION",
+                "Request appears to be a UI interaction task",
+                "Form submitted and confirmation page verified");
+        }
+        if (lower.contains("research") || lower.contains("compare") || lower.contains("difference") ||
+            lower.contains("trending") || lower.contains("latest") || lower.contains("current")) {
             return new WorkflowClassification("WEB_RESEARCH",
                 "Request appears to be a research task",
                 "Result contains comparison with source URLs");
@@ -615,10 +652,12 @@ public class GeminiAiProvider implements AiProvider {
                 "Request appears to be a product comparison",
                 "Each product has extracted specs and price with traceable sources");
         }
-        if (lower.contains("form") || lower.contains("fill") || lower.contains("test") || lower.contains("submit")) {
-            return new WorkflowClassification("UI_INTERACTION",
-                "Request appears to be a UI interaction task",
-                "Form submitted and confirmation page verified");
+        if (lower.contains("what is") || lower.contains("explain") || lower.contains("how does") ||
+            lower.contains("define") || lower.contains("list") || lower.contains("top ") ||
+            lower.contains("summarize") || lower.contains("calculate") || lower.contains("translate")) {
+            return new WorkflowClassification("LLM_ONLY",
+                "Static knowledge question answerable without browser",
+                "Answer is factually correct and addresses the question");
         }
         return new WorkflowClassification("WEB_RESEARCH",
             "Defaulting to web research", "Result contains relevant information");

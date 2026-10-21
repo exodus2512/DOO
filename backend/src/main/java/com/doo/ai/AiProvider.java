@@ -33,6 +33,11 @@ public interface AiProvider {
      */
     String synthesizeResult(SynthesisRequest request);
 
+    /**
+     * Answer a question directly without browser interaction (LLM_ONLY path).
+     */
+    String directAnswer(String userRequest);
+
     record WorkflowClassification(String workflowType, String rationale, String successCriteria) {}
 
     record WorkflowContext(String workflowType) {}

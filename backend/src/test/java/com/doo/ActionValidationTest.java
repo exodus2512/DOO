@@ -139,13 +139,17 @@ class ActionValidationTest {
     // ── WorkflowType enum ──────────────────────────────────────────────────
 
     @Test
-    @DisplayName("All four workflow types exist")
+    @DisplayName("All workflow types exist")
     void allWorkflowTypesExist() {
-        assertThat(WorkflowType.values()).hasSize(4);
+        assertThat(WorkflowType.values()).hasSize(5);
         assertThat(WorkflowType.valueOf("WEB_RESEARCH")).isNotNull();
         assertThat(WorkflowType.valueOf("PRODUCT_COMPARISON")).isNotNull();
         assertThat(WorkflowType.valueOf("UI_INTERACTION")).isNotNull();
+        assertThat(WorkflowType.valueOf("LLM_ONLY")).isNotNull();
         assertThat(WorkflowType.valueOf("UNKNOWN")).isNotNull();
+        assertThat(WorkflowType.WEB_RESEARCH.requiresBrowser()).isTrue();
+        assertThat(WorkflowType.LLM_ONLY.requiresBrowser()).isFalse();
+        assertThat(WorkflowType.UNKNOWN.requiresBrowser()).isFalse();
     }
 
     @Test

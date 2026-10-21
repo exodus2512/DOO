@@ -133,10 +133,51 @@ public class TaskExecutorService {
                 "Plan created: " + plan.steps().size() + " steps", 0,
                 Map.of("plan", planText)));
 
+            // ── Routing: decide execution path based on workflow type ──
+            WorkflowType wfType = task.getWorkflowType();
+            log.info("Task {} routing: workflowType={}, requiresBrowser={}", taskId, wfType, wfType.requiresBrowser());
+            publishEvent(TaskEvent.debug(taskId, "[ROUTING] " + wfType + " → " +
+                (wfType.requiresBrowser() ? "browser" : wfType == WorkflowType.UNKNOWN ? "clarification" : "llm-only"),
+                Map.of("phase", "ROUTING", "path", wfType.requiresBrowser() ? "browser" : wfType.name())));
+
+            if (wfType == WorkflowType.UNKNOWN) {
+                String reason = "Request is ambiguous — please provide more detail about what you'd like to accomplish.";
+                task.setFailureReason(reason);
+                TaskResult taskResult = TaskResult.builder()
+                    .taskId(taskId)
+                    .summary(reason)
+                    .verificationPassed(false)
+                    .verificationNotes("Task classified as UNKNOWN — needs clarification")
+                    .sources(List.of())
+                    .build();
+                taskResultRepository.save(taskResult);
+                updateTaskStatus(task, TaskStatus.FAILED, reason);
+                publishEvent(TaskEvent.error(taskId, reason));
+                return;
+            }
+
+            if (wfType == WorkflowType.LLM_ONLY) {
+                publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Answering directly (no browser needed)...", 0, Map.of()));
+                String answer = aiProvider.directAnswer(task.getUserRequest());
+                aiCallCount++;
+                TaskResult taskResult = TaskResult.builder()
+                    .taskId(taskId)
+                    .summary(answer)
+                    .verificationPassed(true)
+                    .verificationNotes("Answered directly by LLM — no browser interaction required")
+                    .sources(List.of())
+                    .build();
+                taskResultRepository.save(taskResult);
+                updateTaskStatus(task, TaskStatus.COMPLETED, null);
+                publishEvent(TaskEvent.completed(taskId, "Answered directly without browser"));
+                return;
+            }
+
+            // ── Browser path: WEB_RESEARCH, PRODUCT_COMPARISON, UI_INTERACTION ──
             // Step 2: Initialize browser session
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Launching browser...", 0, Map.of()));
             SessionResult session = browserWorkerClient.initSession(taskId);
-            
+
             if (!session.success()) {
                 failTask(task, "Could not launch browser: " + session.error());
                 return;
