@@ -278,7 +278,6 @@ public class GeminiAiProvider implements AiProvider {
             Page title: %s
             %s
             %s
-            %s
             Recent actions: %s
             %s
 
