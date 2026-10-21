@@ -7,6 +7,32 @@
 const { validateUrl, validateActionType } = require('./security');
 const { buildObservation, resolveElement } = require('./perception');
 
+/**
+ * Randomised human-like pause to avoid bot-detection rate limits.
+ * Replaces all fixed waitForTimeout values.
+ * @param {number} min  minimum wait in ms (default 300)
+ * @param {number} max  maximum wait in ms (default 1200)
+ */
+async function humanPause(min = 300, max = 1200) {
+  const ms = Math.floor(min + Math.random() * (max - min));
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Back off on 429 / rate-limit responses.
+ * @param {import('playwright').Response|null} response
+ * @returns {Promise<void>}
+ */
+async function maybeBackoff(response) {
+  if (!response) return;
+  if (response.status() === 429) {
+    const retryAfter = parseInt(response.headers()['retry-after'] || '5', 10);
+    const waitMs = Math.min(retryAfter * 1000, 30000); // cap at 30 s
+    console.warn(`[429] Rate-limited — waiting ${waitMs}ms before proceeding`);
+    await humanPause(waitMs, waitMs + 500);
+  }
+}
+
 function formatValidIndices(elements) {
   if (!elements || elements.length === 0) return '[] (no interactive elements found)';
   const formatted = elements.map(el => {
@@ -117,11 +143,12 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           return { success: false, error: 'NAVIGATE requires a non-empty url' };
         }
         validateUrl(url);
-        await page.goto(url, {
+        const gotoResponse = await page.goto(url, {
           waitUntil: 'domcontentloaded',
           timeout: 30000
         });
-        await page.waitForTimeout(1000);
+        await maybeBackoff(gotoResponse);
+        await humanPause(700, 1400);
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -212,7 +239,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         try {
           await page.waitForLoadState('domcontentloaded', { timeout: 3000 });
         } catch { /* if no navigation occurred */ }
-        await page.waitForTimeout(500);
+        await humanPause(300, 800);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -303,7 +330,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           }
         }
 
-        await page.waitForTimeout(300);
+        await humanPause(200, 600);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -373,7 +400,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         try {
           await page.waitForLoadState('domcontentloaded', { timeout: 3000 });
         } catch { /* ignore */ }
-        await page.waitForTimeout(500);
+        await humanPause(300, 800);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -446,7 +473,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
             await page.waitForLoadState('domcontentloaded', { timeout: 3000 });
           } catch { /* if no navigation happened */ }
         }
-        await page.waitForTimeout(500);
+        await humanPause(300, 800);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -495,7 +522,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         const amount = Math.min(Number(args.amount) || 500, 3000);
         const delta = direction === 'up' ? -amount : amount;
         await page.evaluate((dy) => window.scrollBy(0, dy), delta);
-        await page.waitForTimeout(300);
+        await humanPause(200, 600);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -505,7 +532,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
 
       case 'WAIT': {
         const ms = Math.min(Number(args.milliseconds) || 1000, 5000);
-        await page.waitForTimeout(ms);
+        await humanPause(ms, ms + 100);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
@@ -515,7 +542,7 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
 
       case 'GO_BACK': {
         await page.goBack({ timeout: 10000 });
-        await page.waitForTimeout(500);
+        await humanPause(300, 800);
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
         logData.success = true;
         logData.result_obs_id = observation.observation_id;
