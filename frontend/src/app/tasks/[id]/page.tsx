@@ -433,6 +433,32 @@ export default function TaskDetailPage() {
         </div>
       )}
 
+      {/* Failure reason when no result card */}
+      {!result && task?.status === 'FAILED' && task.failureReason && (
+        <div className="glass-panel rounded-2xl p-6 space-y-3 border border-rose-800/30">
+          <div className="flex items-center space-x-2">
+            <XCircle className="w-5 h-5 text-rose-400" />
+            <h3 className="text-sm font-bold text-rose-300">Task Failed</h3>
+          </div>
+          <p className="text-xs text-slate-300 font-mono bg-slate-950/60 p-4 rounded-xl border border-slate-800/80 leading-relaxed">
+            {task.failureReason}
+          </p>
+        </div>
+      )}
+
+      {/* Cancelled notice */}
+      {task?.status === 'CANCELLED' && !result && (
+        <div className="glass-panel rounded-2xl p-6 space-y-3 border border-slate-700/30">
+          <div className="flex items-center space-x-2">
+            <Ban className="w-5 h-5 text-slate-400" />
+            <h3 className="text-sm font-bold text-slate-300">Task Cancelled</h3>
+          </div>
+          <p className="text-xs text-slate-400">
+            This task was cancelled before completion. Any evidence collected up to that point is shown below.
+          </p>
+        </div>
+      )}
+
       {/* Captured Evidence Section */}
       {artifacts.length > 0 && (
         <div className="glass-panel rounded-2xl p-6 space-y-4">
