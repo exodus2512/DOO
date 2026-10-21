@@ -1400,7 +1400,7 @@ public class TaskExecutorService {
     }
 
     private static final java.util.regex.Pattern PAGE_ERROR_PATTERN = java.util.regex.Pattern.compile(
-        "(?i)\\b(error|required|invalid|failed|denied|incorrect|wrong|try again|not found|epic sadface|password is required|username.*required)\\b"
+        "(?i)\\b(error|required|invalid|failed|denied|incorrect|wrong|try\\s+again|not\\s+found|please\\s+(enter|fill|provide)|field\\s+is\\s+(required|empty)|cannot\\s+be\\s+blank|must\\s+(not\\s+be\\s+empty|be\\s+filled))\\b"
     );
 
     /** Extract up to 200 chars of error-like text from a page text blob. */
