@@ -222,12 +222,17 @@ public class GeminiAiProvider implements AiProvider {
             - DONE: {"reason": "why we're done"}
 
             WORKFLOW PATTERNS — follow these sequences:
-            - To search: FILL the search box → PRESS_KEY Enter → wait for results → EXTRACT_TEXT
+            - To search: FILL the search box → PRESS_KEY Enter → EXTRACT_TEXT on results
             - To read a page: NAVIGATE → EXTRACT_TEXT (extract first, scroll only if needed)
             - To submit a form: FILL fields → CLICK submit button
 
+            EXAMPLE (search on Google):
+              Step 1: FILL {"selector": "textarea[name='q']", "value": "trending python repos"}
+              Step 2: PRESS_KEY {"key": "Enter"}    ← typing alone does nothing; you must submit
+              Step 3: EXTRACT_TEXT {"selector": "body", "label": "search results"}
+
             RULES:
-            - After FILL on a search box, ALWAYS use PRESS_KEY Enter to submit the search.
+            - FILL only puts text in a field. It does NOT submit. After FILL, you MUST either PRESS_KEY Enter or CLICK the submit/search button.
             - Use EXTRACT_TEXT as soon as useful content is visible. Do not scroll first.
             - You MUST use EXTRACT_TEXT at least once before using DONE. The task needs explicit evidence.
             - Do NOT repeat the same action more than twice in a row.
@@ -657,9 +662,26 @@ public class GeminiAiProvider implements AiProvider {
 
     private ActionDecision deterministic_selectAction(ActionSelectionRequest request) {
         if (request.currentUrl() == null || request.currentUrl().isBlank()) {
+            String url = "UI_INTERACTION".equals(request.workflowType())
+                ? "http://localhost:8081" : "https://en.wikipedia.org/wiki/Main_Page";
             return new ActionDecision("NAVIGATE",
-                Map.of("url", "https://en.wikipedia.org/wiki/Main_Page"),
+                Map.of("url", url),
                 "Starting navigation (demo mode)", false, "");
+        }
+        if ("UI_INTERACTION".equals(request.workflowType())) {
+            if (request.currentStep() == 1) {
+                return new ActionDecision("FILL",
+                    Map.of("selector", "#full-name", "value", "Demo User", "description", "Full Name"),
+                    "Filling form field (demo mode)", false, "");
+            }
+            if (request.currentStep() >= 2) {
+                return new ActionDecision("DONE",
+                    Map.of("reason", "Demo mode: form interaction simulated"),
+                    "Demo mode complete", false, "");
+            }
+            return new ActionDecision("SCREENSHOT",
+                Map.of("label", "Current state observation"),
+                "Capturing current state (demo mode)", false, "");
         }
         if (request.currentStep() >= 2) {
             return new ActionDecision("DONE",
