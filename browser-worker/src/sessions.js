@@ -130,10 +130,14 @@ class SessionManager {
         ...contextOptions,
       });
     } else {
-      // Fallback: load storageState JSON if available, or start fresh
+      // Fallback path (storage mode, or persistent without a domain)
       const storageState = domain ? await this.loadStorageState(domain) : null;
       if (storageState) contextOptions.storageState = storageState;
-      const browser = await this.ensureBrowser();
+      // ensureBrowser() returns null in persistent mode — launch a plain browser for the fallback
+      let browser = await this.ensureBrowser();
+      if (!browser) {
+        browser = await chromium.launch({ headless: !IS_HEADED, args: this._launchArgs() });
+      }
       context = await browser.newContext(contextOptions);
     }
 

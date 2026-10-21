@@ -46,14 +46,10 @@ app.post('/session/init', async (req, res) => {
   if (!taskId) return res.status(400).json({ error: 'taskId is required' });
 
   try {
-    // Load saved storage state if a domain is provided (enables session reuse)
-    let storageState = null;
-    if (domain) {
-      storageState = await sessionManager.loadStorageState(domain);
-      if (storageState) console.log(`[/session/init] Using saved session for domain: ${domain}`);
-    }
-    const sessionId = await sessionManager.initSession(taskId, storageState);
-    console.log(`[/session/init] Session ${sessionId} created for task ${taskId}`);
+    // Pass the domain string; initSession loads storageState / profile internally.
+    const sessionId = await sessionManager.initSession(taskId, domain || null);
+    console.log(`[/session/init] Session ${sessionId} created for task ${taskId}` +
+      (domain ? ` (domain=${domain})` : ''));
     res.json({ success: true, sessionId });
   } catch (error) {
     console.error(`[/session/init] Error for task ${taskId}:`, error.message);
