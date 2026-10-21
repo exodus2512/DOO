@@ -77,8 +77,22 @@ public interface AiProvider {
         java.util.Map<String, Object> args,
         String rationale,
         boolean requiresApproval,
-        String approvalReason
-    ) {}
+        String approvalReason,
+        // Extended reasoning schema fields
+        String observation,     // 1-2 sentences about the current state
+        String pageState,       // LOGIN|CAPTCHA|OTP|BOT_BLOCK|FORM|CONTENT|ERROR|OTHER
+        String goalProgress,    // "done" or remaining goal
+        List<String> blockers,  // blocking issues
+        String why,             // single sentence tying action to observation
+        String expected         // what should be true after this action
+    ) {
+        // Backward-compat constructor
+        public ActionDecision(String actionType, java.util.Map<String, Object> args,
+                String rationale, boolean requiresApproval, String approvalReason) {
+            this(actionType, args, rationale, requiresApproval, approvalReason,
+                 null, "OTHER", null, List.of(), null, null);
+        }
+    }
 
     record ActionSelectionRequest(
         String userRequest,

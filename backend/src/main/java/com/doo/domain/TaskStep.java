@@ -50,6 +50,19 @@ public class TaskStep {
     @Column(name = "completed_at")
     private Instant completedAt;
 
+    // Reasoning schema fields from the AI response
+    @Column(name = "observation_text", columnDefinition = "TEXT")
+    private String observationText;
+
+    @Column(name = "page_state", length = 32)
+    private String pageState;
+
+    @Column(name = "why_text", columnDefinition = "TEXT")
+    private String whyText;
+
+    @Column(name = "expected_text", columnDefinition = "TEXT")
+    private String expectedText;
+
     @PrePersist
     protected void onCreate() {
         if (createdAt == null) createdAt = Instant.now();

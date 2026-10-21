@@ -255,7 +255,7 @@ public class GeminiAiProvider implements AiProvider {
             String pageText = request.pageText() != null ? request.pageText() : "";
             String errorLines = java.util.Arrays.stream(pageText.split("\n"))
                 .filter(line -> line.toLowerCase().matches(".*\\b(error|required|invalid|failed|denied|incorrect|wrong|try again|not found|epic sadface)\\b.*"))
-                .limit(5)
+                .limit(8)
                 .map(String::trim)
                 .filter(l -> !l.isBlank())
                 .collect(java.util.stream.Collectors.joining("\n"));
@@ -300,12 +300,20 @@ public class GeminiAiProvider implements AiProvider {
 
             Select ONE action. Respond in JSON format ONLY:
             {
-              "actionType": "NAVIGATE|CLICK|FILL|PRESS_KEY|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE|ASK_USER",
-              "args": { ... action-specific args ... },
-              "rationale": "why this action",
+              "observation": "1-2 sentences citing visible page state and element indices",
+              "page_state": "LOGIN|CAPTCHA|OTP|BOT_BLOCK|FORM|CONTENT|ERROR|OTHER",
+              "goal_progress": "what is done / what remains",
+              "blockers": ["list any issues preventing progress, or empty array"],
+              "action": {
+                "type": "NAVIGATE|CLICK|FILL|PRESS_KEY|EXTRACT_TEXT|SCREENSHOT|SCROLL|WAIT|DONE|ASK_USER",
+                "args": { ... action-specific args ... }
+              },
+              "why": "one sentence tying this action to the observation",
+              "expected": "what should be true on the next observation",
               "requiresApproval": false,
               "approvalReason": ""
             }
+            Note: old flat fields actionType/args are also accepted as aliases for compatibility.
 
             Action args by type:
             - NAVIGATE: {"url": "https://..."}
@@ -378,7 +386,7 @@ public class GeminiAiProvider implements AiProvider {
                 request.pageTitle(),
                 pageStateBlock,
                 scrollBlock + (extractionProgress.isEmpty() ? "" : "\n            " + extractionProgress),
-                String.join(", ", request.recentActions().stream().limit(5).toList()),
+                String.join(", ", request.recentActions().stream().limit(8).toList()),
                 obsIdLine,
                 credBlock
             );
@@ -391,16 +399,41 @@ public class GeminiAiProvider implements AiProvider {
             try {
                 String response = callGemini(prompt, taskLabel);
                 JsonNode json = objectMapper.readTree(extractJson(response));
-                String actionType = json.path("actionType").asText("SCREENSHOT");
-                Map<String, Object> args = objectMapper.convertValue(
-                    json.path("args"), new TypeReference<Map<String, Object>>() {});
-                log.info("[STEP 3/5] SELECT_ACTION — chose: {}", actionType);
-                return new ActionDecision(
+                // Support new nested schema { action: { type, args } } and old flat { actionType, args }
+                String actionType;
+                Map<String, Object> args;
+                if (json.has("action") && json.path("action").has("type")) {
+                    actionType = json.path("action").path("type").asText("SCREENSHOT");
+                    args = objectMapper.convertValue(
+                        json.path("action").path("args"), new TypeReference<Map<String, Object>>() {});
+                } else {
+                    actionType = json.path("actionType").asText("SCREENSHOT");
+                    args = objectMapper.convertValue(
+                        json.path("args"), new TypeReference<Map<String, Object>>() {});
+                }
+                String observation  = json.path("observation").asText(null);
+                String pageState    = json.path("page_state").asText("OTHER");
+                String goalProgress = json.path("goal_progress").asText(null);
+                java.util.List<String> blockers = new java.util.ArrayList<>();
+                JsonNode blockersNode = json.path("blockers");
+                if (blockersNode.isArray()) blockersNode.forEach(b -> blockers.add(b.asText()));
+                String why          = json.path("why").asText(null);
+                String expected     = json.path("expected").asText(null);
+                // rationale: prefer top-level, fall back to why
+                String rationale = json.path("rationale").asText(why != null ? why : "");
+                log.info("[STEP 3/5] SELECT_ACTION — chose: {} page_state={}", actionType, pageState);
+                return new AiProvider.ActionDecision(
                     actionType,
                     args != null ? args : Map.of(),
-                    json.path("rationale").asText(""),
+                    rationale,
                     json.path("requiresApproval").asBoolean(false),
-                    json.path("approvalReason").asText("")
+                    json.path("approvalReason").asText(""),
+                    observation,
+                    pageState.isBlank() ? "OTHER" : pageState,
+                    goalProgress,
+                    blockers,
+                    why,
+                    expected
                 );
             } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
                 log.warn("[STEP 3/5] SELECT_ACTION — malformed JSON from model, retrying ({}/2)", jsonRetry + 1);

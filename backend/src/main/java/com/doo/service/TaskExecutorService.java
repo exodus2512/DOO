@@ -476,6 +476,23 @@ public class TaskExecutorService {
                 aiCallCount++;
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — chose: " + decision.actionType(), Map.of("phase", "SELECT_ACTION", "action", decision.actionType())));
 
+                // ── page_state routing ──────────────────────────────────────────
+                if (decision.pageState() != null) {
+                    String ps = decision.pageState().toUpperCase();
+                    log.debug("Task {} step {} | page_state={} why={}", taskId, step, ps,
+                        decision.why() != null ? decision.why() : "");
+                    if ("LOGIN".equals(ps)) {
+                        // Auth gate runs at loop-top; skip this action and let it fire
+                        recentActions.add("PAGE_STATE=LOGIN: deferring to auth gate");
+                        continue;
+                    }
+                    if ("BOT_BLOCK".equals(ps)) {
+                        log.warn("Task {} step {} | model reports BOT_BLOCK at {}", taskId, step, currentUrl);
+                        failTask(task, "BOT_BLOCK: model detected access denial at " + truncate(currentUrl, 80));
+                        return;
+                    }
+                }
+
                 // Normalize NAVIGATE URL: add https:// if scheme is missing
                 if ("NAVIGATE".equals(decision.actionType())) {
                     String rawUrl = decision.args() != null ? (String) decision.args().get("url") : null;
@@ -724,6 +741,11 @@ public class TaskExecutorService {
                     .actionArgs(enrichedArgs)
                     .status("RUNNING")
                     .build();
+                // Persist reasoning schema fields from AI response
+                if (decision.observation() != null) taskStep.setObservationText(decision.observation());
+                if (decision.pageState() != null) taskStep.setPageState(decision.pageState());
+                if (decision.why() != null) taskStep.setWhyText(decision.why());
+                if (decision.expected() != null) taskStep.setExpectedText(decision.expected());
                 taskStepRepository.save(taskStep);
 
                 publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
@@ -884,8 +906,56 @@ public class TaskExecutorService {
                         + (result.success() ? " [OK]" : " [FAIL]"));
                 }
 
+                // Handle bot_block BEFORE CAPTCHA — different options, never loops
+                boolean hasBotBlock = result.challenges() != null && result.challenges().stream()
+                    .anyMatch(c -> "bot_block".equals(c.getOrDefault("type", "")));
+                if (hasBotBlock) {
+                    log.warn("Task {} step {} | BOT_BLOCK at {}", taskId, step, truncate(currentUrl, 80));
+                    if (result.screenshot() != null) {
+                        saveEvidence(taskId, "STEP_SCREENSHOT",
+                            "Bot block at " + truncate(currentUrl, 60), result.screenshot(), currentUrl);
+                    }
+                    Map<String, Object> bbParams = new HashMap<>();
+                    bbParams.put("type", "bot_block");
+                    bbParams.put("url", currentUrl);
+                    bbParams.put("reason", "The site returned an access-denial page.");
+                    bbParams.put("options", List.of(
+                        "open_live_view: Open the live browser view",
+                        "skip: Skip this source and try another",
+                        "stop: Stop the task"));
+                    String bbReason = "Bot block detected at " + truncate(currentUrl, 60);
+                    ApprovalRequest bbApproval = findOrCreateApproval(taskId, "BOT_BLOCK", bbReason, bbParams);
+                    PauseResult bbPause = pauseForUser(task, sessionId, bbApproval.getId(),
+                        bbReason, "BOT_BLOCK", step, bbParams);
+                    if (!bbPause.resumed) { failTask(task, bbPause.failureReason()); return; }
+                    if (bbPause.observationId != null) {
+                        lastObservationId = bbPause.observationId;
+                        lastInteractiveElements = bbPause.interactiveElements;
+                    }
+                    if (bbPause.currentUrl != null) currentUrl = bbPause.currentUrl;
+                    if (bbPause.pageTitle != null) pageTitle = bbPause.pageTitle;
+                    if (bbPause.pageText != null) {
+                        pageText = bbPause.pageText;
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                        observationEpoch++;
+                    }
+                    ApprovalRequest bbResolved = approvalRepository.findById(bbApproval.getId()).orElse(null);
+                    String bbChoice = bbResolved != null && bbResolved.getUserResponse() != null
+                        ? bbResolved.getUserResponse().toLowerCase() : "stop";
+                    if (bbChoice.contains("stop")) {
+                        failTask(task, "BOT_BLOCK: user chose to stop at " + truncate(currentUrl, 60));
+                        return;
+                    }
+                    recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
+                    continue;
+                }
+
                 // Handle CAPTCHA/2FA challenges: pause for user, DO NOT attempt to solve
-                if (result.challenges() != null && !result.challenges().isEmpty()) {
+                List<Map<String, Object>> captchaChallenges = result.challenges() == null ? List.of()
+                    : result.challenges().stream()
+                        .filter(c -> !"bot_block".equals(c.getOrDefault("type", "")))
+                        .collect(Collectors.toList());
+                if (!captchaChallenges.isEmpty()) {
                     ChallengeHandleResult challengeResult = handleChallenges(task, sessionId, step, result);
                     if (!challengeResult.resumed) {
                         failTask(task, challengeResult.failureReason);
@@ -904,7 +974,7 @@ public class TaskExecutorService {
                         observationEpoch++;
                     }
                     recentActions.add("CHALLENGE_RESOLVED: user completed " +
-                        result.challenges().get(0).getOrDefault("type", "unknown") + " challenge");
+                        captchaChallenges.get(0).getOrDefault("type", "unknown") + " challenge");
                 }
 
                 // Handle RESOLVE_FAILED: element resolution failed; retry with fresh observation containing valid indices
