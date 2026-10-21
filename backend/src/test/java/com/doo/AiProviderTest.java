@@ -205,12 +205,14 @@ class AiProviderTest {
     class SynthesisTests {
 
         @Test
-        @DisplayName("demo mode synthesis mentions demo mode")
+        @DisplayName("demo mode synthesis produces structured summary with sources")
         void demoSynthesis() {
             String result = demoProvider.synthesizeResult(
-                new SynthesisRequest("test", "WEB_RESEARCH",
-                    List.of("https://example.com"), List.of("snippet"), List.of("action")));
-            assertThat(result).containsIgnoringCase("demo mode");
+                new SynthesisRequest("test research", "WEB_RESEARCH",
+                    List.of("https://example.com"), List.of("some findings here"), List.of("action")));
+            assertThat(result).contains("Task Summary");
+            assertThat(result).contains("https://example.com");
+            assertThat(result).contains("some findings here");
         }
     }
 
@@ -248,6 +250,43 @@ class AiProviderTest {
             AiProvider provider = new GeminiAiProvider("real-api-key", "model", true, objectMapper);
             WorkflowClassification result = provider.classifyWorkflow("research topic");
             assertThat(result.workflowType()).isEqualTo("WEB_RESEARCH");
+        }
+    }
+
+    @Nested
+    @DisplayName("Live Mode Failure Behavior")
+    class LiveModeFailureTests {
+
+        @Test
+        @DisplayName("live mode classify throws on provider failure instead of silent fallback")
+        void liveClassifyThrowsOnFailure() {
+            // Create a provider with a real API key but no network — it must throw, not fall back
+            AiProvider liveProvider = new GeminiAiProvider("fake-key-for-test", "gemini-3.5-flash", false, objectMapper);
+            assertThatThrownBy(() -> liveProvider.classifyWorkflow("test query"))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("AI provider error");
+        }
+
+        @Test
+        @DisplayName("live mode selectNextAction throws on provider failure")
+        void liveActionThrowsOnFailure() {
+            AiProvider liveProvider = new GeminiAiProvider("fake-key-for-test", "gemini-3.5-flash", false, objectMapper);
+            assertThatThrownBy(() -> liveProvider.selectNextAction(
+                new ActionSelectionRequest("test", "", 0, List.of(), "", "", "", "",
+                    List.of(), List.of(), "WEB_RESEARCH")))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("AI provider error");
+        }
+
+        @Test
+        @DisplayName("live mode verify throws on provider failure")
+        void liveVerifyThrowsOnFailure() {
+            AiProvider liveProvider = new GeminiAiProvider("fake-key-for-test", "gemini-3.5-flash", false, objectMapper);
+            assertThatThrownBy(() -> liveProvider.verify(
+                new VerificationRequest("test", "criteria", "WEB_RESEARCH",
+                    "https://example.com", "content", List.of(), "summary")))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("AI provider error");
         }
     }
 

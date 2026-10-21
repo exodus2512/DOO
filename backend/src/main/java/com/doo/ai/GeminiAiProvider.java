@@ -51,13 +51,14 @@ public class GeminiAiProvider implements AiProvider {
     @Override
     public WorkflowClassification classifyWorkflow(String userRequest) {
         if (!isAvailable()) {
+            log.info("[DEMO MODE] Using deterministic workflow classification");
             return deterministic_classifyWorkflow(userRequest);
         }
         String prompt = """
             You are DOO, an AI agent. Classify this user request into exactly one workflow type.
-            
+
             User request: "%s"
-            
+
             Respond in JSON format ONLY (no markdown, no explanation outside JSON):
             {
               "workflowType": "WEB_RESEARCH|PRODUCT_COMPARISON|UI_INTERACTION|UNKNOWN",
@@ -75,23 +76,24 @@ public class GeminiAiProvider implements AiProvider {
                 json.path("successCriteria").asText("")
             );
         } catch (Exception e) {
-            log.warn("Failed to classify workflow via Gemini: {}", e.getMessage());
-            return deterministic_classifyWorkflow(userRequest);
+            log.error("Live AI provider failed to classify workflow: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during classification: " + e.getMessage(), e);
         }
     }
 
     @Override
     public TaskPlan generatePlan(String userRequest, String successCriteria, WorkflowContext context) {
         if (!isAvailable()) {
+            log.info("[DEMO MODE] Using deterministic plan generation");
             return deterministic_generatePlan(userRequest, context.workflowType());
         }
         String prompt = """
             You are DOO, an AI browser agent. Create a step-by-step execution plan.
-            
+
             User request: "%s"
             Workflow type: %s
             Success criteria: %s
-            
+
             Rules:
             - Each step should be a concrete browser action or observation
             - Maximum 15 steps
@@ -99,7 +101,7 @@ public class GeminiAiProvider implements AiProvider {
             - For PRODUCT_COMPARISON: visit each product URL, extract specs/price, compare
             - For UI_INTERACTION: navigate to test form, fill fields, submit, verify
             - Do NOT include steps that require login or payment
-            
+
             Respond in JSON format ONLY:
             {
               "steps": ["step 1 description", "step 2 description", ...],
@@ -114,8 +116,8 @@ public class GeminiAiProvider implements AiProvider {
             json.path("steps").forEach(n -> steps.add(n.asText()));
             return new TaskPlan(steps, json.path("successCriteria").asText(successCriteria));
         } catch (Exception e) {
-            log.warn("Failed to generate plan via Gemini: {}", e.getMessage());
-            return deterministic_generatePlan(userRequest, context.workflowType());
+            log.error("Live AI provider failed to generate plan: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during planning: " + e.getMessage(), e);
         }
     }
 
@@ -182,8 +184,8 @@ public class GeminiAiProvider implements AiProvider {
                 json.path("approvalReason").asText("")
             );
         } catch (Exception e) {
-            log.warn("Failed to select next action via Gemini: {}", e.getMessage());
-            return deterministic_selectAction(request);
+            log.error("Live AI provider failed to select action: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during action selection: " + e.getMessage(), e);
         }
     }
 
@@ -241,25 +243,25 @@ public class GeminiAiProvider implements AiProvider {
                 json.path("confidence").asDouble(0.5)
             );
         } catch (Exception e) {
-            log.warn("Failed to parse verification: {}", e.getMessage());
-            return new VerificationResult(false, "Verification could not be completed: " + e.getMessage(), 0.0);
+            log.error("Live AI provider failed to verify: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during verification: " + e.getMessage(), e);
         }
     }
 
     @Override
     public String synthesizeResult(SynthesisRequest request) {
         if (!isAvailable()) {
-            return "Demo mode: This is a simulated result. No AI provider is configured. " +
-                   "Visited URLs: " + String.join(", ", request.visitedUrls());
+            log.info("[DEMO MODE] Using deterministic result synthesis");
+            return deterministic_synthesizeResult(request);
         }
         String prompt = """
             You are DOO. Synthesize a clear, structured answer based on the evidence collected.
-            
+
             User request: "%s"
             Workflow: %s
             Visited URLs: %s
             Evidence collected: %s
-            
+
             Write a clear, well-structured answer. For research tasks, use markdown with sections.
             Include source references. Be honest about gaps in information.
             Do NOT invent facts not present in the evidence.
@@ -273,8 +275,8 @@ public class GeminiAiProvider implements AiProvider {
         try {
             return callGemini(prompt);
         } catch (Exception e) {
-            log.warn("Failed to synthesize result via Gemini: {}", e.getMessage());
-            return deterministic_synthesizeResult(request);
+            log.error("Live AI provider failed to synthesize result: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during synthesis: " + e.getMessage(), e);
         }
     }
 
