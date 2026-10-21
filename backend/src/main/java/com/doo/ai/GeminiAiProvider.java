@@ -267,21 +267,30 @@ public class GeminiAiProvider implements AiProvider {
             Always include observation_id in args when using element_index.
 
             WORKFLOW PATTERNS:
-            - To search: FILL search box (by element_index) → PRESS_KEY Enter → EXTRACT_TEXT on results
-            - To read a page: NAVIGATE → EXTRACT_TEXT
-            - To submit a form: FILL each field (by element_index) → CLICK submit (by element_index)
+            - Single-field search (e.g. search box or lone input): FILL search box (by element_index) → PRESS_KEY Enter → EXTRACT_TEXT on results
+            - Multi-field form (e.g. login, registration, contact): FILL each required field in order (by element_index), and only AFTER all fields are filled, CLICK the submit/login button (or PRESS_KEY Enter on the final field/submit button).
+            - Reading a page: NAVIGATE → EXTRACT_TEXT
 
-            EXAMPLE (search on Google, assuming [2] is the search textarea):
+            EXAMPLE 1 (search box):
               Step 1: FILL {"element_index": 2, "observation_id": "obs_abc123", "value": "trending python repos", "description": "search box"}
               Step 2: PRESS_KEY {"key": "Enter"}
               Step 3: EXTRACT_TEXT {"selector": "body", "label": "search results"}
 
+            EXAMPLE 2 (login form with username [3], password [4], submit button [5]):
+              Step 1: FILL {"element_index": 3, "observation_id": "obs_1", "value": "standard_user", "description": "username"}
+              Step 2: FILL {"element_index": 4, "observation_id": "obs_2", "value": "secret_sauce", "description": "password"}
+              Step 3: CLICK {"element_index": 5, "observation_id": "obs_3", "description": "login button"}
+
             RULES:
-            - FILL only puts text in a field. It does NOT submit. After FILL, MUST use PRESS_KEY Enter or CLICK submit.
+            - FILL only puts text into a single field. It does NOT submit the form.
+            - On forms with multiple inputs (e.g. username and password), DO NOT press Enter after filling just one field. FILL all required fields before submitting.
+            - For single-field search inputs (type=search or a lone input on the page), follow FILL with PRESS_KEY Enter.
+            - If a previous action returned RESOLVE_FAILED, look at the fresh Interactive elements list and pick from the current valid indices.
+            - When logging into a site with credentials provided in the request, FILL the username and password fields, then CLICK the login/submit button.
             - Use EXTRACT_TEXT as soon as useful content is visible.
             - You MUST use EXTRACT_TEXT at least once before DONE.
             - Never navigate to file:// URLs or private IPs.
-            - Never fill password fields or click purchase/buy/subscribe buttons.
+            - Never click purchase/buy/subscribe buttons without explicit confirmation.
             """.formatted(
                 request.userRequest(),
                 request.currentStep(),

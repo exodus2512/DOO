@@ -82,11 +82,12 @@ async function buildObservation(page, taskId, options = {}) {
             window.getComputedStyle(el).display !== 'none';
 
           if (!isVisible) continue;
-
+          const isButtonInput = ['button', 'submit', 'reset'].includes(el.type);
           const role = el.getAttribute('role') ||
             (el.tagName === 'A' ? 'link' :
              el.tagName === 'BUTTON' ? 'button' :
-             el.tagName === 'INPUT' ? (el.type === 'checkbox' ? 'checkbox' :
+             el.tagName === 'INPUT' ? (isButtonInput ? 'button' :
+               el.type === 'checkbox' ? 'checkbox' :
                el.type === 'radio' ? 'radio' : 'textbox') :
              el.tagName === 'SELECT' ? 'combobox' :
              el.tagName === 'TEXTAREA' ? 'textbox' :
@@ -98,6 +99,7 @@ async function buildObservation(page, taskId, options = {}) {
             el.getAttribute('title') ||
             el.getAttribute('alt') ||
             el.getAttribute('placeholder') ||
+            (isButtonInput ? el.value : '') ||
             '';
 
           const isPassword = el.type === 'password';
@@ -126,6 +128,7 @@ async function buildObservation(page, taskId, options = {}) {
             id: el.id || null,
             name: el.name || null,
             className: el.className?.toString()?.substring(0, 200) || null,
+            placeholder: el.getAttribute('placeholder') || null,
           });
 
           if (results.length >= maxElements) break;
@@ -160,6 +163,7 @@ async function buildObservation(page, taskId, options = {}) {
         label: el.label,
         text: el.text,
         role: el.role,
+        placeholder: el.placeholder,
       };
       return mapped;
     });
@@ -262,6 +266,16 @@ async function resolveElement(page, observation, elementIndex) {
     if (await byName.count() > 0 && await byName.first().isVisible()) {
       return byName.first();
     }
+  }
+
+  // Strategy: By placeholder
+  if (locator.placeholder || el.placeholder) {
+    try {
+      const byPlaceholder = page.getByPlaceholder(locator.placeholder || el.placeholder, { exact: false });
+      if (await byPlaceholder.count() > 0 && await byPlaceholder.first().isVisible()) {
+        return byPlaceholder.first();
+      }
+    } catch { /* continue */ }
   }
 
   // Strategy 5: By bounding box click (fallback)

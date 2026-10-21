@@ -62,8 +62,8 @@ class FillSubmitGuardTest {
     }
 
     @Test
-    @DisplayName("Fill without page change triggers PRESS_KEY Enter recovery")
-    void fillGuardInjectsEnter() throws Exception {
+    @DisplayName("Fill without page change does NOT auto-inject Enter (model controls actions)")
+    void fillDoesNotAutoInjectEnter() throws Exception {
         Task task = createTask("fill the test form and submit it");
 
         given(browserWorkerClient.initSession(any()))
@@ -81,92 +81,66 @@ class FillSubmitGuardTest {
                 "http://localhost:8081", "DOO Test Fixture",
                 "Step 1 — Personal Information Full Name Email", null));
 
-        // PRESS_KEY Enter succeeds and changes the page (form submitted / step advanced)
-        given(browserWorkerClient.executeAction(any(), any(), eq("PRESS_KEY"), any()))
-            .willReturn(new ActionResult(true, "Pressed Enter", null, null,
-                "http://localhost:8081", "DOO Test Fixture",
-                "Step 2 — Preferences Select Plan Primary Use Case", null));
-
         // SCREENSHOT succeeds
         given(browserWorkerClient.executeAction(any(), any(), eq("SCREENSHOT"), any()))
             .willReturn(new ActionResult(true, "Screenshot", null, "base64img",
                 "http://localhost:8081", "DOO Test Fixture",
-                "Step 2 — Preferences Select Plan Primary Use Case", null));
+                "Step 1 — Personal Information Full Name Email", null));
 
         executorService.executeTask(task.getId());
         Task result = waitForTerminal(task.getId());
 
-        // Task should complete (demo mode) — the guard prevented the fill-without-submit loop
         assertThat(result.getStatus()).isIn(TaskStatus.COMPLETED, TaskStatus.PARTIAL);
 
-        // Verify the guard injected a PRESS_KEY step
+        // Verify NO unprompted PRESS_KEY Enter step was injected
         List<TaskStep> steps = taskStepRepository.findByTaskIdOrderByStepIndexAsc(task.getId());
-        boolean hasGuardEnter = steps.stream()
-            .anyMatch(s -> "PRESS_KEY".equals(s.getActionType())
-                && s.getActionArgs() != null
-                && "fill-submit".equals(s.getActionArgs().get("_guard")));
-        assertThat(hasGuardEnter)
-            .as("Fill-guard should inject a PRESS_KEY Enter step")
-            .isTrue();
+        boolean hasInjectedGuard = steps.stream()
+            .anyMatch(s -> s.getActionArgs() != null && "fill-submit".equals(s.getActionArgs().get("_guard")));
+        assertThat(hasInjectedGuard)
+            .as("Fill-guard must NOT auto-inject Enter or click steps")
+            .isFalse();
     }
 
     @Test
-    @DisplayName("Fill guard falls back to CLICK when Enter has no effect")
-    void fillGuardFallsBackToClick() throws Exception {
+    @DisplayName("RESOLVE_FAILED error triggers distinct retry with fresh observation")
+    void resolveFailureRetriesWithValidIndices() throws Exception {
         Task task = createTask("fill the test form and submit it");
 
         given(browserWorkerClient.initSession(any()))
             .willReturn(new SessionResult(true, "sess-2", null));
 
-        // All pages return the same URL/title/text to simulate "nothing changed"
-        String unchangedText = "Step 1 — Personal Information Full Name Email Address Company";
+        String formPage = "Step 1 — Personal Information Full Name Email Address Company";
 
         given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
             .willReturn(new ActionResult(true, "Navigated", null, null,
-                "http://localhost:8081", "DOO Test Fixture", unchangedText, null));
+                "http://localhost:8081", "DOO Test Fixture", formPage, null,
+                "obs_nav", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))));
 
-        // FILL: page stays the same
+        // First FILL attempt returns RESOLVE_FAILED with fresh observation containing valid indices
         given(browserWorkerClient.executeAction(any(), any(), eq("FILL"), any()))
-            .willReturn(new ActionResult(true, "Filled", null, null,
-                "http://localhost:8081", "DOO Test Fixture", unchangedText, null));
-
-        // PRESS_KEY Enter: page STILL stays the same (Enter had no effect)
-        given(browserWorkerClient.executeAction(any(), any(), eq("PRESS_KEY"), any()))
-            .willReturn(new ActionResult(true, "Pressed Enter", null, null,
-                "http://localhost:8081", "DOO Test Fixture", unchangedText, null));
-
-        // CLICK on submit button: NOW the page changes
-        given(browserWorkerClient.executeAction(any(), any(), eq("CLICK"), any()))
-            .willReturn(new ActionResult(true, "Clicked submit", null, null,
-                "http://localhost:8081", "DOO Test Fixture",
-                "Registration Successful! Your submission has been recorded.", null));
+            .willReturn(new ActionResult(false, null,
+                "RESOLVE_FAILED: element_index 5 could not be resolved. Current valid indices: [[0] <input> textbox \"Full Name\"]",
+                null, "http://localhost:8081", "DOO Test Fixture", formPage, null,
+                "obs_fresh", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))))
+            .willReturn(new ActionResult(true, "Filled field", null, null,
+                "http://localhost:8081", "DOO Test Fixture", formPage, null,
+                "obs_filled", List.of(Map.of("index", 0, "role", "textbox", "label", "Full Name"))));
 
         // SCREENSHOT
         given(browserWorkerClient.executeAction(any(), any(), eq("SCREENSHOT"), any()))
             .willReturn(new ActionResult(true, "Screenshot", null, "base64img",
-                "http://localhost:8081", "DOO Test Fixture",
-                "Registration Successful! Your submission has been recorded.", null));
+                "http://localhost:8081", "DOO Test Fixture", formPage, null));
 
         executorService.executeTask(task.getId());
         Task result = waitForTerminal(task.getId());
 
         assertThat(result.getStatus()).isIn(TaskStatus.COMPLETED, TaskStatus.PARTIAL);
 
-        // Verify both guard steps were injected: PRESS_KEY then CLICK
         List<TaskStep> steps = taskStepRepository.findByTaskIdOrderByStepIndexAsc(task.getId());
-        boolean hasGuardEnter = steps.stream()
-            .anyMatch(s -> "PRESS_KEY".equals(s.getActionType())
-                && s.getActionArgs() != null
-                && "fill-submit".equals(s.getActionArgs().get("_guard")));
-        boolean hasGuardClick = steps.stream()
-            .anyMatch(s -> "CLICK".equals(s.getActionType())
-                && s.getActionArgs() != null
-                && "fill-submit".equals(s.getActionArgs().get("_guard")));
-        assertThat(hasGuardEnter)
-            .as("Fill-guard should inject PRESS_KEY Enter")
-            .isTrue();
-        assertThat(hasGuardClick)
-            .as("Fill-guard should fall back to CLICK submit")
+        boolean hasResolveFailedStep = steps.stream()
+            .anyMatch(s -> s.getError() != null && s.getError().contains("RESOLVE_FAILED"));
+        assertThat(hasResolveFailedStep)
+            .as("Task steps should record RESOLVE_FAILED distinctly")
             .isTrue();
     }
 

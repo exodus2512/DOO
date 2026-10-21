@@ -200,6 +200,8 @@ public class TaskExecutorService {
             List<Map<String, Object>> lastInteractiveElements = null;
             int staleRetries = 0;
             final int MAX_STALE_RETRIES = 2;
+            int resolverRetries = 0;
+            final int MAX_RESOLVER_RETRIES = 2;
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
 
@@ -395,7 +397,19 @@ public class TaskExecutorService {
                         lastObservationId = result.observationId();
                         lastInteractiveElements = result.interactiveElements();
                     }
+                    if (result.currentUrl() != null && !result.currentUrl().isBlank()) {
+                        currentUrl = result.currentUrl();
+                    }
+                    if (result.pageTitle() != null) pageTitle = result.pageTitle();
+                    if (result.pageText() != null && !result.pageText().isBlank()) {
+                        pageText = result.pageText();
+                        accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
+                    }
+                    lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
                     if (staleRetries <= MAX_STALE_RETRIES) {
+                        if (!recentActionFingerprints.isEmpty()) {
+                            recentActionFingerprints.remove(recentActionFingerprints.size() - 1);
+                        }
                         step--; // retry this slot with fresh observation
                         continue;
                     }
@@ -404,63 +418,56 @@ public class TaskExecutorService {
                 }
                 staleRetries = 0; // reset on non-stale result
 
+                // Handle RESOLVE_FAILED: element resolution failed; retry with fresh observation containing valid indices
+                if (!result.success() && result.error() != null && result.error().contains("RESOLVE_FAILED")) {
+                    resolverRetries++;
+                    log.warn("Task {} step {}: [RESOLVE_FAILED] {} (retry {}/{})",
+                        taskId, step, result.error(), resolverRetries, MAX_RESOLVER_RETRIES);
+                    publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                        "[RESOLVE_FAILED] " + result.error(), step, Map.of("error", result.error())));
+
+                    if (result.observationId() != null) {
+                        lastObservationId = result.observationId();
+                        lastInteractiveElements = result.interactiveElements();
+                    }
+                    if (result.currentUrl() != null && !result.currentUrl().isBlank()) {
+                        currentUrl = result.currentUrl();
+                    }
+                    if (result.pageTitle() != null) pageTitle = result.pageTitle();
+                    if (result.pageText() != null && !result.pageText().isBlank()) {
+                        pageText = result.pageText();
+                        accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
+                    }
+                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                    if (!newObsHash.equals(lastObservationHash)) {
+                        observationEpoch++;
+                        lastObservationHash = newObsHash;
+                    }
+
+                    Object targetIdx = decision.args() != null ? decision.args().get("element_index") : null;
+                    recentActions.add("RESOLVE_FAILED: " + decision.actionType()
+                        + (targetIdx != null ? " at index " + targetIdx : "") + " failed — " + result.error());
+
+                    if (resolverRetries <= MAX_RESOLVER_RETRIES) {
+                        if (!recentActionFingerprints.isEmpty()) {
+                            recentActionFingerprints.remove(recentActionFingerprints.size() - 1);
+                        }
+                        consecutiveFailures = 0;
+                        step--; // retry this step slot with fresh observation containing valid indices
+                        continue;
+                    }
+                    resolverRetries = 0;
+                }
+
                 if (result.success()) {
                     consecutiveFailures = 0;
+                    resolverRetries = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
 
                     // Update structured observation state
                     if (result.observationId() != null) {
                         lastObservationId = result.observationId();
                         lastInteractiveElements = result.interactiveElements();
-                    }
-
-                    // ── Fill-then-submit guard ──────────────────────────────
-                    // After a FILL that didn't change the page (no navigation, no DOM shift),
-                    // the field was filled but the form was NOT submitted. Deterministically
-                    // try PRESS_KEY Enter, then fall back to CLICK on a submit button.
-                    if ("FILL".equals(decision.actionType())) {
-                        String postFillHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
-                        boolean pageChanged = !postFillHash.equals(lastObservationHash);
-                        boolean urlChanged = result.currentUrl() != null && !result.currentUrl().equals(currentUrl);
-                        if (!pageChanged && !urlChanged) {
-                            log.info("Task {} fill-guard: FILL did not change page state, injecting PRESS_KEY Enter", taskId);
-                            recentActions.add("PRESS_KEY: fill-guard auto-submit (Enter)");
-                            ActionResult enterResult = browserWorkerClient.executeAction(
-                                taskId, sessionId, "PRESS_KEY", Map.of("key", "Enter"));
-                            TaskStep enterStep = TaskStep.builder()
-                                .taskId(taskId).stepIndex(step).actionType("PRESS_KEY")
-                                .actionArgs(Map.of("key", "Enter", "_guard", "fill-submit"))
-                                .status(enterResult.success() ? "COMPLETED" : "FAILED")
-                                .result(enterResult.result()).error(enterResult.error())
-                                .completedAt(Instant.now()).build();
-                            taskStepRepository.save(enterStep);
-
-                            if (enterResult.success()) {
-                                String postEnterHash = computeObservationHash(
-                                    enterResult.currentUrl(), enterResult.pageTitle(), enterResult.pageText());
-                                if (!postEnterHash.equals(postFillHash)) {
-                                    log.info("Task {} fill-guard: PRESS_KEY Enter advanced page", taskId);
-                                    result = enterResult;
-                                } else {
-                                    log.info("Task {} fill-guard: Enter had no effect, trying CLICK submit button", taskId);
-                                    recentActions.add("CLICK: fill-guard auto-submit (click)");
-                                    ActionResult clickResult = browserWorkerClient.executeAction(
-                                        taskId, sessionId, "CLICK",
-                                        Map.of("selector", "button[type='submit'], input[type='submit'], button.btn-primary, button.btn-success, button:has-text('Submit'), button:has-text('Search')",
-                                               "description", "submit button"));
-                                    TaskStep clickStep = TaskStep.builder()
-                                        .taskId(taskId).stepIndex(step).actionType("CLICK")
-                                        .actionArgs(Map.of("selector", "submit-button", "_guard", "fill-submit"))
-                                        .status(clickResult.success() ? "COMPLETED" : "FAILED")
-                                        .result(clickResult.result()).error(clickResult.error())
-                                        .completedAt(Instant.now()).build();
-                                    taskStepRepository.save(clickStep);
-                                    if (clickResult.success()) {
-                                        result = clickResult;
-                                    }
-                                }
-                            }
-                        }
                     }
 
                     // For EXTRACT_TEXT, save the action's direct result as primary evidence
@@ -501,11 +508,27 @@ public class TaskExecutorService {
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
+                    recentActions.add("FAILED: " + decision.actionType() + " failed: " + result.error());
 
                     // Capture fresh observation from failed action result if available
                     if (result.observationId() != null) {
                         lastObservationId = result.observationId();
                         lastInteractiveElements = result.interactiveElements();
+                    }
+                    if (result.currentUrl() != null && !result.currentUrl().isBlank()) {
+                        currentUrl = result.currentUrl();
+                    }
+                    if (result.pageTitle() != null) {
+                        pageTitle = result.pageTitle();
+                    }
+                    if (result.pageText() != null && !result.pageText().isBlank()) {
+                        pageText = result.pageText();
+                        accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
+                    }
+                    String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                    if (!newObsHash.equals(lastObservationHash)) {
+                        observationEpoch++;
+                        lastObservationHash = newObsHash;
                     }
 
                     if (consecutiveFailures >= maxRetries) {
@@ -517,10 +540,10 @@ public class TaskExecutorService {
                         currentUrl = state.currentUrl();
                         pageText = state.pageText() != null ? state.pageText() : "";
                         pageTitle = state.pageTitle() != null ? state.pageTitle() : "";
-                        String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
-                        if (!newObsHash.equals(lastObservationHash)) {
+                        String updatedHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        if (!updatedHash.equals(lastObservationHash)) {
                             observationEpoch++;
-                            lastObservationHash = newObsHash;
+                            lastObservationHash = updatedHash;
                         }
                     }
                 }
