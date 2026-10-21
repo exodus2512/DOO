@@ -207,6 +207,45 @@ async function buildObservation(page, taskId, options = {}) {
     }
   }
 
+  // Detect CAPTCHA widgets and OTP/2FA patterns
+  let challenges = [];
+  try {
+    challenges = await page.evaluate(() => {
+      const found = [];
+      // reCAPTCHA v2/v3
+      if (document.querySelector('iframe[src*="recaptcha"], .g-recaptcha, [data-sitekey]')) {
+        found.push({ type: 'captcha', provider: 'recaptcha' });
+      }
+      // hCaptcha
+      if (document.querySelector('iframe[src*="hcaptcha"], .h-captcha, [data-hcaptcha-sitekey]')) {
+        found.push({ type: 'captcha', provider: 'hcaptcha' });
+      }
+      // Cloudflare Turnstile
+      if (document.querySelector('iframe[src*="challenges.cloudflare"], .cf-turnstile, [data-turnstile-sitekey]')) {
+        found.push({ type: 'captcha', provider: 'turnstile' });
+      }
+      // Generic CAPTCHA patterns
+      if (!found.length) {
+        const captchaKeywords = document.querySelectorAll('[class*="captcha" i], [id*="captcha" i], [data-captcha]');
+        if (captchaKeywords.length > 0) {
+          found.push({ type: 'captcha', provider: 'unknown' });
+        }
+      }
+      // OTP / 2FA input patterns
+      const inputs = document.querySelectorAll('input');
+      for (const inp of inputs) {
+        const attrs = (inp.name + ' ' + inp.id + ' ' + inp.placeholder + ' ' + (inp.getAttribute('aria-label') || '')).toLowerCase();
+        const isOtp = /\b(otp|2fa|mfa|totp|verification.?code|one.?time|auth.?code|6.?digit)\b/.test(attrs);
+        const isShortNumeric = inp.maxLength > 0 && inp.maxLength <= 8 && (inp.inputMode === 'numeric' || inp.type === 'tel' || inp.pattern === '[0-9]*');
+        if (isOtp || (isShortNumeric && /\b(code|verify|confirm)\b/.test(attrs))) {
+          found.push({ type: 'otp', inputName: inp.name || inp.id || null });
+          break;
+        }
+      }
+      return found;
+    });
+  } catch { /* continue without challenge detection */ }
+
   return {
     schema_version: SCHEMA_VERSION,
     observation_id: observationId,
@@ -220,6 +259,7 @@ async function buildObservation(page, taskId, options = {}) {
     },
     interactive_elements: interactiveElements,
     screenshot: screenshotData,
+    challenges: challenges.length > 0 ? challenges : null,
     metadata: {
       interactive_elements_count: interactiveElements.length,
       interactive_elements_truncated: elementsTruncated,

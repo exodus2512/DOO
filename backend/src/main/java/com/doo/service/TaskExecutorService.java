@@ -445,6 +445,29 @@ public class TaskExecutorService {
                     publishEvent(TaskEvent.screenshot(taskId, label, result.screenshot()));
                 }
 
+                // Handle CAPTCHA/2FA challenges: pause for user, DO NOT attempt to solve
+                if (result.challenges() != null && !result.challenges().isEmpty()) {
+                    ChallengeHandleResult challengeResult = handleChallenges(task, sessionId, step, result);
+                    if (!challengeResult.resumed) {
+                        failTask(task, challengeResult.failureReason);
+                        return;
+                    }
+                    // Restore observation state after user solved the challenge
+                    if (challengeResult.observationId != null) {
+                        lastObservationId = challengeResult.observationId;
+                        lastInteractiveElements = challengeResult.interactiveElements;
+                    }
+                    if (challengeResult.currentUrl != null) currentUrl = challengeResult.currentUrl;
+                    if (challengeResult.pageTitle != null) pageTitle = challengeResult.pageTitle;
+                    if (challengeResult.pageText != null) {
+                        pageText = challengeResult.pageText;
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        observationEpoch++;
+                    }
+                    recentActions.add("CHALLENGE_RESOLVED: user completed " +
+                        result.challenges().get(0).getOrDefault("type", "unknown") + " challenge");
+                }
+
                 // Handle RESOLVE_FAILED: element resolution failed; retry with fresh observation containing valid indices
                 if (!result.success() && result.error() != null && result.error().contains("RESOLVE_FAILED")) {
                     resolverRetries++;
@@ -1150,6 +1173,100 @@ public class TaskExecutorService {
         } catch (Exception e) {
             log.debug("Event publish failed: {}", e.getMessage());
         }
+    }
+
+    // ─── CAPTCHA / 2FA challenge handoff ────────────────────────────────────────
+
+    record ChallengeHandleResult(
+        boolean resumed,
+        String failureReason,
+        String currentUrl,
+        String pageTitle,
+        String pageText,
+        String observationId,
+        List<Map<String, Object>> interactiveElements
+    ) {
+        static ChallengeHandleResult failed(String reason) {
+            return new ChallengeHandleResult(false, reason, null, null, null, null, null);
+        }
+    }
+
+    ChallengeHandleResult handleChallenges(Task task, String sessionId, int currentStep,
+                                           ActionResult actionResult) {
+        UUID taskId = task.getId();
+        List<Map<String, Object>> challenges = actionResult.challenges();
+        String firstType = (String) challenges.get(0).getOrDefault("type", "unknown");
+        String provider = (String) challenges.get(0).getOrDefault("provider", "");
+        String inputName = (String) challenges.get(0).getOrDefault("inputName", null);
+
+        boolean isOtp = "otp".equals(firstType);
+        String approvalType = isOtp ? "otp_request" : "captcha_request";
+        String prompt = isOtp
+            ? "2FA/OTP verification code required"
+            : "CAPTCHA detected" + (provider != null && !provider.isEmpty() ? " (" + provider + ")" : "")
+                + " — please solve it in the browser";
+
+        log.info("Task {} — challenge detected: type={} provider={}", taskId, firstType, provider);
+
+        Map<String, Object> params = new HashMap<>();
+        params.put("type", approvalType);
+        params.put("challengeType", firstType);
+        if (provider != null) params.put("provider", provider);
+        if (inputName != null) params.put("inputName", inputName);
+
+        ApprovalRequest approval = ApprovalRequest.builder()
+            .taskId(taskId)
+            .prompt(prompt)
+            .proposedAction(approvalType.toUpperCase())
+            .parameters(params)
+            .status("PENDING")
+            .build();
+        approval = approvalRepository.save(approval);
+
+        PauseResult pauseResult = pauseForUser(task, sessionId, approval.getId(),
+            prompt, approvalType.toUpperCase(), currentStep);
+
+        if (!pauseResult.resumed) {
+            return ChallengeHandleResult.failed(pauseResult.failureReason());
+        }
+
+        // For OTP: fill the code directly via the worker (bypasses the model)
+        if (isOtp) {
+            ApprovalRequest resolved = approvalRepository.findById(approval.getId()).orElse(null);
+            String otpCode = parseOtpCode(resolved);
+            if (otpCode != null && !otpCode.isBlank()) {
+                ActionResult otpResult = browserWorkerClient.fillOtp(taskId, otpCode.trim(), inputName);
+                if (!otpResult.success()) {
+                    log.warn("Task {} — OTP fill failed: {}", taskId, otpResult.error());
+                }
+                return new ChallengeHandleResult(true, null,
+                    otpResult.currentUrl(), otpResult.pageTitle(),
+                    pauseResult.pageText(), otpResult.observationId(),
+                    pauseResult.interactiveElements());
+            }
+        }
+
+        // For CAPTCHA: user solved it in the browser, just resume with unparked state
+        return new ChallengeHandleResult(true, null,
+            pauseResult.currentUrl(), pauseResult.pageTitle(),
+            pauseResult.pageText(), pauseResult.observationId(),
+            pauseResult.interactiveElements());
+    }
+
+    private String parseOtpCode(ApprovalRequest approval) {
+        if (approval == null) return null;
+        String response = approval.getUserResponse();
+        if (response == null || response.isBlank()) return null;
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(response, Map.class);
+            String code = (String) parsed.get("otpCode");
+            if (code != null && !code.isBlank()) return code;
+        } catch (Exception e) {
+            // Not JSON — treat the raw response as the code
+        }
+        return response.trim();
     }
 
     // ─── Credential placeholder system ─────────────────────────────────────────

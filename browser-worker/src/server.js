@@ -152,6 +152,10 @@ app.post('/action/execute', async (req, res) => {
         href: el.href || null,
         enabled: el.enabled,
       }));
+      // Forward challenge detection (CAPTCHA/OTP) to backend
+      if (obs.challenges) {
+        result.challenges = obs.challenges;
+      }
     }
 
     console.log(`[/action/execute] Task ${taskId} | ${actionType} | success=${result.success} | obsId=${result.observationId || 'none'} | url=${(result.currentUrl || '').substring(0, 60)}`);
@@ -213,6 +217,68 @@ app.post('/session/unpark', async (req, res) => {
       screenshot: observation.screenshot?.base64 || null,
     });
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ─── Fill OTP code (bypasses the model — code goes directly to the field) ────
+app.post('/action/fill-otp', async (req, res) => {
+  const { taskId, code, inputName } = req.body;
+  if (!taskId || !code) return res.status(400).json({ error: 'taskId and code are required' });
+
+  const session = sessionManager.getSession(taskId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found' });
+  }
+
+  try {
+    const page = session.page;
+    let filled = false;
+
+    // Try to find the OTP input by name/id first
+    if (inputName) {
+      const byName = page.locator(`input[name="${inputName}"], input[id="${inputName}"]`);
+      if (await byName.count() > 0) {
+        await byName.first().fill(code, { timeout: 5000 });
+        filled = true;
+      }
+    }
+
+    // Fallback: find OTP-like inputs
+    if (!filled) {
+      const otpInput = page.locator(
+        'input[name*="otp" i], input[name*="code" i], input[name*="totp" i], ' +
+        'input[id*="otp" i], input[id*="code" i], input[id*="totp" i], ' +
+        'input[placeholder*="code" i], input[placeholder*="otp" i], ' +
+        'input[aria-label*="code" i], input[aria-label*="otp" i], ' +
+        'input[inputmode="numeric"][maxlength]'
+      );
+      if (await otpInput.count() > 0) {
+        await otpInput.first().fill(code, { timeout: 5000 });
+        filled = true;
+      }
+    }
+
+    if (!filled) {
+      return res.status(404).json({ success: false, error: 'Could not find OTP input field' });
+    }
+
+    console.log(`[/action/fill-otp] Task ${taskId} | OTP code filled (code redacted)`);
+    await page.waitForTimeout(500);
+
+    const { buildObservation } = require('./perception');
+    const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+    session.lastObservation = observation;
+
+    res.json({
+      success: true,
+      result: 'OTP code filled',
+      currentUrl: observation.url,
+      pageTitle: observation.title,
+      observationId: observation.observation_id,
+    });
+  } catch (error) {
+    console.error(`[/action/fill-otp] Error for task ${taskId}:`, error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });

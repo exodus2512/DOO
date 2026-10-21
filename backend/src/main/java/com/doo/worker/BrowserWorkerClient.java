@@ -94,9 +94,12 @@ public class BrowserWorkerClient {
             @SuppressWarnings("unchecked")
             java.util.List<java.util.Map<String, Object>> interactiveElements =
                 (java.util.List<java.util.Map<String, Object>>) response.get("interactiveElements");
+            @SuppressWarnings("unchecked")
+            java.util.List<java.util.Map<String, Object>> challenges =
+                (java.util.List<java.util.Map<String, Object>>) response.get("challenges");
 
             return new ActionResult(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                accessibilityTree, observationId, interactiveElements);
+                accessibilityTree, observationId, interactiveElements, challenges);
         } catch (WebClientResponseException e) {
             log.error("Browser worker HTTP error {}: {}", e.getStatusCode(), e.getMessage());
             return ActionResult.failure("Browser worker error: " + e.getStatusCode() + " " + e.getResponseBodyAsString());
@@ -199,10 +202,41 @@ public class BrowserWorkerClient {
                 (java.util.List<java.util.Map<String, Object>>) response.get("interactiveElements");
 
             return new ActionResult(success, "Session unparked", null, screenshot,
-                currentUrl, pageTitle, pageText, null, observationId, interactiveElements);
+                currentUrl, pageTitle, pageText, null, observationId, interactiveElements, null);
         } catch (Exception e) {
             log.warn("Could not unpark session for task {}: {}", taskId, e.getMessage());
             return ActionResult.failure("Unpark failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Fill an OTP code directly into the browser (bypasses the model).
+     * The code goes straight to the worker which fills it into the OTP input field.
+     */
+    public ActionResult fillOtp(UUID taskId, String code, String inputName) {
+        try {
+            Map<String, Object> body = new java.util.HashMap<>();
+            body.put("taskId", taskId.toString());
+            body.put("code", code);
+            if (inputName != null) body.put("inputName", inputName);
+
+            Map response = webClient.post()
+                .uri("/action/fill-otp")
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(15))
+                .block();
+
+            if (response == null) return ActionResult.failure("Empty OTP fill response");
+            boolean success = Boolean.TRUE.equals(response.get("success"));
+            return new ActionResult(success, (String) response.get("result"),
+                (String) response.get("error"), null,
+                (String) response.get("currentUrl"), (String) response.get("pageTitle"),
+                null, null, (String) response.get("observationId"), null, null);
+        } catch (Exception e) {
+            log.warn("Could not fill OTP for task {}: {}", taskId, e.getMessage());
+            return ActionResult.failure("OTP fill failed: " + e.getMessage());
         }
     }
 
@@ -271,18 +305,19 @@ public class BrowserWorkerClient {
         String pageText,
         String accessibilityTree,
         String observationId,
-        java.util.List<java.util.Map<String, Object>> interactiveElements
+        java.util.List<java.util.Map<String, Object>> interactiveElements,
+        java.util.List<java.util.Map<String, Object>> challenges
     ) {
         /** Convenience constructor without perception fields (for tests and simple callers). */
         public ActionResult(boolean success, String result, String error, String screenshot,
                             String currentUrl, String pageTitle, String pageText,
                             String accessibilityTree) {
             this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                 accessibilityTree, null, null);
+                 accessibilityTree, null, null, null);
         }
 
         public static ActionResult failure(String error) {
-            return new ActionResult(false, null, error, null, null, null, null, null, null, null);
+            return new ActionResult(false, null, error, null, null, null, null, null, null, null, null);
         }
     }
 
