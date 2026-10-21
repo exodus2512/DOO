@@ -602,6 +602,17 @@ public class TaskExecutorService {
                     }
                 }
 
+                // Hard dispatch check: block FILL if value still contains an unresolved placeholder.
+                if ("FILL".equals(decision.actionType()) && decision.args() != null) {
+                    Object fillVal = decision.args().get("value");
+                    if (fillVal instanceof String sv && ANY_UNRESOLVED_PLACEHOLDER.matcher(sv).find()) {
+                        log.error("Task {} step {} | FILL BLOCKED — unresolved placeholder '{}' not in knownValues keys={}",
+                            taskId, step, sv, knownValues.keySet());
+                        recentActions.add("FILL_BLOCKED: unresolved placeholder, key not in knownValues");
+                        continue;
+                    }
+                }
+
                 // ── Step D: Personal-data FILL guard ────────────────────────────
                 // Reject FILL on a personal field unless the value is a placeholder
                 // (__cred_* or __user:*__), appears in the task text, or is in knownValues.
@@ -1153,10 +1164,36 @@ public class TaskExecutorService {
         return PERSONAL_FIELD_PATTERN.matcher(fieldDescription).find();
     }
 
+    // ─── User-value placeholder patterns (before methods that reference them) ───────
+    private static final java.util.regex.Pattern USER_PLACEHOLDER_COLON = java.util.regex.Pattern.compile(
+        "__user:([a-z0-9_]+)__"
+    );
+    private static final java.util.regex.Pattern USER_PLACEHOLDER_UNDER = java.util.regex.Pattern.compile(
+        "__user_([a-z0-9_]+)__"
+    );
+    /** Detects any un-resolved placeholder remaining after resolution attempts. */
+    private static final java.util.regex.Pattern ANY_UNRESOLVED_PLACEHOLDER = java.util.regex.Pattern.compile(
+        "__[a-z][a-z0-9:._]+__"
+    );
+
     private static boolean isValueFromKnownSource(String value, Map<String, String> knownValues, String userRequest) {
         if (value == null || value.isBlank()) return true;
         String v = value.trim();
-        if (v.startsWith("__cred_") || v.startsWith("__user:")) return true;
+        if (v.startsWith("__cred_")) return true;
+        // User placeholder: OK only if every referenced key exists in knownValues
+        if (v.contains("__user")) {
+            java.util.regex.Matcher mc = USER_PLACEHOLDER_COLON.matcher(v);
+            while (mc.find()) {
+                String key = normalizeFieldKey(mc.group(1));
+                if (knownValues == null || !knownValues.containsKey(key)) return false;
+            }
+            java.util.regex.Matcher mu = USER_PLACEHOLDER_UNDER.matcher(v);
+            while (mu.find()) {
+                String key = normalizeFieldKey(mu.group(1));
+                if (knownValues == null || !knownValues.containsKey(key)) return false;
+            }
+            return true;
+        }
         if (knownValues != null && knownValues.containsValue(v)) return true;
         if (userRequest != null && userRequest.toLowerCase().contains(v.toLowerCase())) return true;
         return false;
@@ -1277,16 +1314,36 @@ public class TaskExecutorService {
 
     // ─── User-value placeholder resolution (Step C) ───────────────────────────
 
-    private static final java.util.regex.Pattern USER_PLACEHOLDER = java.util.regex.Pattern.compile(
-        "__user:([^_]+)__"
-    );
-
+    /**
+     * Replace all __user:key__ and __user_key__ occurrences using find()+appendReplacement
+     * so placeholders inside a longer string resolve too.
+     * Normalises the captured key via normalizeFieldKey before the knownValues lookup.
+     */
     private static String resolveUserPlaceholder(String value, Map<String, String> knownValues) {
-        java.util.regex.Matcher m = USER_PLACEHOLDER.matcher(value);
-        if (!m.matches()) return value;
-        String key = m.group(1).toLowerCase();
-        String resolved = knownValues.get(key);
-        return resolved != null ? resolved : value;
+        if (value == null || !value.contains("__")) return value;
+        value = resolvePatternOccurrences(value, USER_PLACEHOLDER_COLON, knownValues);
+        value = resolvePatternOccurrences(value, USER_PLACEHOLDER_UNDER, knownValues);
+        return value;
+    }
+
+    private static String resolvePatternOccurrences(String input, java.util.regex.Pattern p,
+            Map<String, String> knownValues) {
+        java.util.regex.Matcher m = p.matcher(input);
+        if (!m.find()) return input;
+        StringBuffer sb = new StringBuffer();
+        do {
+            String rawKey = m.group(1);
+            String key = normalizeFieldKey(rawKey);
+            String resolved = knownValues.get(key);
+            if (resolved != null) {
+                log.debug("[placeholder] resolved __user:{}__ from knownValues", key);
+                m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(resolved));
+            } else {
+                m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(m.group(0)));
+            }
+        } while (m.find());
+        m.appendTail(sb);
+        return sb.toString();
     }
 
     private ApprovalRequest requestApproval(Task task, AiProvider.ActionDecision decision) {
