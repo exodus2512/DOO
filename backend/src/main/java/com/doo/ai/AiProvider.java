@@ -63,8 +63,21 @@ public interface AiProvider {
         String accessibilityTree,
         List<String> recentActions,
         List<String> allowedActionTypes,
-        String workflowType
-    ) {}
+        String workflowType,
+        // Structured perception (null when no observation available yet)
+        String observationId,
+        List<java.util.Map<String, Object>> interactiveElements
+    ) {
+        // Backward-compat constructor for tests that don't have observation data
+        public ActionSelectionRequest(
+            String userRequest, String currentPlan, int currentStep, List<String> planSteps,
+            String currentUrl, String pageTitle, String pageText, String accessibilityTree,
+            List<String> recentActions, List<String> allowedActionTypes, String workflowType) {
+            this(userRequest, currentPlan, currentStep, planSteps, currentUrl, pageTitle,
+                 pageText, accessibilityTree, recentActions, allowedActionTypes, workflowType,
+                 null, null);
+        }
+    }
 
     record VerificationRequest(
         String userRequest,

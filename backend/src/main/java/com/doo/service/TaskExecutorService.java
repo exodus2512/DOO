@@ -193,6 +193,9 @@ public class TaskExecutorService {
             int consecutiveFailures = 0;
             int observationEpoch = 0;
             String lastObservationHash = "";
+            // Structured perception state — updated after each action
+            String lastObservationId = null;
+            List<Map<String, Object>> lastInteractiveElements = null;
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
             List<String> recentActionFingerprints = new ArrayList<>();
 
@@ -230,7 +233,9 @@ public class TaskExecutorService {
                         accessibilityTree,
                         recentActions,
                         ALLOWED_ACTIONS,
-                        task.getWorkflowType().name()
+                        task.getWorkflowType().name(),
+                        lastObservationId,
+                        lastInteractiveElements
                     )
                 );
                 aiCallCount++;
@@ -332,9 +337,23 @@ public class TaskExecutorService {
                     break;
                 }
 
+                // Attach structured observation to element-index actions so the worker
+                // can resolve element_index → Playwright locator and run stale checks.
+                Map<String, Object> actionArgs = new HashMap<>(decision.args() != null ? decision.args() : Map.of());
+                if (actionArgs.containsKey("element_index") && lastObservationId != null) {
+                    actionArgs.put("observation_id", lastObservationId);
+                    // Minimal observation stub for stale check: url + title are sufficient
+                    actionArgs.put("_observation", Map.of(
+                        "observation_id", lastObservationId,
+                        "url", currentUrl,
+                        "title", pageTitle,
+                        "interactive_elements", lastInteractiveElements != null ? lastInteractiveElements : List.of()
+                    ));
+                }
+
                 // Execute action
                 ActionResult result = browserWorkerClient.executeAction(
-                    taskId, sessionId, decision.actionType(), decision.args());
+                    taskId, sessionId, decision.actionType(), actionArgs);
 
                 // Update step record
                 taskStep.setStatus(result.success() ? "COMPLETED" : "FAILED");
@@ -350,9 +369,28 @@ public class TaskExecutorService {
                     publishEvent(TaskEvent.screenshot(taskId, label, result.screenshot()));
                 }
 
+                // Handle STALE_OBSERVATION: re-observe and retry the step without incrementing step counter
+                if (!result.success() && result.error() != null && result.error().startsWith("STALE_OBSERVATION")) {
+                    log.info("Task {} step {}: stale observation detected, refreshing perception", taskId, step);
+                    if (result.observationId() != null) {
+                        lastObservationId = result.observationId();
+                        lastInteractiveElements = result.interactiveElements();
+                    }
+                    // Don't count as a failure — force the loop to re-select with fresh observation
+                    // by decrementing step so the same slot is retried with updated state
+                    step--;
+                    continue;
+                }
+
                 if (result.success()) {
                     consecutiveFailures = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
+
+                    // Update structured observation state
+                    if (result.observationId() != null) {
+                        lastObservationId = result.observationId();
+                        lastInteractiveElements = result.interactiveElements();
+                    }
 
                     // ── Fill-then-submit guard ──────────────────────────────
                     // After a FILL that didn't change the page (no navigation, no DOM shift),
@@ -441,6 +479,12 @@ public class TaskExecutorService {
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
+
+                    // Capture fresh observation from failed action result if available
+                    if (result.observationId() != null) {
+                        lastObservationId = result.observationId();
+                        lastInteractiveElements = result.interactiveElements();
+                    }
 
                     if (consecutiveFailures >= maxRetries) {
                         failTask(task, "Browser action failed " + maxRetries + " times: " + result.error());

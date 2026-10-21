@@ -197,6 +197,39 @@ public class GeminiAiProvider implements AiProvider {
         if (!isAvailable()) {
             return deterministic_selectAction(request);
         }
+        // Build the page state block: prefer indexed elements, fall back to raw text
+        String pageStateBlock;
+        if (request.observationId() != null && request.interactiveElements() != null
+                && !request.interactiveElements().isEmpty()) {
+            StringBuilder sb = new StringBuilder();
+            sb.append("Observation ID: ").append(request.observationId()).append("\n");
+            sb.append("Interactive elements (use element_index to act on them):\n");
+            for (java.util.Map<String, Object> el : request.interactiveElements()) {
+                Object idx = el.get("index");
+                Object tag = el.get("tag");
+                Object role = el.get("role");
+                Object label = el.get("label");
+                Object text = el.get("text");
+                Object placeholder = el.get("placeholder");
+                Object type = el.get("type");
+                Object href = el.get("href");
+                sb.append(String.format("  [%s] <%s> role=%s", idx, tag, role));
+                if (label != null && !label.toString().isBlank()) sb.append(" label=\"").append(label).append("\"");
+                if (text != null && !text.toString().isBlank()) sb.append(" text=\"").append(text).append("\"");
+                if (placeholder != null && !placeholder.toString().isBlank()) sb.append(" placeholder=\"").append(placeholder).append("\"");
+                if ("a".equals(tag) && href != null) sb.append(" href=\"").append(href).append("\"");
+                sb.append("\n");
+            }
+            pageStateBlock = sb.toString();
+        } else {
+            pageStateBlock = "Page text (truncated, no structured observation available):\n"
+                + truncate(request.pageText(), 2000);
+        }
+
+        String obsIdLine = request.observationId() != null
+            ? "\nobservation_id (REQUIRED in args for CLICK/FILL/SELECT_OPTION/PRESS_KEY): \"" + request.observationId() + "\""
+            : "";
+
         String prompt = """
             You are DOO, an AI browser agent selecting the next browser action.
 
@@ -204,9 +237,9 @@ public class GeminiAiProvider implements AiProvider {
             Current plan step %d: %s
             Current URL: %s
             Page title: %s
-            Page content (truncated): %s
+            %s
             Recent actions: %s
-            Allowed action types: %s
+            %s
 
             Select ONE action. Respond in JSON format ONLY:
             {
@@ -219,30 +252,34 @@ public class GeminiAiProvider implements AiProvider {
 
             Action args by type:
             - NAVIGATE: {"url": "https://..."}
-            - CLICK: {"selector": "css or xpath", "description": "what element"}
-            - FILL: {"selector": "...", "value": "text to enter", "description": "field name"}
+            - CLICK: {"element_index": 5, "observation_id": "...", "description": "what element"}
+            - FILL: {"element_index": 3, "observation_id": "...", "value": "text to enter", "description": "field name"}
             - PRESS_KEY: {"key": "Enter|Tab|Escape|Backspace|ArrowDown|ArrowUp|Space"}
+            - SELECT_OPTION: {"element_index": 7, "observation_id": "...", "value": "option text"}
             - EXTRACT_TEXT: {"selector": "body", "label": "what we're extracting"}
             - SCREENSHOT: {"label": "description of what we're capturing"}
             - SCROLL: {"direction": "down|up", "amount": 500}
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
 
-            WORKFLOW PATTERNS — follow these sequences:
-            - To search: FILL the search box → PRESS_KEY Enter → EXTRACT_TEXT on results
-            - To read a page: NAVIGATE → EXTRACT_TEXT (extract first, scroll only if needed)
-            - To submit a form: FILL fields → CLICK submit button
+            CRITICAL: For CLICK, FILL, SELECT_OPTION — you MUST use element_index from the elements list above.
+            Never invent CSS selectors. The element_index is the [number] in brackets from the list.
+            Always include observation_id in args when using element_index.
 
-            EXAMPLE (search on Google):
-              Step 1: FILL {"selector": "textarea[name='q']", "value": "trending python repos"}
-              Step 2: PRESS_KEY {"key": "Enter"}    ← typing alone does nothing; you must submit
+            WORKFLOW PATTERNS:
+            - To search: FILL search box (by element_index) → PRESS_KEY Enter → EXTRACT_TEXT on results
+            - To read a page: NAVIGATE → EXTRACT_TEXT
+            - To submit a form: FILL each field (by element_index) → CLICK submit (by element_index)
+
+            EXAMPLE (search on Google, assuming [2] is the search textarea):
+              Step 1: FILL {"element_index": 2, "observation_id": "obs_abc123", "value": "trending python repos", "description": "search box"}
+              Step 2: PRESS_KEY {"key": "Enter"}
               Step 3: EXTRACT_TEXT {"selector": "body", "label": "search results"}
 
             RULES:
-            - FILL only puts text in a field. It does NOT submit. After FILL, you MUST either PRESS_KEY Enter or CLICK the submit/search button.
-            - Use EXTRACT_TEXT as soon as useful content is visible. Do not scroll first.
-            - You MUST use EXTRACT_TEXT at least once before using DONE. The task needs explicit evidence.
-            - Do NOT repeat the same action more than twice in a row.
+            - FILL only puts text in a field. It does NOT submit. After FILL, MUST use PRESS_KEY Enter or CLICK submit.
+            - Use EXTRACT_TEXT as soon as useful content is visible.
+            - You MUST use EXTRACT_TEXT at least once before DONE.
             - Never navigate to file:// URLs or private IPs.
             - Never fill password fields or click purchase/buy/subscribe buttons.
             """.formatted(
@@ -252,9 +289,9 @@ public class GeminiAiProvider implements AiProvider {
                     Math.min(request.currentStep(), request.planSteps().size() - 1)),
                 request.currentUrl(),
                 request.pageTitle(),
-                truncate(request.pageText(), 2000),
+                pageStateBlock,
                 String.join(", ", request.recentActions().stream().limit(5).toList()),
-                String.join(", ", request.allowedActionTypes())
+                obsIdLine
             );
 
         String taskLabel = truncate(request.userRequest(), 60);
@@ -709,6 +746,22 @@ public class GeminiAiProvider implements AiProvider {
         }
         if ("UI_INTERACTION".equals(request.workflowType())) {
             if (request.currentStep() == 1) {
+                // Use element_index if we have an observation, fall back to selector for tests
+                if (request.observationId() != null && request.interactiveElements() != null) {
+                    // Find the first text input element
+                    int idx = 0;
+                    for (java.util.Map<String, Object> el : request.interactiveElements()) {
+                        Object role = el.get("role");
+                        if ("textbox".equals(role) || "input".equals(el.get("tag"))) {
+                            idx = ((Number) el.get("index")).intValue();
+                            break;
+                        }
+                    }
+                    return new ActionDecision("FILL",
+                        Map.of("element_index", idx, "observation_id", request.observationId(),
+                               "value", "Demo User", "description", "First text field"),
+                        "Filling form field (demo mode)", false, "");
+                }
                 return new ActionDecision("FILL",
                     Map.of("selector", "#full-name", "value", "Demo User", "description", "Full Name"),
                     "Filling form field (demo mode)", false, "");

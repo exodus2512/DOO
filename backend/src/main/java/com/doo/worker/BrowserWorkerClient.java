@@ -85,13 +85,18 @@ public class BrowserWorkerClient {
             boolean success = Boolean.TRUE.equals(response.get("success"));
             String result = (String) response.get("result");
             String error = (String) response.get("error");
-            String screenshot = (String) response.get("screenshot"); // base64 if captured
+            String screenshot = (String) response.get("screenshot");
             String currentUrl = (String) response.get("currentUrl");
             String pageTitle = (String) response.get("pageTitle");
             String pageText = (String) response.get("pageText");
             String accessibilityTree = (String) response.get("accessibilityTree");
+            String observationId = (String) response.get("observationId");
+            @SuppressWarnings("unchecked")
+            java.util.List<java.util.Map<String, Object>> interactiveElements =
+                (java.util.List<java.util.Map<String, Object>>) response.get("interactiveElements");
 
-            return new ActionResult(success, result, error, screenshot, currentUrl, pageTitle, pageText, accessibilityTree);
+            return new ActionResult(success, result, error, screenshot, currentUrl, pageTitle, pageText,
+                accessibilityTree, observationId, interactiveElements);
         } catch (WebClientResponseException e) {
             log.error("Browser worker HTTP error {}: {}", e.getStatusCode(), e.getMessage());
             return ActionResult.failure("Browser worker error: " + e.getStatusCode() + " " + e.getResponseBodyAsString());
@@ -210,10 +215,20 @@ public class BrowserWorkerClient {
         String currentUrl,
         String pageTitle,
         String pageText,
-        String accessibilityTree
+        String accessibilityTree,
+        String observationId,
+        java.util.List<java.util.Map<String, Object>> interactiveElements
     ) {
+        /** Convenience constructor without perception fields (for tests and simple callers). */
+        public ActionResult(boolean success, String result, String error, String screenshot,
+                            String currentUrl, String pageTitle, String pageText,
+                            String accessibilityTree) {
+            this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
+                 accessibilityTree, null, null);
+        }
+
         public static ActionResult failure(String error) {
-            return new ActionResult(false, null, error, null, null, null, null, null);
+            return new ActionResult(false, null, error, null, null, null, null, null, null, null);
         }
     }
 

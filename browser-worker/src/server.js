@@ -120,9 +120,9 @@ app.post('/action/execute', async (req, res) => {
   try {
     const result = await executeAction(session.page, actionType, args || {}, taskId);
 
-    // Flatten observation into legacy fields for backward compat
     if (result.observation) {
       const obs = result.observation;
+      // Flatten into legacy fields for backward compat
       result.currentUrl = obs.url;
       result.pageTitle = obs.title;
       result.pageText = obs.page_text?.text || '';
@@ -132,6 +132,19 @@ app.post('/action/execute', async (req, res) => {
       if (obs.screenshot?.base64 && !result.screenshot) {
         result.screenshot = obs.screenshot.base64;
       }
+      // Send the structured observation for element-index-based actions
+      result.observationId = obs.observation_id;
+      result.interactiveElements = (obs.interactive_elements || []).map(el => ({
+        index: el.index,
+        tag: el._locator?.tagName || el.type,
+        role: el.role,
+        text: (el.text || '').substring(0, 80),
+        label: (el.label || '').substring(0, 80),
+        placeholder: el.placeholder || null,
+        type: el.type,
+        href: el.href || null,
+        enabled: el.enabled,
+      }));
     }
 
     res.json(result);

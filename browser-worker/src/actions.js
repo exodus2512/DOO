@@ -14,6 +14,23 @@ const { buildObservation, resolveElement } = require('./perception');
 async function executeAction(page, actionType, args = {}, taskId = null) {
   const validatedAction = validateActionType(actionType);
 
+  // Stale-observation guard: if the caller references an observation_id,
+  // verify the page hasn't navigated away since that observation.
+  if (args.observation_id && args.element_index !== undefined) {
+    const currentUrl = page.url();
+    const currentTitle = await page.title().catch(() => '');
+    const refObs = args._observation;
+    if (refObs && (refObs.url !== currentUrl || refObs.title !== currentTitle)) {
+      const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
+      return {
+        success: false,
+        error: 'STALE_OBSERVATION: page changed since observation ' + args.observation_id +
+               ' (was ' + refObs.url + ', now ' + currentUrl + ')',
+        observation: freshObs,
+      };
+    }
+  }
+
   try {
     switch (validatedAction) {
       case 'NAVIGATE': {
