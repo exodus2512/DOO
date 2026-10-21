@@ -142,7 +142,11 @@ public interface AiProvider {
         }
     }
 
-    record VerificationResult(boolean passed, String notes, double confidence) {}
+    record VerificationResult(boolean passed, String notes, double confidence, List<String> unsupportedClaims) {
+        public VerificationResult(boolean passed, String notes, double confidence) {
+            this(passed, notes, confidence, List.of());
+        }
+    }
 
     record SynthesisRequest(
         String userRequest,

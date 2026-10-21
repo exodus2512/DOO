@@ -448,6 +448,31 @@ public class TaskExecutorService {
                     continue;
                 }
 
+                // ── Step G: Confirm-before-submit gate ────────────────────────
+                // Force approval on CLICK targeting submit-like buttons, even if the AI forgot.
+                if ("CLICK".equals(decision.actionType()) && !decision.requiresApproval()
+                        && decision.args() != null) {
+                    String btnDesc = String.valueOf(decision.args().getOrDefault("description", ""));
+                    String btnText = "";
+                    Object eidx = decision.args().get("element_index");
+                    if (eidx != null && lastInteractiveElements != null) {
+                        int idx = eidx instanceof Number n ? n.intValue() : Integer.parseInt(eidx.toString());
+                        if (idx >= 0 && idx < lastInteractiveElements.size()) {
+                            btnText = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("text", ""));
+                            if (btnText.isBlank()) {
+                                btnText = String.valueOf(lastInteractiveElements.get(idx).getOrDefault("label", ""));
+                            }
+                        }
+                    }
+                    String combined = btnDesc + " " + btnText;
+                    if (SUBMIT_BUTTON_PATTERN.matcher(combined).find()) {
+                        log.info("Task {} step {} | CONFIRM-BEFORE-SUBMIT forced for '{}'", taskId, step, combined.trim());
+                        decision = new AiProvider.ActionDecision(
+                            decision.actionType(), decision.args(), decision.rationale(),
+                            true, "Confirm before submitting: " + combined.trim());
+                    }
+                }
+
                 // Check if approval required
                 if (decision.requiresApproval()) {
                     ApprovalRequest approval = requestApproval(task, decision);
@@ -887,8 +912,19 @@ public class TaskExecutorService {
             aiCallCount++;
             publishEvent(TaskEvent.debug(taskId, "[STEP 5/5] VERIFY — passed=" + verification.passed() + ", confidence=" + verification.confidence(), Map.of("phase", "VERIFY", "passed", verification.passed())));
 
-            saveEvidence(taskId, "VERIFICATION_RESULT", "Verification",
-                "Passed: " + verification.passed() + "\n" + verification.notes(), null);
+            // Step G: Use unsupportedClaims — if any exist, downgrade to PARTIAL
+            boolean hasUnsupported = verification.unsupportedClaims() != null
+                && !verification.unsupportedClaims().isEmpty();
+            if (hasUnsupported) {
+                log.warn("Task {} — {} unsupported claims in verification: {}",
+                    taskId, verification.unsupportedClaims().size(), verification.unsupportedClaims());
+            }
+
+            String verificationDetails = "Passed: " + verification.passed() + "\n" + verification.notes();
+            if (hasUnsupported) {
+                verificationDetails += "\nUnsupported claims: " + String.join("; ", verification.unsupportedClaims());
+            }
+            saveEvidence(taskId, "VERIFICATION_RESULT", "Verification", verificationDetails, null);
 
             // Step 6: Save result and transition to final state
             List<TaskResult.SourceRef> sources = visitedUrls.stream()
@@ -896,18 +932,21 @@ public class TaskExecutorService {
                 .map(u -> new TaskResult.SourceRef(u, ""))
                 .toList();
 
+            // Downgrade to PARTIAL if unsupported claims found, even if AI said passed
+            boolean effectivelyPassed = verification.passed() && !hasUnsupported;
+
             TaskResult taskResult = TaskResult.builder()
                 .taskId(taskId)
                 .summary(synthesized)
                 .deliverableType(task.getDeliverableType())
-                .verificationPassed(verification.passed())
+                .verificationPassed(effectivelyPassed)
                 .verificationNotes(verification.notes())
                 .confidenceScore(verification.confidence())
                 .sources(sources)
                 .build();
             taskResultRepository.save(taskResult);
 
-            TaskStatus finalStatus = verification.passed() ? TaskStatus.COMPLETED : TaskStatus.PARTIAL;
+            TaskStatus finalStatus = effectivelyPassed ? TaskStatus.COMPLETED : TaskStatus.PARTIAL;
             updateTaskStatus(task, finalStatus, null);
             
             publishEvent(TaskEvent.completed(taskId, 
@@ -1027,6 +1066,10 @@ public class TaskExecutorService {
 
     private static final java.util.regex.Pattern PERSONAL_FIELD_PATTERN = java.util.regex.Pattern.compile(
         "(?i)(first.?name|last.?name|full.?name|\\bname\\b|email|e-mail|phone|mobile|address|zip|postal|city|state|country|dob|birth|ssn|credit.?card)"
+    );
+
+    private static final java.util.regex.Pattern SUBMIT_BUTTON_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)(finish|place.?order|submit|complete|confirm|pay|buy|checkout|send|purchase)"
     );
 
     private static final Set<String> PERSONAL_AUTOCOMPLETE_TOKENS = Set.of(

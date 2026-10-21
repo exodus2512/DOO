@@ -332,6 +332,7 @@ public class GeminiAiProvider implements AiProvider {
             SAFETY GATES — set requiresApproval=true for any of these:
             - Submitting a form that sends data externally (contact form, signup, purchase, subscription)
             - Clicking buy/purchase/subscribe/delete/send/publish buttons
+            - CONFIRM-BEFORE-SUBMIT: any CLICK on a button whose text contains Finish, Place Order, Submit, Complete, Confirm, Pay, Buy, Checkout, or Send MUST set requiresApproval=true with approvalReason describing what will be submitted.
             - Any action that is irreversible or externally visible
             - If unsure whether an action is safe, set requiresApproval=true with a clear approvalReason.
             Read-only actions (NAVIGATE, EXTRACT_TEXT, SCREENSHOT, SCROLL) NEVER need approval.
@@ -430,8 +431,10 @@ public class GeminiAiProvider implements AiProvider {
             {
               "passed": true|false,
               "notes": "specific explanation citing screenshots and text evidence",
-              "confidence": 0.0-1.0
+              "confidence": 0.0-1.0,
+              "unsupportedClaims": ["claim1 not backed by evidence", ...]
             }
+            If any claims in the synthesized result lack evidence support, list them in unsupportedClaims (even if overall passed=true).
             """.formatted(
                 request.userRequest(),
                 request.successCriteria(),
@@ -450,11 +453,20 @@ public class GeminiAiProvider implements AiProvider {
             JsonNode json = objectMapper.readTree(extractJson(response));
             boolean passed = json.path("passed").asBoolean(false);
             double confidence = json.path("confidence").asDouble(0.5);
-            log.info("[STEP 5/5] VERIFY — passed={}, confidence={}", passed, confidence);
+            List<String> unsupported = new java.util.ArrayList<>();
+            JsonNode claimsNode = json.path("unsupportedClaims");
+            if (claimsNode.isArray()) {
+                for (JsonNode c : claimsNode) unsupported.add(c.asText());
+            }
+            if (!unsupported.isEmpty()) {
+                log.warn("[STEP 5/5] VERIFY — {} unsupported claims: {}", unsupported.size(), unsupported);
+            }
+            log.info("[STEP 5/5] VERIFY — passed={}, confidence={}, unsupportedClaims={}", passed, confidence, unsupported.size());
             return new VerificationResult(
                 passed,
                 json.path("notes").asText(""),
-                confidence
+                confidence,
+                unsupported
             );
         } catch (Exception e) {
             log.error("[STEP 5/5] VERIFY — FAILED: {}", e.getMessage());
