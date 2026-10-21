@@ -3,13 +3,18 @@
  * Receives action requests from the Spring backend and executes them via Playwright.
  */
 
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const express = require('express');
 const sessionManager = require('./sessions');
 const { executeAction, getPageState } = require('./actions');
 const { validateUrl, validateActionType } = require('./security');
+const live = require('./live');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
 
 const PORT = process.env.BROWSER_WORKER_PORT || 3001;
 const WORKER_SECRET = process.env.BROWSER_WORKER_SECRET || 'dev-secret-change-in-production';
@@ -356,8 +361,54 @@ app.post('/task/cancel', async (req, res) => {
   res.json({ success: true });
 });
 
+// ─── Live view token ─────────────────────────────────────────────────────────
+// POST /session/live-token  — issues a short-lived token for the live WS.
+app.post('/session/live-token', (req, res) => {
+  const { taskId } = req.body;
+  if (!taskId) return res.status(400).json({ error: 'taskId required' });
+  const session = sessionManager.getSession(taskId);
+  if (!session) return res.status(404).json({ error: 'session not found' });
+  const token = live.issueToken(taskId);
+  res.json({ token, ttlSeconds: 600 });
+});
+
+// ─── Live view WebSocket ──────────────────────────────────────────────────────
+// WS /session/:taskId/live?token=<token>
+server.on('upgrade', async (request, socket, head) => {
+  const url = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  const liveMatch = url.pathname.match(/^\/session\/([^/]+)\/live$/);
+  if (!liveMatch) { socket.destroy(); return; }
+
+  const token = url.searchParams.get('token');
+  const claimedTaskId = liveMatch[1];
+
+  // Validate secret header for WS too
+  const secret = request.headers['x-worker-secret'];
+  const tokenTaskId = live.validateToken(token);
+  if (!tokenTaskId || tokenTaskId !== claimedTaskId || secret !== WORKER_SECRET) {
+    socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  wss.handleUpgrade(request, socket, head, async (ws) => {
+    const session = sessionManager.getSession(claimedTaskId);
+    if (!session || !session.page) {
+      ws.close(4404, 'session not found');
+      return;
+    }
+    try {
+      await live.startLiveSession(ws, session.page);
+      console.log(`[LiveView] session started for task ${claimedTaskId}`);
+    } catch (e) {
+      console.error('[LiveView] failed to start:', e.message);
+      ws.close(4500, 'internal error');
+    }
+  });
+});
+
 // ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`[DOO Browser Worker] Listening on port ${PORT}`);
   console.log(`[DOO Browser Worker] Headless: ${process.env.HEADLESS !== 'false'}`);
 });
@@ -375,4 +426,4 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-module.exports = app;
+module.exports = { app, server };
