@@ -156,7 +156,8 @@ app.post('/task/cancel', async (req, res) => {
   if (!taskId) return res.status(400).json({ error: 'taskId is required' });
 
   sessionManager.cancelTask(taskId);
-  await sessionManager.closeSession(taskId);
+  // Don't close the session here — the backend's finally block calls /session/close.
+  // Closing eagerly races with in-flight actions, causing "session not found" errors.
   res.json({ success: true });
 });
 

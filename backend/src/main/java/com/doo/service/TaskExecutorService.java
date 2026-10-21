@@ -255,6 +255,12 @@ public class TaskExecutorService {
                 publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
                     decision.rationale() + " → " + decision.actionType(), step, Map.of()));
 
+                // Re-check cancellation before sending action to worker
+                if (isCancelled(taskId)) {
+                    log.info("Task {} cancelled before action execution at step {}", taskId, step);
+                    break;
+                }
+
                 // Execute action
                 ActionResult result = browserWorkerClient.executeAction(
                     taskId, sessionId, decision.actionType(), decision.args());
