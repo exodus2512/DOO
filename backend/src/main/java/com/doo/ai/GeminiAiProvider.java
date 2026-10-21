@@ -154,7 +154,8 @@ public class GeminiAiProvider implements AiProvider {
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
             
-            IMPORTANT: Only navigate to public URLs. Never navigate to localhost, file://, or private IPs.
+            IMPORTANT: Never navigate to file:// URLs or private IPs (10.x, 172.16-31.x, 192.168.x).
+            localhost URLs are allowed when specified in the task.
             Never fill password fields. Never click purchase/checkout/buy/subscribe buttons.
             """.formatted(
                 request.userRequest(),
@@ -189,22 +190,36 @@ public class GeminiAiProvider implements AiProvider {
     @Override
     public VerificationResult verify(VerificationRequest request) {
         if (!isAvailable()) {
-            return new VerificationResult(true, "Demo mode: verification simulated", 0.7);
+            boolean hasEvidence = request.evidenceSummary() != null && !request.evidenceSummary().isEmpty();
+            boolean hasUrls = request.visitedUrls() != null && !request.visitedUrls().isEmpty();
+            boolean passed = hasEvidence && hasUrls;
+            String notes = passed
+                ? "Demo mode: verification passed based on collected evidence — " + String.join("; ", request.evidenceSummary())
+                : "Demo mode: insufficient evidence collected";
+            return new VerificationResult(passed, notes, passed ? 0.7 : 0.3);
         }
+        String evidenceBlock = request.evidenceSummary() != null
+            ? String.join("\n", request.evidenceSummary()) : "No evidence summary available";
         String prompt = """
             You are DOO's verification engine. Determine if the task was completed successfully.
-            
+
             User request: "%s"
             Success criteria: "%s"
             Workflow type: %s
             Final URL: %s
             Visited URLs: %s
             Synthesized result (truncated): %s
-            
+
+            Evidence collected:
+            %s
+
+            IMPORTANT: Base your verdict on the specific evidence listed above.
+            If evidence is insufficient to confirm the success criteria, mark as NOT passed.
+
             Did the execution meet the success criteria? Respond in JSON format ONLY:
             {
               "passed": true|false,
-              "notes": "specific explanation of what was/wasn't achieved",
+              "notes": "specific explanation referencing the evidence collected",
               "confidence": 0.0-1.0
             }
             """.formatted(
@@ -213,7 +228,8 @@ public class GeminiAiProvider implements AiProvider {
                 request.workflowType(),
                 request.finalUrl(),
                 String.join(", ", request.visitedUrls()),
-                truncate(request.synthesizedResult(), 3000)
+                truncate(request.synthesizedResult(), 3000),
+                evidenceBlock
             );
 
         try {
@@ -268,9 +284,6 @@ public class GeminiAiProvider implements AiProvider {
             candidateModels.add(this.model);
         }
         candidateModels.add("gemini-3.5-flash");
-        candidateModels.add("gemini-3.5-flash-lite");
-        candidateModels.add("gemini-3.6-flash");
-        candidateModels.add("gemini-flash-latest");
         Exception lastException = null;
 
         for (String targetModel : candidateModels) {
@@ -289,7 +302,7 @@ public class GeminiAiProvider implements AiProvider {
                         .bodyValue(body)
                         .retrieve()
                         .bodyToMono(Map.class)
-                        .timeout(java.time.Duration.ofSeconds(15))
+                        .timeout(java.time.Duration.ofSeconds(30))
                         .block();
 
                     if (response == null) continue;
@@ -309,7 +322,8 @@ public class GeminiAiProvider implements AiProvider {
                     lastException = e;
                     log.warn("Gemini call failed (model={}, attempt={}/3): {}", targetModel, attempt, e.getMessage());
                     try {
-                        Thread.sleep(attempt * 1200L); // 1.2s, 2.4s backoff
+                        long backoff = (long) Math.pow(2, attempt) * 1000L + (long) (Math.random() * 500);
+                        Thread.sleep(backoff);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw new RuntimeException("Interrupted during Gemini call", ie);

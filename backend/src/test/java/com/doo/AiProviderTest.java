@@ -177,14 +177,26 @@ class AiProviderTest {
     class VerificationTests {
 
         @Test
-        @DisplayName("demo mode verify returns passed=true with demo note")
-        void demoVerify() {
+        @DisplayName("demo mode verify passes with evidence and visited URLs")
+        void demoVerifyWithEvidence() {
             VerificationResult result = demoProvider.verify(
                 new VerificationRequest("test", "criteria", "WEB_RESEARCH",
-                    "https://example.com", "content", List.of("https://example.com"), "summary"));
+                    "https://example.com", "content", List.of("https://example.com"), "summary",
+                    List.of("Visited 1 URLs", "Collected 2 text snippets")));
             assertThat(result.passed()).isTrue();
             assertThat(result.notes()).contains("Demo mode");
             assertThat(result.confidence()).isGreaterThan(0.0);
+        }
+
+        @Test
+        @DisplayName("demo mode verify fails without evidence")
+        void demoVerifyWithoutEvidence() {
+            VerificationResult result = demoProvider.verify(
+                new VerificationRequest("test", "criteria", "WEB_RESEARCH",
+                    "https://example.com", "content", List.of(), "summary"));
+            assertThat(result.passed()).isFalse();
+            assertThat(result.notes()).contains("insufficient evidence");
+            assertThat(result.confidence()).isLessThan(0.5);
         }
     }
 

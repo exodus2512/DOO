@@ -15,6 +15,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,6 +44,12 @@ public class TaskExecutorService {
 
     @Value("${doo.task.max-retries:3}")
     private int maxRetries;
+
+    @Value("${doo.task.execution-timeout-minutes:10}")
+    private int executionTimeoutMinutes;
+
+    private static final int NO_PROGRESS_WINDOW = 5;
+    private static final int NO_PROGRESS_THRESHOLD = 3;
 
     // Track cancelled tasks to prevent actions being dispatched after cancellation
     private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
@@ -128,12 +135,23 @@ public class TaskExecutorService {
             String pageText = "";
             String accessibilityTree = "";
             int consecutiveFailures = 0;
+            int observationEpoch = 0;
+            String lastObservationHash = "";
+            Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
+            List<String> recentActionFingerprints = new ArrayList<>();
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
+                // Wall-clock budget enforcement
+                if (Instant.now().isAfter(deadline)) {
+                    log.warn("Task {} exceeded {}min wall-clock budget at step {}", taskId, executionTimeoutMinutes, step);
+                    failTask(task, "Task exceeded " + executionTimeoutMinutes + " minute execution budget");
+                    return;
+                }
+
                 task.setCurrentStep(step);
                 taskRepository.save(task);
 
-                log.debug("Task {} step {}/{}", taskId, step, maxSteps);
+                log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
 
                 // Select next action
                 AiProvider.ActionDecision decision = aiProvider.selectNextAction(
@@ -159,6 +177,19 @@ public class TaskExecutorService {
                     break;
                 }
 
+                // No-progress detection: fingerprint = actionType + sorted key args
+                String fingerprint = computeActionFingerprint(decision);
+                recentActionFingerprints.add(fingerprint);
+                if (detectNoProgress(recentActionFingerprints)) {
+                    log.warn("Task {} stuck: action '{}' repeated {} times in last {} steps",
+                        taskId, decision.actionType(), NO_PROGRESS_THRESHOLD, NO_PROGRESS_WINDOW);
+                    publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                        "No progress detected — agent is repeating the same action", step, Map.of()));
+                    failTask(task, "Agent made no progress: repeated '" + decision.actionType()
+                        + "' action " + NO_PROGRESS_THRESHOLD + " times without advancing");
+                    return;
+                }
+
                 // Validate action
                 if (!validateAction(decision, task)) {
                     consecutiveFailures++;
@@ -176,7 +207,6 @@ public class TaskExecutorService {
                         decision.approvalReason(), decision.actionType()));
                     updateTaskStatus(task, TaskStatus.WAITING_FOR_USER, null);
 
-                    // Wait for approval (poll DB)
                     ApprovalRequest resolved = waitForApproval(approval.getId(), taskId);
                     if (resolved == null || "REJECTED".equals(resolved.getStatus())) {
                         failTask(task, "Action was rejected by user or approval expired");
@@ -185,12 +215,16 @@ public class TaskExecutorService {
                     updateTaskStatus(task, TaskStatus.RUNNING, null);
                 }
 
-                // Record step
+                // Record step with observation epoch
+                Map<String, Object> enrichedArgs = new HashMap<>(decision.args() != null ? decision.args() : Map.of());
+                enrichedArgs.put("_observationEpoch", observationEpoch);
+                enrichedArgs.put("_observationHash", lastObservationHash);
+
                 TaskStep taskStep = TaskStep.builder()
                     .taskId(taskId)
                     .stepIndex(step)
                     .actionType(decision.actionType())
-                    .actionArgs(decision.args())
+                    .actionArgs(enrichedArgs)
                     .status("RUNNING")
                     .build();
                 taskStepRepository.save(taskStep);
@@ -220,6 +254,13 @@ public class TaskExecutorService {
                     consecutiveFailures = 0;
                     recentActions.add(decision.actionType() + ": " + decision.rationale());
 
+                    // Update observation epoch on state change
+                    String newObsHash = computeObservationHash(result.currentUrl(), result.pageTitle(), result.pageText());
+                    if (!newObsHash.equals(lastObservationHash)) {
+                        observationEpoch++;
+                        lastObservationHash = newObsHash;
+                    }
+
                     if (result.currentUrl() != null && !result.currentUrl().equals(currentUrl)) {
                         currentUrl = result.currentUrl();
                         if (!visitedUrls.contains(currentUrl)) {
@@ -233,7 +274,6 @@ public class TaskExecutorService {
                         pageTitle = result.pageTitle() != null ? result.pageTitle() : "";
                         accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
 
-                        // Save text snippet for significant content
                         if (result.pageText().length() > 100) {
                             String snippet = result.pageText().substring(0, Math.min(2000, result.pageText().length()));
                             textSnippets.add("[" + result.pageTitle() + "] " + snippet);
@@ -244,17 +284,21 @@ public class TaskExecutorService {
                 } else {
                     consecutiveFailures++;
                     log.warn("Task {} step {} failed: {}", taskId, step, result.error());
-                    
+
                     if (consecutiveFailures >= maxRetries) {
                         failTask(task, "Browser action failed " + maxRetries + " times: " + result.error());
                         return;
                     }
-                    // Don't blindly retry; update state and re-observe
                     BrowserState state = browserWorkerClient.getState(taskId, sessionId);
                     if (state.currentUrl() != null) {
                         currentUrl = state.currentUrl();
                         pageText = state.pageText() != null ? state.pageText() : "";
                         pageTitle = state.pageTitle() != null ? state.pageTitle() : "";
+                        String newObsHash = computeObservationHash(currentUrl, pageTitle, pageText);
+                        if (!newObsHash.equals(lastObservationHash)) {
+                            observationEpoch++;
+                            lastObservationHash = newObsHash;
+                        }
                     }
                 }
             }
@@ -279,8 +323,18 @@ public class TaskExecutorService {
                 )
             );
 
-            // Step 5: Verify
-            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome...", maxSteps, Map.of()));
+            // Step 5: Evidence-based verification
+            publishEvent(TaskEvent.stepUpdate(taskId, "VERIFYING", "Verifying outcome against evidence...", maxSteps, Map.of()));
+
+            List<String> evidenceSummary = new ArrayList<>();
+            evidenceSummary.add("Visited " + visitedUrls.size() + " URLs");
+            evidenceSummary.add("Collected " + textSnippets.size() + " text snippets");
+            evidenceSummary.add("Executed " + recentActions.size() + " actions");
+            evidenceSummary.add("Observation epochs: " + observationEpoch);
+            if (!visitedUrls.isEmpty()) {
+                evidenceSummary.add("Final URL: " + currentUrl);
+            }
+
             AiProvider.VerificationResult verification = aiProvider.verify(
                 new AiProvider.VerificationRequest(
                     task.getUserRequest(),
@@ -289,7 +343,8 @@ public class TaskExecutorService {
                     currentUrl,
                     pageText,
                     visitedUrls,
-                    synthesized
+                    synthesized,
+                    evidenceSummary
                 )
             );
 
@@ -467,6 +522,37 @@ public class TaskExecutorService {
         } catch (Exception e) {
             log.warn("Could not save evidence for task {}: {}", taskId, e.getMessage());
         }
+    }
+
+    private String computeActionFingerprint(AiProvider.ActionDecision decision) {
+        String type = decision.actionType();
+        Map<String, Object> args = decision.args() != null ? decision.args() : Map.of();
+        String keyArgs = args.entrySet().stream()
+            .filter(e -> !e.getKey().startsWith("_"))
+            .sorted(Map.Entry.comparingByKey())
+            .map(e -> e.getKey() + "=" + e.getValue())
+            .reduce((a, b) -> a + "&" + b)
+            .orElse("");
+        return type + "|" + keyArgs;
+    }
+
+    private boolean detectNoProgress(List<String> fingerprints) {
+        if (fingerprints.size() < NO_PROGRESS_THRESHOLD) return false;
+        int windowStart = Math.max(0, fingerprints.size() - NO_PROGRESS_WINDOW);
+        List<String> window = fingerprints.subList(windowStart, fingerprints.size());
+        Map<String, Integer> counts = new HashMap<>();
+        for (String fp : window) {
+            int count = counts.merge(fp, 1, Integer::sum);
+            if (count >= NO_PROGRESS_THRESHOLD) return true;
+        }
+        return false;
+    }
+
+    private String computeObservationHash(String url, String title, String text) {
+        String input = (url != null ? url : "") + "|"
+            + (title != null ? title : "") + "|"
+            + (text != null ? text.substring(0, Math.min(500, text.length())) : "");
+        return Integer.toHexString(input.hashCode());
     }
 
     private void publishEvent(TaskEvent event) {
