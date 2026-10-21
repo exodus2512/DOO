@@ -219,9 +219,13 @@ public class GeminiAiProvider implements AiProvider {
             - WAIT: {"milliseconds": 1000}
             - DONE: {"reason": "why we're done"}
 
-            IMPORTANT: Never navigate to file:// URLs or private IPs (10.x, 172.16-31.x, 192.168.x).
-            localhost URLs are allowed when specified in the task.
-            Never fill password fields. Never click purchase/checkout/buy/subscribe buttons.
+            IMPORTANT RULES:
+            - Never navigate to file:// URLs or private IPs (10.x, 172.16-31.x, 192.168.x).
+            - localhost URLs are allowed when specified in the task.
+            - Never fill password fields. Never click purchase/checkout/buy/subscribe buttons.
+            - Do NOT repeat the same action type more than twice in a row. If you have scrolled twice, use EXTRACT_TEXT to capture what you see, or move to the next step.
+            - If the page already contains the information you need, use EXTRACT_TEXT immediately instead of scrolling.
+            - When you have gathered enough information for the task, use DONE.
             """.formatted(
                 request.userRequest(),
                 request.currentStep(),
