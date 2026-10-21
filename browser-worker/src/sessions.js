@@ -4,6 +4,13 @@
  */
 
 const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+const STORAGE_STATE_DIR = process.env.STORAGE_STATE_DIR
+  || path.join(os.homedir(), '.doo-worker', 'storage-states');
+fs.mkdirSync(STORAGE_STATE_DIR, { recursive: true });
 
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 60 * 60 * 1000;  // 60min absolute
 const SESSION_IDLE_MS = Number(process.env.SESSION_IDLE_MS) || 15 * 60 * 1000; // 15min idle
@@ -53,19 +60,20 @@ class SessionManager {
     return this.browser;
   }
 
-  async initSession(taskId) {
+  async initSession(taskId, storageState = null) {
     // Close existing session for this task if any
     await this.closeSession(taskId);
 
     const browser = await this.ensureBrowser();
-    
-    const context = await browser.newContext({
+
+    const contextOptions = {
       viewport: { width: 1280, height: 800 },
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
       ignoreHTTPSErrors: false,
-      // Permissions: none by default
       geolocation: undefined,
-    });
+    };
+    if (storageState) contextOptions.storageState = storageState;
+    const context = await browser.newContext(contextOptions);
 
     // Stealth: override navigator.webdriver
     await context.addInitScript(() => {
@@ -147,6 +155,48 @@ class SessionManager {
   isParked(taskId) {
     const session = this.sessions.get(taskId);
     return session ? session.parked : false;
+  }
+
+  async bringToFront(taskId) {
+    const session = this.sessions.get(taskId);
+    if (!session || !session.page) return false;
+    try {
+      await session.page.bringToFront();
+      return true;
+    } catch (e) {
+      console.warn(`[BrowserWorker] bringToFront failed for ${taskId}:`, e.message);
+      return false;
+    }
+  }
+
+  async saveStorageState(taskId, domain) {
+    const session = this.sessions.get(taskId);
+    if (!session) return false;
+    try {
+      const safeDomain = domain.replace(/[^a-z0-9.-]/gi, '_');
+      const filePath = path.join(STORAGE_STATE_DIR, `${safeDomain}.json`);
+      await session.context.storageState({ path: filePath });
+      console.log(`[BrowserWorker] Saved storage state for ${domain} → ${filePath}`);
+      return true;
+    } catch (e) {
+      console.warn(`[BrowserWorker] Could not save storage state for ${domain}:`, e.message);
+      return false;
+    }
+  }
+
+  async loadStorageState(domain) {
+    try {
+      const safeDomain = domain.replace(/[^a-z0-9.-]/gi, '_');
+      const filePath = path.join(STORAGE_STATE_DIR, `${safeDomain}.json`);
+      if (!fs.existsSync(filePath)) return null;
+      const state = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (!state.cookies && !state.origins) return null;
+      console.log(`[BrowserWorker] Loaded storage state for ${domain}`);
+      return state;
+    } catch (e) {
+      console.warn(`[BrowserWorker] Could not load storage state for ${domain}:`, e.message);
+      return null;
+    }
   }
 
   cancelTask(taskId) {

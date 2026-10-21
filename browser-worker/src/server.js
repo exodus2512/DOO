@@ -37,11 +37,17 @@ app.get('/health', (req, res) => {
 
 // ─── Session Init ────────────────────────────────────────────────────────────
 app.post('/session/init', async (req, res) => {
-  const { taskId } = req.body;
+  const { taskId, domain } = req.body;
   if (!taskId) return res.status(400).json({ error: 'taskId is required' });
 
   try {
-    const sessionId = await sessionManager.initSession(taskId);
+    // Load saved storage state if a domain is provided (enables session reuse)
+    let storageState = null;
+    if (domain) {
+      storageState = await sessionManager.loadStorageState(domain);
+      if (storageState) console.log(`[/session/init] Using saved session for domain: ${domain}`);
+    }
+    const sessionId = await sessionManager.initSession(taskId, storageState);
     console.log(`[/session/init] Session ${sessionId} created for task ${taskId}`);
     res.json({ success: true, sessionId });
   } catch (error) {
@@ -250,6 +256,22 @@ app.post('/session/unpark', async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
+});
+
+// ─── Bring Session to Front (human handoff with HEADLESS=false) ───────────────
+app.post('/session/bring-to-front', async (req, res) => {
+  const { taskId } = req.body;
+  if (!taskId) return res.status(400).json({ error: 'taskId required' });
+  const success = await sessionManager.bringToFront(taskId);
+  res.json({ success });
+});
+
+// ─── Save Storage State (session reuse across tasks) ─────────────────────────
+app.post('/session/save-storage', async (req, res) => {
+  const { taskId, domain } = req.body;
+  if (!taskId || !domain) return res.status(400).json({ error: 'taskId and domain required' });
+  const success = await sessionManager.saveStorageState(taskId, domain);
+  res.json({ success });
 });
 
 // ─── Fill OTP code (bypasses the model — code goes directly to the field) ────
