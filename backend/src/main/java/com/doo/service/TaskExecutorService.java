@@ -198,8 +198,6 @@ public class TaskExecutorService {
             // Structured perception state — updated after each action
             String lastObservationId = null;
             List<Map<String, Object>> lastInteractiveElements = null;
-            int staleRetries = 0;
-            final int MAX_STALE_RETRIES = 2;
             int resolverRetries = 0;
             final int MAX_RESOLVER_RETRIES = 2;
             Instant deadline = Instant.now().plus(Duration.ofMinutes(executionTimeoutMinutes));
@@ -371,6 +369,14 @@ public class TaskExecutorService {
                     ));
                 }
 
+                // Log what we're sending to the worker
+                Object sentElementIndex = actionArgs.get("element_index");
+                Object sentObsId = actionArgs.get("observation_id");
+                if (sentElementIndex != null) {
+                    log.info("Task {} step {} | DISPATCH {} | element_index={} obs_id={} lastKnownObs={}",
+                        taskId, step, decision.actionType(), sentElementIndex, sentObsId, lastObservationId);
+                }
+
                 // Execute action
                 ActionResult result = browserWorkerClient.executeAction(
                     taskId, sessionId, decision.actionType(), actionArgs);
@@ -382,41 +388,21 @@ public class TaskExecutorService {
                 taskStep.setCompletedAt(Instant.now());
                 taskStepRepository.save(taskStep);
 
+                // Log action result for diagnostics
+                log.info("Task {} step {} | {} | success={} | obsId={} | url={}",
+                    taskId, step, decision.actionType(), result.success(),
+                    result.observationId() != null ? result.observationId() : "none",
+                    truncate(result.currentUrl(), 60));
+                if (!result.success()) {
+                    log.warn("Task {} step {} | {} | FAILED: {}", taskId, step, decision.actionType(), result.error());
+                }
+
                 // Handle screenshot
                 if (result.screenshot() != null && !result.screenshot().isBlank()) {
                     String label = (String) decision.args().getOrDefault("label", "Step " + step);
                     saveEvidence(taskId, "SCREENSHOT", label, result.screenshot(), result.currentUrl());
                     publishEvent(TaskEvent.screenshot(taskId, label, result.screenshot()));
                 }
-
-                // Handle STALE_OBSERVATION: re-observe and retry the step without incrementing step counter
-                if (!result.success() && result.error() != null && result.error().startsWith("STALE_OBSERVATION")) {
-                    staleRetries++;
-                    log.info("Task {} step {}: stale observation (retry {}/{})", taskId, step, staleRetries, MAX_STALE_RETRIES);
-                    if (result.observationId() != null) {
-                        lastObservationId = result.observationId();
-                        lastInteractiveElements = result.interactiveElements();
-                    }
-                    if (result.currentUrl() != null && !result.currentUrl().isBlank()) {
-                        currentUrl = result.currentUrl();
-                    }
-                    if (result.pageTitle() != null) pageTitle = result.pageTitle();
-                    if (result.pageText() != null && !result.pageText().isBlank()) {
-                        pageText = result.pageText();
-                        accessibilityTree = result.accessibilityTree() != null ? result.accessibilityTree() : "";
-                    }
-                    lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText);
-                    if (staleRetries <= MAX_STALE_RETRIES) {
-                        if (!recentActionFingerprints.isEmpty()) {
-                            recentActionFingerprints.remove(recentActionFingerprints.size() - 1);
-                        }
-                        step--; // retry this slot with fresh observation
-                        continue;
-                    }
-                    // Max stale retries hit — treat as normal failure
-                    staleRetries = 0;
-                }
-                staleRetries = 0; // reset on non-stale result
 
                 // Handle RESOLVE_FAILED: element resolution failed; retry with fresh observation containing valid indices
                 if (!result.success() && result.error() != null && result.error().contains("RESOLVE_FAILED")) {

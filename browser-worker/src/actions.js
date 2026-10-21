@@ -18,51 +18,92 @@ function formatValidIndices(elements) {
   return '[' + formatted.join(', ') + ']';
 }
 
+function actionLog(taskId, actionType, data) {
+  const ts = new Date().toISOString();
+  const tag = data.success ? 'ACTION_OK' : 'ACTION_FAIL';
+  const parts = [`[${tag}] Task ${taskId} | ${actionType}`];
+  if (data.element_index !== undefined) parts.push(`element_index=${data.element_index}`);
+  if (data.observation_id) parts.push(`obs_id=${data.observation_id}`);
+  if (data.session_obs_id) parts.push(`session_obs_id=${data.session_obs_id}`);
+  if (data.obs_match !== undefined) parts.push(`obs_match=${data.obs_match}`);
+  if (data.resolve_strategy) parts.push(`resolved_via=${data.resolve_strategy}`);
+  if (data.error) parts.push(`error=${data.error}`);
+  if (data.result_obs_id) parts.push(`new_obs_id=${data.result_obs_id}`);
+  console.log(parts.join(' | '));
+}
+
+/**
+ * Resolve the observation to use for element-index actions.
+ * Prefers the session's cached observation (has _locator data), but falls back
+ * to building a fresh observation from the live page if the cached one is stale
+ * or missing. This eliminates the hard STALE_OBSERVATION failure that previously
+ * caused retry loops.
+ */
+async function resolveObservationForAction(page, args, session, taskId) {
+  const requestedObsId = args.observation_id || null;
+  const sessionObs = session?.lastObservation || null;
+  const sessionObsId = sessionObs?.observation_id || null;
+
+  // Case 1: observation_ids match — use the cached observation (has full _locator data)
+  if (requestedObsId && sessionObs && sessionObsId === requestedObsId) {
+    return { observation: sessionObs, match: 'exact', stale: false };
+  }
+
+  // Case 2: mismatch or missing — build a fresh observation from the live page
+  // This is the key fix: instead of returning a hard STALE_OBSERVATION error,
+  // we build a fresh observation that reflects the CURRENT page state.
+  const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
+
+  if (requestedObsId && sessionObsId && sessionObsId !== requestedObsId) {
+    console.warn(`[OBS_STALE] Task ${taskId} | requested=${requestedObsId} session=${sessionObsId} — using fresh obs ${freshObs.observation_id}`);
+  } else if (!sessionObs) {
+    console.warn(`[OBS_MISS] Task ${taskId} | no cached observation — using fresh obs ${freshObs.observation_id}`);
+  }
+
+  // Update session with the fresh observation so subsequent actions stay in sync
+  if (session) {
+    session.lastObservation = freshObs;
+  }
+
+  return { observation: freshObs, match: requestedObsId ? 'fresh_rebuild' : 'none', stale: !!requestedObsId };
+}
+
 /**
  * Execute a single action in the given Playwright page.
  * Returns { success, result, error, observation, screenshot }
  */
 async function executeAction(page, actionType, args = {}, taskId = null, session = null) {
   const validatedAction = validateActionType(actionType);
+  const logData = {
+    element_index: args.element_index,
+    observation_id: args.observation_id || null,
+    session_obs_id: session?.lastObservation?.observation_id || null,
+  };
 
-  // Resolve element_index against the session's stored observation.
-  // The backend sends observation_id + element_index; we look up the full
-  // cached observation (with _locator data) by matching the id.
-  let resolvedObservation = args._observation || null;
-  if (args.observation_id && session && session.lastObservation) {
-    const cached = session.lastObservation;
-    if (cached.observation_id === args.observation_id) {
-      resolvedObservation = cached;
-    } else {
-      // observation_id doesn't match — page changed since the AI saw it
-      const currentUrl = page.url();
+  // Resolve observation for element-index-based actions
+  let resolvedObservation = null;
+  if (args.element_index !== undefined) {
+    const obsResult = await resolveObservationForAction(page, args, session, taskId);
+    resolvedObservation = obsResult.observation;
+    logData.obs_match = obsResult.match;
+
+    if (!resolvedObservation) {
       const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
       const validSummary = formatValidIndices(freshObs.interactive_elements);
-      console.warn(`[RESOLVE_FAILED] Task ${taskId} | observation ${args.observation_id} is stale (page is now ${currentUrl}). Valid indices: ${validSummary}`);
+      logData.success = false;
+      logData.error = 'NO_OBSERVATION';
+      actionLog(taskId, validatedAction, logData);
       return {
         success: false,
-        error: 'STALE_OBSERVATION: observation ' + args.observation_id +
-               ' is stale (page is now ' + currentUrl + '). Current valid indices: ' + validSummary,
+        error: `NO_OBSERVATION: could not obtain observation for element resolution. Valid indices: ${validSummary}`,
         observation: freshObs,
       };
     }
-  }
 
-  // Inject the resolved observation into args so the action handlers can use it
-  if (resolvedObservation && args.element_index !== undefined) {
     args = { ...args, _observation: resolvedObservation };
-  }
-
-  // If element_index was provided but no observation is available, fail with fresh observation
-  if (args.element_index !== undefined && !resolvedObservation) {
-    const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
-    const validSummary = formatValidIndices(freshObs.interactive_elements);
-    console.warn(`[RESOLVE_FAILED] Task ${taskId} | element_index=${args.element_index} specified without valid observation. Valid indices: ${validSummary}`);
-    return {
-      success: false,
-      error: `RESOLVE_FAILED: element_index ${args.element_index} specified but no matching observation found. Current valid indices: ${validSummary}`,
-      observation: freshObs,
-    };
+  } else if (args._observation) {
+    // Non-element-index action that still carries an observation (passthrough)
+    resolvedObservation = args._observation;
   }
 
   try {
@@ -70,6 +111,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
       case 'NAVIGATE': {
         const url = args.url;
         if (!url || !url.trim()) {
+          logData.success = false;
+          logData.error = 'NAVIGATE requires a non-empty url';
+          actionLog(taskId, validatedAction, logData);
           return { success: false, error: 'NAVIGATE requires a non-empty url' };
         }
         validateUrl(url);
@@ -79,11 +123,13 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         });
         await page.waitForTimeout(1000);
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Navigated to ${url}`, observation };
       }
 
       case 'CLICK': {
-        // Support both element_index (new) and selector (legacy) approaches
         let clicked = false;
         const element_index = args.element_index;
 
@@ -94,7 +140,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (err) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | CLICK element_index=${element_index} could not be resolved: ${err.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `RESOLVE_FAILED: ${err.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} could not be resolved (${err.message}). Current valid indices: ${validSummary}`,
@@ -112,7 +160,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (clickErr) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | CLICK element_index=${element_index} interaction failed: ${clickErr.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `CLICK_FAILED: ${clickErr.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} interaction failed (${clickErr.message}). Current valid indices: ${validSummary}`,
@@ -120,9 +170,13 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
             };
           }
         } else {
-          // Legacy selector-based click
           const selector = args.selector || args.text;
-          if (!selector) return { success: false, error: 'CLICK requires element_index or selector' };
+          if (!selector) {
+            logData.success = false;
+            logData.error = 'CLICK requires element_index or selector';
+            actionLog(taskId, validatedAction, logData);
+            return { success: false, error: 'CLICK requires element_index or selector' };
+          }
 
           const strategies = [
             async () => await page.click(selector, { timeout: 5000 }),
@@ -145,6 +199,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         if (!clicked) {
           const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
           const validSummary = formatValidIndices(freshObs.interactive_elements);
+          logData.success = false;
+          logData.error = 'Could not find clickable element';
+          actionLog(taskId, validatedAction, logData);
           return {
             success: false,
             error: `RESOLVE_FAILED: Could not find clickable element. Current valid indices: ${validSummary}`,
@@ -157,12 +214,18 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         } catch { /* if no navigation occurred */ }
         await page.waitForTimeout(500);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Clicked element`, observation };
       }
 
       case 'FILL': {
         const value = args.value !== undefined ? args.value : args.text;
         if (value === undefined) {
+          logData.success = false;
+          logData.error = 'FILL requires value';
+          actionLog(taskId, validatedAction, logData);
           return { success: false, error: 'FILL requires value' };
         }
 
@@ -176,7 +239,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (err) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | FILL element_index=${element_index} could not be resolved: ${err.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `RESOLVE_FAILED: ${err.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} could not be resolved (${err.message}). Current valid indices: ${validSummary}`,
@@ -185,6 +250,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           }
 
           if (resolved._coordinate) {
+            logData.success = false;
+            logData.error = 'Cannot fill coordinate-based element';
+            actionLog(taskId, validatedAction, logData);
             return { success: false, error: 'Cannot fill a coordinate-based element' };
           }
 
@@ -194,7 +262,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (fillErr) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | FILL element_index=${element_index} interaction failed: ${fillErr.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `FILL_FAILED: ${fillErr.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} interaction failed (${fillErr.message}). Current valid indices: ${validSummary}`,
@@ -202,9 +272,13 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
             };
           }
         } else {
-          // Legacy selector-based fill
           const selector = args.selector;
-          if (!selector) return { success: false, error: 'FILL requires element_index or selector' };
+          if (!selector) {
+            logData.success = false;
+            logData.error = 'FILL requires element_index or selector';
+            actionLog(taskId, validatedAction, logData);
+            return { success: false, error: 'FILL requires element_index or selector' };
+          }
 
           try {
             await page.fill(selector, String(value), { timeout: 5000 });
@@ -217,6 +291,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
             } catch (e2) {
               const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
               const validSummary = formatValidIndices(freshObs.interactive_elements);
+              logData.success = false;
+              logData.error = `FILL_FAILED: ${e.message}`;
+              actionLog(taskId, validatedAction, logData);
               return {
                 success: false,
                 error: `RESOLVE_FAILED: Could not fill field '${selector}': ${e.message}. Current valid indices: ${validSummary}`,
@@ -228,12 +305,18 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
 
         await page.waitForTimeout(300);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Filled field with value`, observation };
       }
 
       case 'SELECT_OPTION': {
         const value = args.value;
         if (value === undefined) {
+          logData.success = false;
+          logData.error = 'SELECT_OPTION requires value';
+          actionLog(taskId, validatedAction, logData);
           return { success: false, error: 'SELECT_OPTION requires value' };
         }
 
@@ -245,7 +328,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (err) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | SELECT_OPTION element_index=${element_index} could not be resolved: ${err.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `RESOLVE_FAILED: ${err.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} could not be resolved (${err.message}). Current valid indices: ${validSummary}`,
@@ -254,6 +339,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           }
 
           if (resolved._coordinate) {
+            logData.success = false;
+            logData.error = 'Cannot select on coordinate-based element';
+            actionLog(taskId, validatedAction, logData);
             return { success: false, error: 'Cannot select option on coordinate-based element' };
           }
 
@@ -262,7 +350,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (selErr) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | SELECT_OPTION element_index=${element_index} interaction failed: ${selErr.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `SELECT_FAILED: ${selErr.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${element_index} interaction failed (${selErr.message}). Current valid indices: ${validSummary}`,
@@ -271,7 +361,12 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           }
         } else {
           const selector = args.selector;
-          if (!selector) return { success: false, error: 'SELECT_OPTION requires element_index or selector' };
+          if (!selector) {
+            logData.success = false;
+            logData.error = 'SELECT_OPTION requires element_index or selector';
+            actionLog(taskId, validatedAction, logData);
+            return { success: false, error: 'SELECT_OPTION requires element_index or selector' };
+          }
           await page.selectOption(selector, value, { timeout: 5000 });
         }
 
@@ -280,12 +375,20 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         } catch { /* ignore */ }
         await page.waitForTimeout(500);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Selected option: ${value}`, observation };
       }
 
       case 'PRESS_KEY': {
         const key = args.key;
-        if (!key) return { success: false, error: 'PRESS_KEY requires key' };
+        if (!key) {
+          logData.success = false;
+          logData.error = 'PRESS_KEY requires key';
+          actionLog(taskId, validatedAction, logData);
+          return { success: false, error: 'PRESS_KEY requires key' };
+        }
 
         const SAFE_KEYS = [
           'Enter', 'Tab', 'Escape', 'Backspace', 'Delete',
@@ -293,6 +396,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           'Home', 'End', 'PageUp', 'PageDown', 'Space',
         ];
         if (!SAFE_KEYS.includes(key)) {
+          logData.success = false;
+          logData.error = `Key '${key}' not in safe list`;
+          actionLog(taskId, validatedAction, logData);
           return { success: false, error: `Key '${key}' is not in the safe key list` };
         }
 
@@ -303,7 +409,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (err) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | PRESS_KEY element_index=${args.element_index} could not be resolved: ${err.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `RESOLVE_FAILED: ${err.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${args.element_index} could not be resolved (${err.message}). Current valid indices: ${validSummary}`,
@@ -320,7 +428,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
           } catch (pressErr) {
             const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
             const validSummary = formatValidIndices(freshObs.interactive_elements);
-            console.warn(`[RESOLVE_FAILED] Task ${taskId} | PRESS_KEY element_index=${args.element_index} interaction failed: ${pressErr.message}. Valid indices: ${validSummary}`);
+            logData.success = false;
+            logData.error = `PRESS_FAILED: ${pressErr.message}`;
+            actionLog(taskId, validatedAction, logData);
             return {
               success: false,
               error: `RESOLVE_FAILED: element_index ${args.element_index} interaction failed (${pressErr.message}). Current valid indices: ${validSummary}`,
@@ -338,6 +448,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         }
         await page.waitForTimeout(500);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Pressed key: ${key}`, observation };
       }
 
@@ -358,11 +471,17 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         if (text && text.length > 10000) text = text.substring(0, 10000) + '...';
 
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: text, observation };
       }
 
       case 'SCREENSHOT': {
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return {
           success: true,
           result: `Screenshot captured: ${args.label || 'page state'}`,
@@ -378,6 +497,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         await page.evaluate((dy) => window.scrollBy(0, dy), delta);
         await page.waitForTimeout(300);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Scrolled ${direction} by ${amount}px`, observation };
       }
 
@@ -385,6 +507,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         const ms = Math.min(Number(args.milliseconds) || 1000, 5000);
         await page.waitForTimeout(ms);
         const observation = await buildObservation(page, taskId, { includeScreenshot: false });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: `Waited ${ms}ms`, observation };
       }
 
@@ -392,23 +517,33 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
         await page.goBack({ timeout: 10000 });
         await page.waitForTimeout(500);
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: 'Navigated back', observation };
       }
 
       case 'GET_CONTENT': {
         const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+        logData.success = true;
+        logData.result_obs_id = observation.observation_id;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: 'Page content retrieved', observation };
       }
 
       case 'DONE': {
+        logData.success = true;
+        actionLog(taskId, validatedAction, logData);
         return { success: true, result: args.reason || 'Task execution completed', done: true };
       }
 
       default:
+        logData.success = false;
+        logData.error = `Unknown action: ${validatedAction}`;
+        actionLog(taskId, validatedAction, logData);
         return { success: false, error: `Unknown action: ${validatedAction}` };
     }
   } catch (error) {
-    // On error, still try to get an observation for recovery
     let observation = null;
     try {
       observation = await buildObservation(page, taskId, { includeScreenshot: false });
@@ -425,9 +560,9 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
       ? `RESOLVE_FAILED: ${error.message || String(error)}. Current valid indices: ${validSummary}`
       : `${error.message || String(error)}`;
 
-    if (isResolveFailure) {
-      console.warn(`[RESOLVE_FAILED] Task ${taskId} | Uncaught error: ${error.message}. Valid indices: ${validSummary}`);
-    }
+    logData.success = false;
+    logData.error = errorMsg;
+    actionLog(taskId, validatedAction, logData);
 
     return {
       success: false,
@@ -445,7 +580,6 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
 async function getPageState(page, includeAccessibility = false, taskId = null) {
   const observation = await buildObservation(page, taskId, { includeScreenshot: false });
 
-  // Backward-compatible flat fields
   return {
     currentUrl: observation.url,
     pageTitle: observation.title,

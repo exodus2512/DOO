@@ -115,13 +115,15 @@ app.post('/action/execute', async (req, res) => {
     return res.status(404).json({ success: false, error: 'Session not found. Task may have been cancelled.' });
   }
 
-  console.log(`[/action/execute] Task ${taskId} | ${actionType} | args: ${JSON.stringify(args || {}).substring(0, 100)}`);
+  const safeArgs = args ? { ...args } : {};
+  delete safeArgs._observation; // don't log the large observation blob
+  console.log(`[/action/execute] Task ${taskId} | ${actionType} | args: ${JSON.stringify(safeArgs).substring(0, 200)}`);
 
   try {
     const result = await executeAction(session.page, actionType, args || {}, taskId, session);
 
     if (result.observation) {
-      // Cache full observation on the session for stale-check and element resolution
+      // Cache full observation on the session for element resolution
       session.lastObservation = result.observation;
       const obs = result.observation;
       // Flatten into legacy fields for backward compat
@@ -149,6 +151,7 @@ app.post('/action/execute', async (req, res) => {
       }));
     }
 
+    console.log(`[/action/execute] Task ${taskId} | ${actionType} | success=${result.success} | obsId=${result.observationId || 'none'} | url=${(result.currentUrl || '').substring(0, 60)}`);
     res.json(result);
   } catch (error) {
     console.error(`[/action/execute] Error for task ${taskId}:`, error.message);
