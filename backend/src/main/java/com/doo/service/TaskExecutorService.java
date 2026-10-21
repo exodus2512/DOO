@@ -236,6 +236,9 @@ public class TaskExecutorService {
             // failed clicks (e.g. clicking Login 7 times with "Password is required").
             Integer lastClickElementIndex = null;
             boolean lastClickHadError = false;
+            // Approval dedup cache: keyed by (proposedAction + sorted field names).
+            // Stores the JSON response string so repeated asks reuse the prior answer.
+            Map<String, String> approvalAnswerCache = new HashMap<>();
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -280,6 +283,17 @@ public class TaskExecutorService {
                         approvalParams.put("fields", missingFields);
                         approvalParams.put("reason", askReason);
 
+                        // Dedup: reuse cached answer if this exact field set was answered before
+                        String gateDedupKey = approvalDedupKey("ASK_USER", approvalParams);
+                        String cachedGateResponse = approvalAnswerCache.get(gateDedupKey);
+                        if (cachedGateResponse != null) {
+                            log.info("Task {} step {} | FORM GATE: reusing cached answer (dedup key={})", taskId, step, gateDedupKey);
+                            storeUserValues(cachedGateResponse, knownValues, taskId);
+                            credentialHints = buildFullHints(taskCredentials, knownValues);
+                            recentActions.add("FORM_GATE → CACHED: reused prior answer for " + missingFields.size() + " fields");
+                            continue;
+                        }
+
                         ApprovalRequest gateApproval = ApprovalRequest.builder()
                             .taskId(taskId).prompt(askReason).proposedAction("ASK_USER")
                             .parameters(approvalParams).status("PENDING").build();
@@ -292,6 +306,7 @@ public class TaskExecutorService {
                         ApprovalRequest gateResolved = approvalRepository.findById(gateApproval.getId()).orElse(null);
                         if (gateResolved != null && gateResolved.getUserResponse() != null) {
                             storeUserValues(gateResolved.getUserResponse(), knownValues, taskId);
+                            approvalAnswerCache.put(gateDedupKey, gateResolved.getUserResponse());
                         }
                         // Rebuild credential hints with user-value placeholders
                         credentialHints = buildFullHints(taskCredentials, knownValues);
@@ -370,6 +385,17 @@ public class TaskExecutorService {
                     approvalParams.put("fields", fieldsList);
                     approvalParams.put("reason", askReason);
 
+                    // Dedup: reuse cached answer if this exact field set was answered before
+                    String askDedupKey = approvalDedupKey("ASK_USER", approvalParams);
+                    String cachedAskResponse = approvalAnswerCache.get(askDedupKey);
+                    if (cachedAskResponse != null) {
+                        log.info("Task {} step {} | ASK_USER dedup: reusing cached answer (key={})", taskId, step, askDedupKey);
+                        storeUserValues(cachedAskResponse, knownValues, taskId);
+                        credentialHints = buildFullHints(taskCredentials, knownValues);
+                        recentActions.add("ASK_USER: reused cached answer for " + fieldsList.size() + " fields");
+                        continue;
+                    }
+
                     ApprovalRequest approval = ApprovalRequest.builder()
                         .taskId(taskId)
                         .prompt(askReason)
@@ -392,6 +418,7 @@ public class TaskExecutorService {
                     if (resolved != null && resolved.getUserResponse() != null) {
                         storeUserValues(resolved.getUserResponse(), knownValues, taskId);
                         credentialHints = buildFullHints(taskCredentials, knownValues);
+                        approvalAnswerCache.put(askDedupKey, resolved.getUserResponse());
                     }
 
                     // Restore observation state from unpark
@@ -2023,5 +2050,28 @@ public class TaskExecutorService {
             return gp.getKeyPool().getKeyStates().toString();
         }
         return "N/A";
+    }
+
+    /**
+     * Build a deduplication key for an approval request.
+     * Two approvals with the same proposed action and the same sorted set of field names
+     * are considered equivalent — the second one reuses the first answer.
+     */
+    private static String approvalDedupKey(String proposedAction, Map<String, Object> parameters) {
+        if (parameters == null) return proposedAction + ":{}";
+        Object fieldsObj = parameters.get("fields");
+        String fieldHash = "";
+        if (fieldsObj instanceof List<?> flist) {
+            fieldHash = flist.stream()
+                .filter(f -> f instanceof Map)
+                .map(f -> {
+                    Object name = ((Map<?, ?>) f).get("name");
+                    return name != null ? name.toString() : "";
+                })
+                .filter(s -> !s.isBlank())
+                .sorted()
+                .collect(Collectors.joining(","));
+        }
+        return proposedAction + ":" + fieldHash;
     }
 }
