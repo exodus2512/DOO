@@ -18,19 +18,115 @@ async function humanPause(min = 300, max = 1200) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Map of domain -> timestamp of last navigation
+const domainLastNavTime = new Map();
+// Map of domain -> Promise (queue/lock to ensure 1 page/action at a time per domain)
+const domainQueues = new Map();
+// Map of domain -> consecutive 429/503 backoff attempts
+const domainBackoffAttempts = new Map();
+// Map of domain -> cooldown expiration timestamp (Date.now() + ms)
+const domainCooldowns = new Map();
+
+function getDomainFromUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') return null;
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      return parsed.hostname.toLowerCase();
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Back off on 429 / rate-limit responses.
+ * Ensures only one action/page executes per domain at a time.
+ */
+async function withDomainLock(domain, fn) {
+  if (!domain) return await fn();
+  const previous = domainQueues.get(domain) || Promise.resolve();
+  let release;
+  const current = new Promise(resolve => { release = resolve; });
+  domainQueues.set(domain, current);
+  try {
+    await previous;
+    return await fn();
+  } finally {
+    release();
+    if (domainQueues.get(domain) === current) {
+      domainQueues.delete(domain);
+    }
+  }
+}
+
+/**
+ * Enforce minimum 2 seconds between navigations to the same domain.
+ */
+async function throttleDomainNavigation(domain, minIntervalMs = 2000) {
+  if (!domain) return;
+  const lastNav = domainLastNavTime.get(domain) || 0;
+  const elapsed = Date.now() - lastNav;
+  if (elapsed < minIntervalMs) {
+    const waitMs = minIntervalMs - elapsed;
+    console.log(`[PoliteClient] Rate-limiting navigation to ${domain} (waiting ${waitMs}ms to respect min ${minIntervalMs}ms)`);
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+  }
+}
+
+/**
+ * Back off on 429 / 503 / rate-limit responses honoring Retry-After.
  * @param {import('playwright').Response|null} response
+ * @param {string|null} domain
  * @returns {Promise<void>}
  */
-async function maybeBackoff(response) {
+async function maybeBackoff(response, domain = null) {
   if (!response) return;
-  if (response.status() === 429) {
-    const retryAfter = parseInt(response.headers()['retry-after'] || '5', 10);
-    const waitMs = Math.min(retryAfter * 1000, 30000); // cap at 30 s
-    console.warn(`[429] Rate-limited — waiting ${waitMs}ms before proceeding`);
-    await humanPause(waitMs, waitMs + 500);
+  const status = typeof response.status === 'function' ? response.status() : response.status;
+  if (response.status() === 429 || status === 503) {
+    const headers = typeof response.headers === 'function' ? response.headers() : (response.headers || {});
+    const retryAfter = headers['retry-after'];
+    let waitMs = 0;
+
+    if (retryAfter) {
+      const seconds = parseInt(retryAfter, 10);
+      if (!isNaN(seconds)) {
+        waitMs = seconds * 1000;
+      } else {
+        const parsedDate = Date.parse(retryAfter);
+        if (!isNaN(parsedDate)) {
+          waitMs = Math.max(0, parsedDate - Date.now());
+        }
+      }
+    }
+
+    if (waitMs <= 0) {
+      const attempts = (domain ? (domainBackoffAttempts.get(domain) || 0) : 0) + 1;
+      if (domain) domainBackoffAttempts.set(domain, attempts);
+      waitMs = Math.min(2000 * Math.pow(2, attempts - 1), 30000);
+    } else {
+      waitMs = Math.min(waitMs, 60000);
+    }
+
+    console.warn(`[${status}] Polite backoff — waiting ${waitMs}ms (Retry-After=${retryAfter || 'none'})`);
+    if (domain) {
+      const cooldownMs = Math.max(waitMs, 15 * 60 * 1000);
+      domainCooldowns.set(domain, Date.now() + cooldownMs);
+    }
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+  } else if (status >= 200 && status < 300 && domain) {
+    domainBackoffAttempts.delete(domain);
   }
+}
+
+function getDomainCooldown(domain) {
+  if (!domain) return 0;
+  const expiresAt = domainCooldowns.get(domain) || 0;
+  return Math.max(0, expiresAt - Date.now());
+}
+
+function isDomainInCooldown(domain) {
+  return getDomainCooldown(domain) > 0;
 }
 
 function formatValidIndices(elements) {
@@ -99,62 +195,77 @@ async function resolveObservationForAction(page, args, session, taskId) {
  * Returns { success, result, error, observation, screenshot }
  */
 async function executeAction(page, actionType, args = {}, taskId = null, session = null) {
-  const validatedAction = validateActionType(actionType);
-  const logData = {
-    element_index: args.element_index,
-    observation_id: args.observation_id || null,
-    session_obs_id: session?.lastObservation?.observation_id || null,
-  };
+  const targetDomain = session?.domain
+    || (args.url ? getDomainFromUrl(args.url) : null)
+    || (page && typeof page.url === 'function' ? getDomainFromUrl(page.url()) : null);
 
-  // Resolve observation for element-index-based actions
-  let resolvedObservation = null;
-  if (args.element_index !== undefined) {
-    const obsResult = await resolveObservationForAction(page, args, session, taskId);
-    resolvedObservation = obsResult.observation;
-    logData.obs_match = obsResult.match;
+  return await withDomainLock(targetDomain, async () => {
+    // Randomized human pause before executing action
+    await humanPause(300, 1200);
 
-    if (!resolvedObservation) {
-      const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
-      const validSummary = formatValidIndices(freshObs.interactive_elements);
-      logData.success = false;
-      logData.error = 'NO_OBSERVATION';
-      actionLog(taskId, validatedAction, logData);
-      return {
-        success: false,
-        error: `NO_OBSERVATION: could not obtain observation for element resolution. Valid indices: ${validSummary}`,
-        observation: freshObs,
-      };
+    const validatedAction = validateActionType(actionType);
+    const logData = {
+      element_index: args.element_index,
+      observation_id: args.observation_id || null,
+      session_obs_id: session?.lastObservation?.observation_id || null,
+    };
+
+    // Resolve observation for element-index-based actions
+    let resolvedObservation = null;
+    if (args.element_index !== undefined) {
+      const obsResult = await resolveObservationForAction(page, args, session, taskId);
+      resolvedObservation = obsResult.observation;
+      logData.obs_match = obsResult.match;
+
+      if (!resolvedObservation) {
+        const freshObs = await buildObservation(page, taskId, { includeScreenshot: false });
+        const validSummary = formatValidIndices(freshObs.interactive_elements);
+        logData.success = false;
+        logData.error = 'NO_OBSERVATION';
+        actionLog(taskId, validatedAction, logData);
+        return {
+          success: false,
+          error: `NO_OBSERVATION: could not obtain observation for element resolution. Valid indices: ${validSummary}`,
+          observation: freshObs,
+        };
+      }
+
+      args = { ...args, _observation: resolvedObservation };
+    } else if (args._observation) {
+      // Non-element-index action that still carries an observation (passthrough)
+      resolvedObservation = args._observation;
     }
 
-    args = { ...args, _observation: resolvedObservation };
-  } else if (args._observation) {
-    // Non-element-index action that still carries an observation (passthrough)
-    resolvedObservation = args._observation;
-  }
-
-  try {
-    switch (validatedAction) {
-      case 'NAVIGATE': {
-        const url = args.url;
-        if (!url || !url.trim()) {
-          logData.success = false;
-          logData.error = 'NAVIGATE requires a non-empty url';
+    try {
+      switch (validatedAction) {
+        case 'NAVIGATE': {
+          const url = args.url;
+          if (!url || !url.trim()) {
+            logData.success = false;
+            logData.error = 'NAVIGATE requires a non-empty url';
+            actionLog(taskId, validatedAction, logData);
+            return { success: false, error: 'NAVIGATE requires a non-empty url' };
+          }
+          validateUrl(url);
+          const navDomain = getDomainFromUrl(url);
+          if (navDomain) {
+            await throttleDomainNavigation(navDomain, 2000);
+          }
+          const gotoResponse = await page.goto(url, {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+          });
+          if (navDomain) {
+            domainLastNavTime.set(navDomain, Date.now());
+          }
+          await maybeBackoff(gotoResponse, navDomain);
+          await humanPause(300, 1200);
+          const observation = await buildObservation(page, taskId, { includeScreenshot: true });
+          logData.success = true;
+          logData.result_obs_id = observation.observation_id;
           actionLog(taskId, validatedAction, logData);
-          return { success: false, error: 'NAVIGATE requires a non-empty url' };
+          return { success: true, result: `Navigated to ${url}`, observation };
         }
-        validateUrl(url);
-        const gotoResponse = await page.goto(url, {
-          waitUntil: 'domcontentloaded',
-          timeout: 30000
-        });
-        await maybeBackoff(gotoResponse);
-        await humanPause(700, 1400);
-        const observation = await buildObservation(page, taskId, { includeScreenshot: true });
-        logData.success = true;
-        logData.result_obs_id = observation.observation_id;
-        actionLog(taskId, validatedAction, logData);
-        return { success: true, result: `Navigated to ${url}`, observation };
-      }
 
       case 'CLICK': {
         let clicked = false;
@@ -591,13 +702,14 @@ async function executeAction(page, actionType, args = {}, taskId = null, session
     logData.error = errorMsg;
     actionLog(taskId, validatedAction, logData);
 
-    return {
-      success: false,
-      error: errorMsg,
-      currentUrl: page.url(),
-      observation,
-    };
-  }
+      return {
+        success: false,
+        error: errorMsg,
+        currentUrl: page && typeof page.url === 'function' ? page.url() : '',
+        observation,
+      };
+    }
+  });
 }
 
 /**
@@ -616,4 +728,16 @@ async function getPageState(page, includeAccessibility = false, taskId = null) {
   };
 }
 
-module.exports = { executeAction, getPageState };
+module.exports = {
+  executeAction,
+  getPageState,
+  humanPause,
+  maybeBackoff,
+  throttleDomainNavigation,
+  withDomainLock,
+  getDomainCooldown,
+  isDomainInCooldown,
+  getDomainFromUrl,
+  domainLastNavTime,
+  domainCooldowns,
+};

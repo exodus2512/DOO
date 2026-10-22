@@ -73,16 +73,41 @@ class SessionManager {
   }
 
   _launchArgs() {
-    const args = [
+    return [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
     ];
-    // Keep AutomationControlled disabled — it prevents some bot-detection flags
-    // in real browsers without injecting fake JS properties.
-    args.push('--disable-blink-features=AutomationControlled');
-    return args;
+  }
+
+  async _launchPersistent(profileDir, options) {
+    if (IS_HEADED) {
+      try {
+        console.log(`[BrowserWorker] Launching persistent context with Google Chrome channel...`);
+        return await chromium.launchPersistentContext(profileDir, {
+          ...options,
+          channel: 'chrome',
+        });
+      } catch (err) {
+        console.warn(`[BrowserWorker] 'chrome' channel unavailable (${err.message}), falling back to bundled chromium`);
+        return await chromium.launchPersistentContext(profileDir, options);
+      }
+    }
+    return await chromium.launchPersistentContext(profileDir, options);
+  }
+
+  async _launchBrowser(options) {
+    if (IS_HEADED) {
+      try {
+        console.log(`[BrowserWorker] Launching browser with Google Chrome channel...`);
+        return await chromium.launch({ ...options, channel: 'chrome' });
+      } catch (err) {
+        console.warn(`[BrowserWorker] 'chrome' channel unavailable (${err.message}), falling back to bundled chromium`);
+        return await chromium.launch(options);
+      }
+    }
+    return await chromium.launch(options);
   }
 
   async ensureBrowser() {
@@ -90,8 +115,8 @@ class SessionManager {
     // each domain gets its own launchPersistentContext (see initSession).
     if (PROFILE_MODE !== 'persistent') {
       if (!this.browser || !this.browser.isConnected()) {
-        console.log(`[BrowserWorker] Launching Chromium (headless=${!IS_HEADED})...`);
-        this.browser = await chromium.launch({
+        console.log(`[BrowserWorker] Launching browser (headless=${!IS_HEADED}, headed=${IS_HEADED})...`);
+        this.browser = await this._launchBrowser({
           headless: !IS_HEADED,
           args: this._launchArgs(),
         });
@@ -124,7 +149,7 @@ class SessionManager {
       const profileDir = path.join(PROFILE_DIR, safeDomain);
       fs.mkdirSync(profileDir, { recursive: true });
       console.log(`[BrowserWorker] Using persistent profile for ${domain} (${profileDir})`);
-      context = await chromium.launchPersistentContext(profileDir, {
+      context = await this._launchPersistent(profileDir, {
         headless: !IS_HEADED,
         args: this._launchArgs(),
         ...contextOptions,
@@ -136,7 +161,7 @@ class SessionManager {
       // ensureBrowser() returns null in persistent mode — launch a plain browser for the fallback
       let browser = await this.ensureBrowser();
       if (!browser) {
-        browser = await chromium.launch({ headless: !IS_HEADED, args: this._launchArgs() });
+        browser = await this._launchBrowser({ headless: !IS_HEADED, args: this._launchArgs() });
       }
       context = await browser.newContext(contextOptions);
     }
