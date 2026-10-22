@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Contact Us — Secure Inquiry Form</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; color: #1e293b; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    p { color: #64748b; margin-bottom: 24px; }
+    .form-group { margin-bottom: 16px; }
+    label { display: block; font-weight: 500; margin-bottom: 6px; font-size: 14px; }
+    input[type="text"], input[type="email"], textarea { width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #cbd5e1; border-radius: 6px; box-sizing: border-box; }
+    button { padding: 12px 24px; background: #0f172a; color: white; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
+    /* Invisible reCAPTCHA v3 badge: positioned offscreen/fixed floating */
+    .grecaptcha-badge {
+      width: 256px;
+      height: 60px;
+      display: block;
+      transition: right 0.3s ease;
+      position: fixed;
+      bottom: 14px;
+      right: -186px;
+      box-shadow: gray 0px 0px 5px;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+  </style>
+</head>
+<body>
+  <h1>Send us a message</h1>
+  <p>Fill out the form below and our team will get back to you shortly.</p>
+  <form id="contact-form">
+    <div class="form-group">
+      <label for="name">Your Name</label>
+      <input type="text" id="name" name="name" placeholder="Alice Smith" required />
+    </div>
+    <div class="form-group">
+      <label for="email">Work Email</label>
+      <input type="email" id="email" name="email" placeholder="alice@example.com" required />
+    </div>
+    <div class="form-group">
+      <label for="message">Message</label>
+      <textarea id="message" name="message" rows="4" placeholder="How can we assist you?"></textarea>
+    </div>
+    <button type="submit">Submit Inquiry</button>
+
+    <!-- Invisible badge should NOT be treated as a visible challenge gate -->
+    <div class="grecaptcha-badge">
+      <div class="grecaptcha-logo">
+        <iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&amp;k=6Lc_mock_invisible&amp;size=invisible" width="256" height="60" role="presentation" name="a-mock" frameborder="0" scrolling="no"></iframe>
+      </div>
+    </div>
+  </form>
+</body>
+</html>

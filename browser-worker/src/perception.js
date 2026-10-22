@@ -399,12 +399,21 @@ async function buildObservation(page, taskId, options = {}) {
     }));
   } catch { /* continue with defaults */ }
 
+  const pageState = classifyPage({
+    url: currentUrl,
+    title: pageTitle,
+    page_text: pageTextResult,
+    interactive_elements: interactiveElements,
+    challenges: challenges.length > 0 ? challenges : null,
+  }, options.responseStatus || 200);
+
   return {
     schema_version: SCHEMA_VERSION,
     observation_id: observationId,
     task_id: taskId,
     url: currentUrl,
     title: pageTitle,
+    page_state: pageState,
     observed_at: observedAt,
     page_text: {
       text: pageTextResult.text,
@@ -419,8 +428,95 @@ async function buildObservation(page, taskId, options = {}) {
       interactive_elements_truncated: elementsTruncated,
       page_text_truncated: pageTextResult.truncated,
       page_text_length: pageTextResult.text.length,
+      page_state: pageState,
     },
   };
+}
+
+/**
+ * Classify page state: NORMAL / LOGIN / CAPTCHA_VISIBLE / BOT_BLOCK
+ * @param {object} observation
+ * @param {number} [responseStatus=200]
+ * @param {object} [responseHeaders={}]
+ * @returns {'NORMAL' | 'LOGIN' | 'CAPTCHA_VISIBLE' | 'BOT_BLOCK'}
+ */
+function classifyPage(observation, responseStatus = 200, responseHeaders = {}) {
+  const status = Number(responseStatus) || 200;
+  const title = (observation?.title || '').toLowerCase();
+  const text = (observation?.page_text?.text || '').toLowerCase();
+  const challenges = observation?.challenges || [];
+
+  // 1. Check BOT_BLOCK first (HTTP 403/429 or explicit bot-block markers)
+  if (status === 403 || status === 429) {
+    return 'BOT_BLOCK';
+  }
+
+  const BOT_BLOCK_TITLE_PATTERNS = [
+    'attention required! | cloudflare',
+    'just a moment...',
+    'just a moment',
+    'access denied',
+    '403 forbidden',
+    'pardon our interruption',
+    'security check',
+  ];
+
+  const BOT_BLOCK_TEXT_PATTERNS = [
+    'attention required! | cloudflare',
+    'just a moment...',
+    'cf-browser-verification',
+    'cloudflare ray id',
+    'unusual traffic from your computer network',
+    'unusual traffic',
+    'access denied',
+    'pardon our interruption',
+    'why have i been blocked',
+    'this website is using a security service to protect itself',
+  ];
+
+  for (const pat of BOT_BLOCK_TITLE_PATTERNS) {
+    if (title.includes(pat)) return 'BOT_BLOCK';
+  }
+
+  for (const pat of BOT_BLOCK_TEXT_PATTERNS) {
+    if (text.includes(pat)) return 'BOT_BLOCK';
+  }
+
+  if (challenges.some(c => c.type === 'bot_block')) {
+    return 'BOT_BLOCK';
+  }
+
+  // 2. Check CAPTCHA_VISIBLE: active visible challenge requiring human
+  const hasVisibleCaptcha = challenges.some(c => c.type === 'captcha');
+  if (hasVisibleCaptcha) {
+    return 'CAPTCHA_VISIBLE';
+  }
+
+  // 3. Check LOGIN: password field or authentication surface
+  const elements = observation?.interactive_elements || [];
+  const hasPasswordField = elements.some(el =>
+    el.type === 'password' ||
+    (el.tag === 'INPUT' && (el.name === 'password' || el.id === 'password'))
+  );
+  if (hasPasswordField) {
+    return 'LOGIN';
+  }
+
+  const url = (observation?.url || '').toLowerCase();
+  if (url.includes('/login') || url.includes('/signin') || url.includes('/auth')) {
+    const hasIdentifierField = elements.some(el =>
+      el.role === 'textbox' || el.tag === 'INPUT'
+    );
+    if (hasIdentifierField && elements.some(el => {
+      const lbl = (el.text || el.label || '').toLowerCase();
+      return lbl.includes('log in') || lbl.includes('sign in');
+    })) {
+      return 'LOGIN';
+    }
+  }
+
+  // 4. Default: NORMAL
+  return 'NORMAL';
 }
 
 /**
@@ -515,6 +611,7 @@ module.exports = {
   buildObservation,
   resolveElement,
   generateObservationId,
+  classifyPage,
   SCHEMA_VERSION,
   MAX_PAGE_TEXT_LENGTH,
   MAX_INTERACTIVE_ELEMENTS,

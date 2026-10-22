@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Security Verification Required</title>
+  <style>
+    body { font-family: system-ui, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; background: #f8fafc; }
+    .card { background: white; padding: 32px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); width: 380px; text-align: center; }
+    h2 { font-size: 20px; color: #1e293b; margin-top: 0; }
+    p { font-size: 14px; color: #64748b; margin-bottom: 24px; }
+    .captcha-container { display: flex; justify-content: center; margin: 20px 0; }
+    iframe { width: 304px; height: 78px; border: 1px solid #d1d5db; border-radius: 4px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h2>Human Verification</h2>
+    <p>Please check the box below to confirm you are not an automated program.</p>
+    <div class="captcha-container">
+      <!-- Visible reCAPTCHA v2 anchor iframe (in viewport, ratio >= 0.7) -->
+      <iframe src="https://www.google.com/recaptcha/api2/anchor?ar=1&amp;k=6Le-wvkSAAAAAPBZYSqqW0Q36XPquYIIgEkA7&amp;co=aHR0cHM6Ly9leGFtcGxlLmNvbTo0NDM.&amp;hl=en&amp;v=123" title="reCAPTCHA"></iframe>
+    </div>
+    <p style="font-size: 12px; color: #94a3b8;">Protected by reCAPTCHA v2</p>
+  </div>
+</body>
+</html>
