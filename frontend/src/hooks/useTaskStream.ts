@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useCallback } from 'react';
 import { api } from '@/lib/api';
+import { dooLogger } from '@/lib/logger';
 
 export interface TaskStreamEvent {
   taskId: string;
@@ -56,6 +57,10 @@ export function useTaskStream(
 
         reconnectCount.current = 0;
 
+        if (data.eventType === 'connected') {
+          dooLogger.streamEvent('connected', `Real-time stream connected for task ${taskId}`, data);
+        }
+
         if (
           data.eventType === 'completed' ||
           data.eventType === 'error' ||
@@ -84,7 +89,7 @@ export function useTaskStream(
       if (reconnectCount.current < MAX_RECONNECTS) {
         reconnectCount.current++;
         const delay = backoffMs(reconnectCount.current);
-        console.log(`[DOO] SSE dropped (attempt ${reconnectCount.current}/${MAX_RECONNECTS}), reconnecting in ${delay}ms...`);
+        dooLogger.streamEvent('reconnect', `SSE connection dropped (attempt ${reconnectCount.current}/${MAX_RECONNECTS}), reconnecting in ${delay}ms...`);
         reconnectTimer.current = setTimeout(() => {
           // Re-fetch latest state before reconnecting so the UI isn't stale
           onReconnectRef.current?.();

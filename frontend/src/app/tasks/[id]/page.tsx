@@ -31,6 +31,7 @@ import StepTimeline from '@/components/StepTimeline';
 import ApprovalModal from '@/components/ApprovalModal';
 import ResultCard from '@/components/ResultCard';
 import EvidenceGallery from '@/components/EvidenceGallery';
+import { dooLogger } from '@/lib/logger';
 
 export default function TaskDetailPage() {
   const router = useRouter();
@@ -116,19 +117,30 @@ export default function TaskDetailPage() {
   // Reactive SSE listener
   useTaskStream(taskId, (event: TaskStreamEvent) => {
     if (event.eventType === 'debug') {
-      const data = event.data as any;
-      const keyPool = data?.keyPool || '';
-      console.log(`%c[DOO] ${event.message}`, 'color: #38bdf8; font-weight: bold', keyPool ? `| keys: ${keyPool}` : '');
+      dooLogger.handleBackendMessage(event.message, event.data);
       return;
     }
 
     // Workflow type update (published right after classification)
     if (event.eventType === 'task_updated' && event.data?.workflowType) {
+      dooLogger.stage(
+        1,
+        'CLASSIFY',
+        `Workflow classified as ${event.data.workflowType}`,
+        event.data
+      );
       setTask((prev) => prev ? { ...prev, workflowType: event.data.workflowType as any } : null);
       return;
     }
 
     if (event.status) {
+      dooLogger.streamEvent('status_change', `Task status transitioned to: ${event.status}`, {
+        status: event.status,
+        message: event.message,
+      });
+      if (event.status === 'VERIFYING') {
+        dooLogger.stage(5, 'VERIFY', 'Validating final task outcome against success criteria', event.data);
+      }
       setTask((prev) => (prev ? { ...prev, status: event.status as any } : null));
     }
 
@@ -151,6 +163,13 @@ export default function TaskDetailPage() {
         completedAt: rawData.completedAt || null,
       };
 
+      dooLogger.stage(
+        3,
+        'SELECT_ACTION',
+        `Browser action: ${newStep.actionType} (Step ${newStep.stepNumber}) ${newStep.target ? '-> ' + newStep.target : ''}`,
+        newStep
+      );
+
       setSteps((prev) => {
         const index = prev.findIndex(
           (s) => (s.stepNumber ?? s.stepIndex) === (newStep.stepNumber ?? newStep.stepIndex)
@@ -170,6 +189,7 @@ export default function TaskDetailPage() {
 
     if (event.eventType === 'screenshot' && event.data) {
       const data = event.data as any;
+      dooLogger.streamEvent('screenshot', 'Visual proof snapshot captured', { url: data?.url });
       if (typeof data.base64 === 'string') {
         setLiveScreenshot(data.base64);
       } else if (typeof data.content === 'string') {
@@ -200,6 +220,7 @@ export default function TaskDetailPage() {
         expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
         resolvedAt: null,
       };
+      dooLogger.streamEvent('live_view', 'Interactive live view session active for user handoff', normalized);
       setPendingApproval(normalized);
     }
 
@@ -219,7 +240,11 @@ export default function TaskDetailPage() {
         expiresAt: d.expiresAt || new Date(Date.now() + 30 * 60 * 1000).toISOString(),
         resolvedAt: null,
       };
-      console.log('[GATE] login detected — waiting for credentials', normalized);
+      dooLogger.streamEvent(
+        'approval_required',
+        `Approval Gate: ${normalized.proposedAction || normalized.parameters?.type} — waiting for user input`,
+        normalized
+      );
       setPendingApproval(normalized);
     }
 
@@ -229,6 +254,12 @@ export default function TaskDetailPage() {
       event.status === 'PARTIAL' ||
       event.status === 'FAILED'
     ) {
+      dooLogger.stage(
+        5,
+        'VERIFY',
+        `Task finished with status: ${event.status || 'COMPLETED'}`,
+        event.data
+      );
       api.getResult(taskId).then(setResult).catch(console.error);
       api.getEvidence(taskId).then(setArtifacts).catch(console.error);
       setPendingApproval(null);
@@ -237,6 +268,12 @@ export default function TaskDetailPage() {
 
   const handleCancel = async () => {
     if (!task || actionInProgress) return;
+    dooLogger.userEvent({
+      event: 'User Cancel Click',
+      process: 'User clicked Cancel button; requesting backend to stop execution loop',
+      data: { taskId },
+      nextStep: 'Calling api.cancelTask',
+    });
     try {
       setActionInProgress(true);
       await api.cancelTask(taskId);
@@ -250,6 +287,12 @@ export default function TaskDetailPage() {
 
   const handleApprove = async (reason?: string) => {
     if (!pendingApproval) return;
+    dooLogger.userEvent({
+      event: 'User Approve Click',
+      process: 'User confirmed approval modal; submitting response to resolve gate',
+      data: { taskId, approvalId: pendingApproval.id, reason },
+      nextStep: 'Calling api.resolveApproval with approved=true',
+    });
     try {
       setActionInProgress(true);
       await api.resolveApproval(taskId, pendingApproval.id, true, reason);
@@ -264,6 +307,12 @@ export default function TaskDetailPage() {
 
   const handleReject = async (reason?: string) => {
     if (!pendingApproval) return;
+    dooLogger.userEvent({
+      event: 'User Reject Click',
+      process: 'User rejected approval modal; notifying backend execution engine',
+      data: { taskId, approvalId: pendingApproval.id, reason },
+      nextStep: 'Calling api.resolveApproval with approved=false',
+    });
     try {
       setActionInProgress(true);
       await api.resolveApproval(taskId, pendingApproval.id, false, reason);

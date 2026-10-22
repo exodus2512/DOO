@@ -15,6 +15,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+import { dooLogger } from '@/lib/logger';
 
 export default function HomePage() {
   const router = useRouter();
@@ -54,12 +55,25 @@ export default function HomePage() {
     const cleanPrompt = prompt.trim();
     if (!cleanPrompt || isSubmitting) return;
 
+    dooLogger.userEvent({
+      event: 'Submit Task Button Clicked',
+      process: 'User submitted task prompt from composer; initiating task creation API call',
+      data: { prompt: cleanPrompt },
+      nextStep: 'Request dispatched to POST /api/tasks; will redirect to /tasks/:id',
+    });
+
     setIsSubmitting(true);
     setError(null);
 
     try {
       const task = await api.createTask({
         userRequest: cleanPrompt,
+      });
+      dooLogger.userEvent({
+        event: 'Task Created Successfully',
+        process: `Task ${task.id} initialized with status ${task.status}; transitioning browser to detail view`,
+        data: { taskId: task.id, status: task.status, workflowType: task.workflowType },
+        nextStep: `Opening /tasks/${task.id} to stream real-time execution stages`,
       });
       router.push(`/tasks/${task.id}`);
     } catch (err: any) {
@@ -155,7 +169,15 @@ export default function HomePage() {
             return (
               <div
                 key={idx}
-                onClick={() => setPrompt(item.query)}
+                onClick={() => {
+                  dooLogger.userEvent({
+                    event: 'Benchmark Workflow Selected',
+                    process: `User populated task composer with "${item.title}"`,
+                    data: { badge: item.badge, title: item.title, prompt: item.query },
+                    nextStep: 'Ready for user edit or direct submission',
+                  });
+                  setPrompt(item.query);
+                }}
                 className={`p-4 rounded-2xl border bg-gradient-to-br ${item.color} hover:border-sky-400/50 transition-all cursor-pointer group flex flex-col justify-between space-y-3 shadow-md hover:shadow-sky-500/10`}
               >
                 <div>

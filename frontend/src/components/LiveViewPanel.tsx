@@ -12,6 +12,7 @@ import {
   WifiOff,
   ExternalLink,
 } from 'lucide-react';
+import { dooLogger } from '@/lib/logger';
 
 export interface LiveViewPanelProps {
   wsUrl?: string;
@@ -122,6 +123,12 @@ export default function LiveViewPanel({
   const sendWs = useCallback((payload: Record<string, unknown>) => {
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
+        dooLogger.userEvent({
+          event: `Live View Input: ${String(payload.type || 'action')}`,
+          process: 'Relaying user browser input to remote Playwright session via WebSocket',
+          data: payload,
+          nextStep: 'Remote browser executes action directly in active browser context',
+        });
         wsRef.current.send(JSON.stringify(payload));
       } catch (err) {
         console.debug('[LiveView] send error:', err);
@@ -402,7 +409,14 @@ export default function LiveViewPanel({
           <button
             type="button"
             data-testid="live-view-resume-btn"
-            onClick={onResume}
+            onClick={() => {
+              dooLogger.userEvent({
+                event: 'Live View: Resume Agent Clicked',
+                process: 'User finished manual intervention; signaling autonomous agent to resume execution',
+                nextStep: 'Resolving live view gate and resuming main execution loop',
+              });
+              onResume();
+            }}
             disabled={isSubmitting}
             className="flex items-center justify-center space-x-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-emerald-400 to-teal-400 hover:from-emerald-300 hover:to-teal-300 shadow-md shadow-emerald-500/20 transition-all disabled:opacity-50 font-bold"
           >

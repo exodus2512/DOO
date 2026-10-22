@@ -4,6 +4,7 @@ import React, { useState } from 'react';
 import { CheckCircle2, XCircle, ShieldAlert, Clock, KeyRound, Eye, EyeOff, MessageSquareText, LogIn } from 'lucide-react';
 import { ApprovalRequest } from '@/lib/api';
 import LiveViewPanel from './LiveViewPanel';
+import { dooLogger } from '@/lib/logger';
 
 interface ApprovalModalProps {
   approval: ApprovalRequest | null;
@@ -224,19 +225,54 @@ export default function ApprovalModal({
       } else if (authChoice === 'phone') {
         payload.phone = authPhone;
       }
+      dooLogger.userEvent({
+        event: 'Auth Gate Response Submitted',
+        process: `User approved auth gate for ${domain} with method: ${authChoice}`,
+        data: payload,
+        nextStep: 'Submitting response to backend; agent will continue sign-in workflow',
+      });
       onApprove(JSON.stringify(payload));
     } else if (isCred) {
       const payload = JSON.stringify({ username, password, saveToVault });
+      dooLogger.userEvent({
+        event: 'Credentials Form Submitted',
+        process: `User submitted credentials for ${domain}`,
+        data: { username, password: '•••••••• (protected)', saveToVault },
+        nextStep: 'Submitting credentials to backend',
+      });
       onApprove(payload);
     } else if (isOtp) {
       const payload = JSON.stringify({ otpCode });
+      dooLogger.userEvent({
+        event: 'OTP Verification Code Submitted',
+        process: 'User provided OTP code for two-factor authentication',
+        data: { otpCode },
+        nextStep: 'Submitting OTP to backend',
+      });
       onApprove(payload);
     } else if (isCaptcha) {
+      dooLogger.userEvent({
+        event: 'CAPTCHA Confirmation Submitted',
+        process: 'User confirmed CAPTCHA was solved in browser session',
+        nextStep: 'Resuming task execution',
+      });
       onApprove('captcha_solved');
     } else if (isAskUser) {
       const payload = JSON.stringify(formValues);
+      dooLogger.userEvent({
+        event: 'Form Input Data Submitted',
+        process: 'User submitted requested form information',
+        data: formValues,
+        nextStep: 'Submitting form values to backend knownValues pool',
+      });
       onApprove(payload);
     } else {
+      dooLogger.userEvent({
+        event: 'Sensitive Action Approved',
+        process: 'User confirmed action approval in modal',
+        data: { comment },
+        nextStep: 'Execution engine will proceed with proposed action',
+      });
       onApprove(comment);
     }
   };
@@ -338,7 +374,15 @@ export default function ApprovalModal({
                       key={opt.value}
                       type="button"
                       data-testid={`bot-block-btn-${opt.value}`}
-                      onClick={() => onApprove(opt.value)}
+                      onClick={() => {
+                        dooLogger.userEvent({
+                          event: 'Bot Block Resolution Selected',
+                          process: `User selected "${opt.label}" (${opt.value}) in response to site block challenge`,
+                          data: { choice: opt.value },
+                          nextStep: opt.value === 'open_live_view' ? 'Opening interactive live view session' : 'Executing chosen fallback',
+                        });
+                        onApprove(opt.value);
+                      }}
                       disabled={isSubmitting}
                       className={
                         isPrimary
@@ -608,7 +652,15 @@ export default function ApprovalModal({
           <div className="p-5 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-end space-x-3">
             <button
               type="button"
-              onClick={() => onReject(comment)}
+              onClick={() => {
+                dooLogger.userEvent({
+                  event: 'Approval Modal Rejected/Skipped',
+                  process: 'User clicked Reject/Skip button in approval modal',
+                  data: { comment },
+                  nextStep: 'Notifying backend to skip or abort operation',
+                });
+                onReject(comment);
+              }}
               disabled={isSubmitting}
               className="flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/40 transition-colors disabled:opacity-50"
             >
