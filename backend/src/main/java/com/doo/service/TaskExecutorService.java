@@ -308,6 +308,7 @@ public class TaskExecutorService {
             // Per-domain bot block attempt counter — capped at MAX_BOT_BLOCK_ATTEMPTS.
             Map<String, Integer> botBlockAttempts = new HashMap<>();
             final int MAX_BOT_BLOCK_ATTEMPTS = 2;
+            Set<String> signupRedirectedDomains = new HashSet<>();
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -329,6 +330,16 @@ public class TaskExecutorService {
 
                 log.debug("Task {} step {}/{} epoch={}", taskId, step, maxSteps, observationEpoch);
 
+                // Check for email confirmation state at loop-top
+                if (isConfirmationEmailState(pageText)) {
+                    String confirmDomain = extractDomain(currentUrl);
+                    String domainKey = confirmDomain != null ? confirmDomain : "The site";
+                    String failMsg = domainKey + " sent a confirmation email, which DOO cannot read. Use password login or handoff.";
+                    log.warn("Task {} step {} | Confirmation email state detected: {}", taskId, step, failMsg);
+                    failTask(task, failMsg);
+                    return;
+                }
+
                 // ── Auth surface gate ──────────────────────────────────────────────────────
                 // After observing a new page, detect auth surfaces in the DOM and show a card
                 // matching what is actually available. This replaces plan-text credential scanning.
@@ -336,6 +347,34 @@ public class TaskExecutorService {
                     String authDomain = extractDomain(currentUrl);
                     if (authDomain != null && !authHandledDomains.contains(authDomain)
                             && !taskCredentials.containsKey(authDomain)) {
+
+                        // Detect sign-up vs log-in forms and prefer navigating to the log-in form before offering login methods
+                        if (isSignupSurface(currentUrl, pageText, lastInteractiveElements)
+                                && !signupRedirectedDomains.contains(authDomain)) {
+                            Map<String, Object> loginLink = findLoginLinkOnSignupPage(lastInteractiveElements);
+                            if (loginLink != null && loginLink.get("index") != null) {
+                                signupRedirectedDomains.add(authDomain);
+                                int eidx = ((Number) loginLink.get("index")).intValue();
+                                log.info("Task {} step {} | Detected sign-up form on {}; navigating to log-in via element {}",
+                                    taskId, step, authDomain, eidx);
+                                recentActions.add("Detected sign-up form; clicked 'Sign in' link to reach login page");
+                                ActionResult clickRes = browserWorkerClient.executeAction(
+                                    taskId, sessionId, "CLICK", Map.of("element_index", eidx,
+                                        "observation_id", lastObservationId != null ? lastObservationId : "")
+                                );
+                                if (clickRes != null) {
+                                    if (clickRes.currentUrl() != null && !clickRes.currentUrl().isBlank()) currentUrl = clickRes.currentUrl();
+                                    if (clickRes.pageTitle() != null) pageTitle = clickRes.pageTitle();
+                                    if (clickRes.pageText() != null) pageText = clickRes.pageText();
+                                    if (clickRes.interactiveElements() != null) lastInteractiveElements = clickRes.interactiveElements();
+                                    if (clickRes.observationId() != null) lastObservationId = clickRes.observationId();
+                                    lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                                    observationEpoch++;
+                                }
+                                continue;
+                            }
+                        }
+
                         AuthSurface authSurface = detectAuthSurface(lastInteractiveElements, pageText, currentUrl);
                         if (authSurface.isAuthPage()) {
                             log.info("Task {} step {} | AUTH GATE: auth surface on {} (password={}, oauth={}, emailOnly={})",
@@ -349,9 +388,15 @@ public class TaskExecutorService {
                                 authOptions.add(Map.of("value", "password", "label", "Enter username + password",
                                     "description", "Provide credentials and the agent will fill them."));
                             }
+                            boolean mentionsEmailLink = pageText != null && EMAIL_LINK_MENTION_PATTERN.matcher(pageText).find();
                             if (authSurface.hasEmailOnlyForm()) {
-                                authOptions.add(Map.of("value", "email_link", "label", "Enter email address",
-                                    "description", "Receive a magic link or verification code."));
+                                if (mentionsEmailLink) {
+                                    authOptions.add(Map.of("value", "email_link", "label", "Enter email address",
+                                        "description", "Receive a magic link or verification code."));
+                                } else {
+                                    authOptions.add(Map.of("value", "email_link", "label", "Continue with email",
+                                        "description", "Enter your email address to continue."));
+                                }
                             }
                             if (authSurface.hasPhoneOtp()) {
                                 authOptions.add(Map.of("value", "phone", "label", "Enter phone number",
@@ -362,12 +407,13 @@ public class TaskExecutorService {
                                     "label", "OAuth: " + String.join(", ", authSurface.oauthProviders()),
                                     "description", "Choose 'Sign in in the browser' to use a social login."));
                             }
+                            String emailMethodLabel = mentionsEmailLink ? "Email link" : "Continue with email";
                             String authMethods = !authSurface.oauthProviders().isEmpty()
                                 ? String.join(", ", authSurface.oauthProviders())
                                     + (authSurface.hasPasswordForm() ? ", Email+Password" : "")
-                                    + (authSurface.hasEmailOnlyForm() ? ", Email link" : "")
+                                    + (authSurface.hasEmailOnlyForm() ? ", " + emailMethodLabel : "")
                                 : (authSurface.hasPasswordForm() ? "Email+Password"
-                                    : (authSurface.hasEmailOnlyForm() ? "Email link" : "Phone/OTP"));
+                                    : (authSurface.hasEmailOnlyForm() ? emailMethodLabel : "Phone/OTP"));
                             String authReason = "Login required. Available sign-in methods: " + authMethods;
                             Map<String, Object> authParams = new HashMap<>();
                             authParams.put("type", "auth_gate");
@@ -1150,6 +1196,16 @@ public class TaskExecutorService {
                 }
                 if (result.screenshot() != null) {
                     lastScreenshot = result.screenshot();
+                }
+
+                // Check for email confirmation state after action execution
+                if (isConfirmationEmailState(pageText)) {
+                    String confirmDomain = extractDomain(currentUrl);
+                    String domainKey = confirmDomain != null ? confirmDomain : "The site";
+                    String failMsg = domainKey + " sent a confirmation email, which DOO cannot read. Use password login or handoff.";
+                    log.warn("Task {} step {} | Confirmation email state detected after action: {}", taskId, step, failMsg);
+                    failTask(task, failMsg);
+                    return;
                 }
 
                 // Handle bot_block BEFORE CAPTCHA — different options, never loops
@@ -1957,6 +2013,71 @@ public class TaskExecutorService {
     public static boolean verifyLoggedIn(
             List<Map<String, Object>> elements, String pageText, String url, AuthSurface authSurface) {
         return verifyLoginStatus(elements, pageText, url, authSurface).verified();
+    }
+
+    // ─── Email Link & Confirmation Email patterns ─────────────────────────────────
+
+    private static final java.util.regex.Pattern EMAIL_LINK_MENTION_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)(email\\s+(you\\s+)?a\\s+link|magic\\s+link|verification\\s+code|sign\\s+in\\s+link|link\\s+to\\s+sign\\s+in)"
+    );
+
+    private static final java.util.regex.Pattern EMAIL_CONFIRMATION_SENT_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)(check\\s+your\\s+(inbox|email)|confirm\\s+your\\s+email|sent\\s+(you\\s+)?(a|an)?\\s*(\\w+\\s+)*(email|link|code|verification)|magic\\s+link\\s+sent|verification\\s+email\\s+sent|link\\s+sent\\s+to\\s+your\\s+email)"
+    );
+
+    private static final java.util.regex.Pattern SIGNUP_URL_PATTERN = java.util.regex.Pattern.compile(
+        ".*/(signup|sign-up|register|join|create-account).*",
+        java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    private static final java.util.regex.Pattern SIGNUP_TEXT_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)\\b(create\\s+(your|an?)?\\s*account|sign\\s*up|join\\s+(today|now)?|register\\s+now|new\\s+user\\?)\\b"
+    );
+
+    private static final java.util.regex.Pattern LOGIN_LINK_ON_SIGNUP_PATTERN = java.util.regex.Pattern.compile(
+        "(?i)\\b(log\\s*in|sign\\s*in|already\\s+have\\s+an?\\s+account|sign\\s*in\\s*instead)\\b"
+    );
+
+    public static boolean isConfirmationEmailState(String pageText) {
+        if (pageText == null || pageText.isBlank()) return false;
+        String sample = pageText.substring(0, Math.min(2000, pageText.length()));
+        return EMAIL_CONFIRMATION_SENT_PATTERN.matcher(sample).find();
+    }
+
+    public static boolean isSignupSurface(String url, String pageText, List<Map<String, Object>> elements) {
+        if (url != null && SIGNUP_URL_PATTERN.matcher(url).find()) return true;
+        if (pageText != null) {
+            String sample = pageText.substring(0, Math.min(1000, pageText.length()));
+            if (SIGNUP_TEXT_PATTERN.matcher(sample).find()) return true;
+        }
+        return false;
+    }
+
+    public static Map<String, Object> findLoginLinkOnSignupPage(List<Map<String, Object>> elements) {
+        if (elements == null) return null;
+        for (Map<String, Object> el : elements) {
+            String role = String.valueOf(el.getOrDefault("role", ""));
+            String tag = String.valueOf(el.getOrDefault("tag", ""));
+            if (!"link".equalsIgnoreCase(role) && !"button".equalsIgnoreCase(role)
+                    && !"a".equalsIgnoreCase(tag) && !"button".equalsIgnoreCase(tag)) {
+                continue;
+            }
+            String text = String.valueOf(el.getOrDefault("text", ""));
+            String label = String.valueOf(el.getOrDefault("label", ""));
+            String href = String.valueOf(el.getOrDefault("href", "")).toLowerCase();
+            String combined = (text + " " + label).toLowerCase();
+
+            // Ignore OAuth buttons (e.g. Sign in with Google)
+            if (OAUTH_PROVIDER_PATTERN.matcher(combined).find()) continue;
+
+            if (LOGIN_LINK_ON_SIGNUP_PATTERN.matcher(combined).find()
+                    || href.contains("login") || href.contains("signin") || href.contains("sign-in")) {
+                if (el.get("index") != null) {
+                    return el;
+                }
+            }
+        }
+        return null;
     }
 
     // ─── Confirmation signal patterns ─────────────────────────────────────────────
