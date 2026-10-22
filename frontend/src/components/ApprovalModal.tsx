@@ -41,6 +41,46 @@ function isAuthGateRequest(approval: ApprovalRequest): boolean {
     || approval.proposedAction === 'AUTH_GATE';
 }
 
+function isBotBlockRequest(approval: ApprovalRequest): boolean {
+  return approval.parameters?.type === 'bot_block'
+    || approval.proposedAction === 'BOT_BLOCK';
+}
+
+interface BotBlockOption {
+  value: string;
+  label: string;
+}
+
+function parseBotBlockOptions(approval: ApprovalRequest): BotBlockOption[] {
+  const raw = approval.parameters?.options;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return [
+      { value: 'open_live_view', label: 'Open the live browser view' },
+      { value: 'skip', label: 'Skip this source and try another' },
+      { value: 'stop', label: 'Stop the task' },
+    ];
+  }
+  return raw.map((item: any) => {
+    if (typeof item === 'string') {
+      const idx = item.indexOf(':');
+      if (idx !== -1) {
+        return {
+          value: item.slice(0, idx).trim(),
+          label: item.slice(idx + 1).trim(),
+        };
+      }
+      return { value: item.trim(), label: item.trim() };
+    }
+    if (typeof item === 'object' && item !== null) {
+      return {
+        value: String(item.value || item.id || ''),
+        label: String(item.label || item.value || ''),
+      };
+    }
+    return { value: String(item), label: String(item) };
+  });
+}
+
 function parseFields(approval: ApprovalRequest): AskField[] {
   const raw = approval.parameters?.fields;
   if (!Array.isArray(raw)) return [];
@@ -120,9 +160,11 @@ export default function ApprovalModal({
   const isOtp = approval.parameters?.type === 'otp_request';
   const isCaptcha = approval.parameters?.type === 'captcha_request';
   const isAuthGate = !isCred && !isOtp && !isCaptcha && isAuthGateRequest(approval);
-  const isAskUser = !isCred && !isOtp && !isCaptcha && !isAuthGate && isFormInputRequest(approval);
+  const isBotBlock = !isCred && !isOtp && !isCaptcha && !isAuthGate && isBotBlockRequest(approval);
+  const isAskUser = !isCred && !isOtp && !isCaptcha && !isAuthGate && !isBotBlock && isFormInputRequest(approval);
   const askFields = isAskUser ? parseFields(approval) : [];
   const authOptions = isAuthGate ? parseAuthOptions(approval) : [];
+  const botBlockOptions = isBotBlock ? parseBotBlockOptions(approval) : [];
   const askReason = (approval.parameters?.reason as string) || approval.prompt || 'The agent needs information to continue';
   const domain = (approval.parameters?.domain as string) || 'the site';
 
@@ -177,36 +219,43 @@ export default function ApprovalModal({
     setFormValues(prev => ({ ...prev, [name]: value }));
   };
 
-  const headerIcon = isAuthGate ? <LogIn className="w-6 h-6" /> :
+  const headerIcon = isBotBlock ? <ShieldAlert className="w-6 h-6" /> :
+    isAuthGate ? <LogIn className="w-6 h-6" /> :
     isCred ? <KeyRound className="w-6 h-6" /> :
     isAskUser ? <MessageSquareText className="w-6 h-6" /> :
     <ShieldAlert className="w-6 h-6" />;
 
-  const headerColorClass = isAuthGate ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
+  const headerColorClass = isBotBlock ? 'bg-rose-500/15 border-rose-500/30 text-rose-400' :
+    isAuthGate ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
     isCred ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
     isAskUser ? 'bg-violet-500/15 border-violet-500/30 text-violet-400' :
     'bg-amber-500/15 border-amber-500/30 text-amber-400';
 
-  const badgeColorClass = isAuthGate ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
+  const badgeColorClass = isBotBlock ? 'bg-rose-500/20 text-rose-300 border-rose-500/30' :
+    isAuthGate ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
     isCred ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
     isAskUser ? 'bg-violet-500/20 text-violet-300 border-violet-500/30' :
     'bg-amber-500/20 text-amber-300 border-amber-500/30';
 
-  const badgeLabel = isAuthGate ? 'Login Required' :
+  const badgeLabel = isBotBlock ? 'Site Blocked' :
+    isAuthGate ? 'Login Required' :
     isCred ? 'Login Required' :
     isAskUser ? 'Input Needed' :
     isCaptcha ? 'Your Turn' :
     isOtp ? 'Verification Code' :
     'Action Approval Required';
 
-  const headerTitle = isAuthGate ? `Login required for ${domain}` :
+  const headerTitle = isBotBlock ? 'This site blocked automation' :
+    isAuthGate ? `Login required for ${domain}` :
     isCred ? `Login required for ${domain}` :
     isAskUser ? 'DOO needs your input' :
     isCaptcha ? 'Please solve the CAPTCHA' :
     isOtp ? 'Enter the verification code' :
     'DOO paused for user confirmation';
 
-  const headerDesc = isAuthGate
+  const headerDesc = isBotBlock
+    ? ([approval.parameters?.reason, approval.parameters?.url].filter(Boolean).join(' ') || 'The site returned an access-denial page.')
+    : isAuthGate
     ? ((approval.parameters?.authMethods as string) || 'Choose how to sign in to continue.')
     : isCred ? 'Provide credentials to continue. They will only be used for this task.'
     : isAskUser ? askReason
@@ -214,9 +263,11 @@ export default function ApprovalModal({
     : isOtp ? 'A verification code was sent to your device. Enter it below to continue.'
     : 'The agent is about to execute a protected or sensitive operation.';
 
-  const borderColor = isAuthGate || isCred ? 'border-blue-500/40' :
+  const borderColor = isBotBlock ? 'border-rose-500/40' :
+    isAuthGate || isCred ? 'border-blue-500/40' :
     isAskUser ? 'border-violet-500/40' : 'border-amber-500/40';
-  const shadowColor = isAuthGate || isCred ? 'shadow-blue-500/10' :
+  const shadowColor = isBotBlock ? 'shadow-rose-500/10' :
+    isAuthGate || isCred ? 'shadow-blue-500/10' :
     isAskUser ? 'shadow-violet-500/10' : 'shadow-amber-500/10';
 
   return (
@@ -240,7 +291,44 @@ export default function ApprovalModal({
 
         {/* Content */}
         <div className="p-6 space-y-4">
-          {isAuthGate ? (
+          {isBotBlock ? (
+            <div className="space-y-4">
+              {approval.parameters?.url && (
+                <div className="rounded-xl bg-slate-950/80 p-4 border border-slate-800">
+                  <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1">
+                    Blocked URL
+                  </span>
+                  <p className="text-sm font-mono text-amber-200 break-all">
+                    {String(approval.parameters.url)}
+                  </p>
+                </div>
+              )}
+              <div className="flex flex-col sm:flex-row gap-3 pt-2">
+                {botBlockOptions.map((opt) => {
+                  const isPrimary = opt.value === 'open_live_view';
+                  const isDanger = opt.value === 'stop';
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      data-testid={`bot-block-btn-${opt.value}`}
+                      onClick={() => onApprove(opt.value)}
+                      disabled={isSubmitting}
+                      className={
+                        isPrimary
+                          ? 'flex-1 flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-300 hover:to-blue-400 shadow-md shadow-blue-500/20 transition-all disabled:opacity-50'
+                          : isDanger
+                          ? 'flex-1 flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/40 transition-colors disabled:opacity-50'
+                          : 'flex-1 flex items-center justify-center space-x-2 px-4 py-2.5 rounded-xl text-sm font-semibold text-slate-300 bg-slate-800 hover:bg-slate-700 border border-slate-700 transition-colors disabled:opacity-50'
+                      }
+                    >
+                      <span>{opt.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ) : isAuthGate ? (
             <>
               {/* Sign-in method radio list */}
               <div className="space-y-2">
@@ -490,32 +578,34 @@ export default function ApprovalModal({
         </div>
 
         {/* Footer actions */}
-        <div className="p-5 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-end space-x-3">
-          <button
-            type="button"
-            onClick={() => onReject(comment)}
-            disabled={isSubmitting}
-            className="flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/40 transition-colors disabled:opacity-50"
-          >
-            <XCircle className="w-4 h-4" />
-            <span>{isAuthGate ? 'Skip Login' : isCred ? 'Skip Login' : isAskUser ? 'Skip' : 'Reject'}</span>
-          </button>
-          <button
-            type="button"
-            onClick={handleApprove}
-            disabled={
-              isSubmitting
-              || (isAuthGate && !authGateSubmitReady)
-              || (isCred && (!username || !password))
-              || (isOtp && !otpCode)
-              || (isAskUser && !allRequiredFilled)
-            }
-            className="flex items-center space-x-2 px-5 py-2 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-300 hover:to-blue-400 shadow-md shadow-blue-500/20 transition-all disabled:opacity-50"
-          >
-            <CheckCircle2 className="w-4 h-4" />
-            <span>{isAuthGate ? 'Continue' : isCred ? 'Login & Continue' : isCaptcha ? 'Done — Continue' : isOtp ? 'Submit Code' : isAskUser ? 'Submit & Continue' : 'Approve & Continue'}</span>
-          </button>
-        </div>
+        {!isBotBlock && (
+          <div className="p-5 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-end space-x-3">
+            <button
+              type="button"
+              onClick={() => onReject(comment)}
+              disabled={isSubmitting}
+              className="flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/40 transition-colors disabled:opacity-50"
+            >
+              <XCircle className="w-4 h-4" />
+              <span>{isAuthGate ? 'Skip Login' : isCred ? 'Skip Login' : isAskUser ? 'Skip' : 'Reject'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={handleApprove}
+              disabled={
+                isSubmitting
+                || (isAuthGate && !authGateSubmitReady)
+                || (isCred && (!username || !password))
+                || (isOtp && !otpCode)
+                || (isAskUser && !allRequiredFilled)
+              }
+              className="flex items-center space-x-2 px-5 py-2 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-300 hover:to-blue-400 shadow-md shadow-blue-500/20 transition-all disabled:opacity-50"
+            >
+              <CheckCircle2 className="w-4 h-4" />
+              <span>{isAuthGate ? 'Continue' : isCred ? 'Login & Continue' : isCaptcha ? 'Done — Continue' : isOtp ? 'Submit Code' : isAskUser ? 'Submit & Continue' : 'Approve & Continue'}</span>
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
