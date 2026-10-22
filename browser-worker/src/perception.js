@@ -355,9 +355,15 @@ async function buildObservation(page, taskId, options = {}) {
 
       // ── Bot-block detection ───────────────────────────────────────────────────
       const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-      const BOT_BLOCK_RE = /unusual traffic|access denied|verify you are human|just a moment|press & hold|are you a robot/i;
+      const docTitle = document.title || '';
+      const BOT_BLOCK_RE = /unusual traffic|access denied|verify you are human|just a moment|press & hold|are you a robot|sorry,? you have been blocked|attention required|cloudflare ray id|you are unable to access|enable cookies and reload|checking your browser|why have i been blocked|request blocked/i;
       if (BOT_BLOCK_RE.test(bodyText.substring(0, 3000))) {
         found.push({ type: 'bot_block', reason: 'visible block text detected' });
+      }
+      if (/attention required|just a moment/i.test(docTitle)) {
+        if (!found.some(f => f.type === 'bot_block')) {
+          found.push({ type: 'bot_block', reason: 'document title contains bot block indicator' });
+        }
       }
 
       // ── OTP / 2FA inputs ──────────────────────────────────────────────────────
@@ -375,6 +381,19 @@ async function buildObservation(page, taskId, options = {}) {
       return found;
     });
   } catch { /* continue without challenge detection */ }
+
+  // Push a bot_block challenge when document.title contains "Attention Required" or "Just a moment", or when main response status is 403 or 429
+  const mainStatus = Number(options?.responseStatus) || 200;
+  if (mainStatus === 403 || mainStatus === 429) {
+    if (!challenges.some(c => c.type === 'bot_block')) {
+      challenges.push({ type: 'bot_block', reason: `HTTP status ${mainStatus}` });
+    }
+  }
+  if (/attention required|just a moment/i.test(pageTitle)) {
+    if (!challenges.some(c => c.type === 'bot_block')) {
+      challenges.push({ type: 'bot_block', reason: 'document title contains bot block indicator' });
+    }
+  }
 
   // Log each reported captcha challenge (one line per entry)
   for (const c of challenges) {
@@ -453,6 +472,7 @@ function classifyPage(observation, responseStatus = 200, responseHeaders = {}) {
 
   const BOT_BLOCK_TITLE_PATTERNS = [
     'attention required! | cloudflare',
+    'attention required',
     'just a moment...',
     'just a moment',
     'access denied',
@@ -472,6 +492,12 @@ function classifyPage(observation, responseStatus = 200, responseHeaders = {}) {
     'pardon our interruption',
     'why have i been blocked',
     'this website is using a security service to protect itself',
+    'sorry, you have been blocked',
+    'sorry you have been blocked',
+    'you are unable to access',
+    'enable cookies and reload',
+    'checking your browser',
+    'request blocked',
   ];
 
   for (const pat of BOT_BLOCK_TITLE_PATTERNS) {

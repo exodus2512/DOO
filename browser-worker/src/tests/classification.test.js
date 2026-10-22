@@ -59,6 +59,22 @@ describe('Page Classification System', () => {
       assert.equal(state, 'BOT_BLOCK');
     });
 
+    test('classifies "Sorry, you have been blocked" as BOT_BLOCK', () => {
+      const state = classifyPage({
+        title: 'Attention Required! | Cloudflare',
+        page_text: { text: 'Sorry, you have been blocked. You are unable to access medium.com' }
+      }, 200);
+      assert.equal(state, 'BOT_BLOCK');
+    });
+
+    test('classifies "you are unable to access" as BOT_BLOCK', () => {
+      const state = classifyPage({
+        title: 'Security Alert',
+        page_text: { text: 'You are unable to access this website. Request blocked by security policy.' }
+      }, 200);
+      assert.equal(state, 'BOT_BLOCK');
+    });
+
     test('classifies "Attention Required! | Cloudflare" as BOT_BLOCK', () => {
       const state = classifyPage({
         title: 'Attention Required! | Cloudflare',
@@ -132,12 +148,15 @@ describe('Page Classification System', () => {
       assert.equal(obs.page_state, 'NORMAL', 'Should classify as NORMAL form');
     });
 
-    test('4. Cloudflare Block Page Fixture: classified as BOT_BLOCK', async () => {
+    test('4. Cloudflare Block Page Fixture: title "Attention Required! | Cloudflare" and body "Sorry, you have been blocked" produces bot_block challenge and page_state BOT_BLOCK', async () => {
       const response = await page.goto(`${BASE_URL}/cloudflare-block.html`);
       const obs = await buildObservation(page, 'test-cloudflare', {
         includeScreenshot: false,
         responseStatus: response.status()
       });
+      assert.equal(obs.title, 'Attention Required! | Cloudflare');
+      assert.ok(obs.challenges && obs.challenges.length > 0, 'Challenges array must not be empty');
+      assert.ok(obs.challenges.some(c => c.type === 'bot_block'), 'Challenges must contain bot_block');
       assert.equal(obs.page_state, 'BOT_BLOCK', 'Cloudflare block page fixture must classify as BOT_BLOCK');
     });
 
