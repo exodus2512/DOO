@@ -1583,7 +1583,7 @@ public class TaskExecutorService {
 
     // ─── Auth surface detection ───────────────────────────────────────────────────
 
-    record AuthSurface(
+    public record AuthSurface(
         boolean hasPasswordForm,    // input[type=password] + identifier field present
         boolean hasEmailOnlyForm,   // email input but no password
         List<String> oauthProviders,// detected SSO provider names (Google, Apple, etc.)
@@ -1600,7 +1600,7 @@ public class TaskExecutorService {
             "(?i)(accounts\\.google\\.com|appleid\\.apple\\.com|connect\\.facebook|github\\.com/login/oauth|login\\.microsoftonline|twitter\\.com/i/oauth)"
         );
 
-    private static AuthSurface detectAuthSurface(
+    public static AuthSurface detectAuthSurface(
             List<Map<String, Object>> elements, String pageText, String url) {
         if (elements == null) return new AuthSurface(false, false, List.of(), false, false);
         boolean hasPassword = false;
@@ -1621,8 +1621,9 @@ public class TaskExecutorService {
                 hasPassword = true;
             }
             if ("email".equals(type) || "email".equals(autocomplete)
-                    || label.contains("email") || elName.contains("email")
+                    || label.contains("email") || text.contains("email") || elName.contains("email")
                     || label.contains("username") || label.contains("user name")
+                    || text.contains("username") || text.contains("user name")
                     || elName.contains("username") || elName.contains("user")
                     || "username".equals(autocomplete)) {
                 hasIdentifier = true;

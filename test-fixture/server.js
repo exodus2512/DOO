@@ -50,6 +50,10 @@ const server = http.createServer((req, res) => {
     fileName = 'captcha-visible.html';
   } else if (cleanUrl === '/invisible-badge' || cleanUrl === '/invisible-badge.html') {
     fileName = 'invisible-badge.html';
+  } else if (cleanUrl === '/signin-landing' || cleanUrl === '/signin-landing.html') {
+    fileName = 'signin-landing.html';
+  } else if (cleanUrl === '/signin-modal' || cleanUrl === '/signin-modal.html') {
+    fileName = 'signin-modal.html';
   } else if (cleanUrl !== '/' && fs.existsSync(path.join(__dirname, cleanUrl.replace(/^\//, '')))) {
     fileName = cleanUrl.replace(/^\//, '');
   }
