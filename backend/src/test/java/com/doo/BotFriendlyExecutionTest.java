@@ -216,4 +216,122 @@ class BotFriendlyExecutionTest {
         // Clean up cooldown
         TaskExecutorService.setDomainCooldown("en.wikipedia.org", Duration.ofSeconds(-1));
     }
+
+    @Test
+    @DisplayName("handleAuthGateResponse: non-JSON response treats as handoff without throwing exception")
+    void testHandleAuthGateResponseNonJson() {
+        Map<String, String> creds = new java.util.HashMap<>();
+        Map<String, String> known = new java.util.HashMap<>();
+        java.util.Set<String> handled = new java.util.HashSet<>();
+        UUID taskId = UUID.randomUUID();
+
+        // 1. Plain non-JSON text -> handoff
+        executorService.handleAuthGateResponse("plain text response", "login.example.com",
+            creds, known, handled, taskId);
+        assertThat(handled).contains("login.example.com");
+        assertThat(creds).isEmpty();
+        assertThat(known).isEmpty();
+
+        // 2. Unrecognized choice -> handoff
+        executorService.handleAuthGateResponse("{\"choice\":\"unknown_sso\"}", "sso.example.com",
+            creds, known, handled, taskId);
+        assertThat(handled).contains("sso.example.com");
+        assertThat(creds).isEmpty();
+        assertThat(known).isEmpty();
+
+        // 3. Password choice -> sets task credentials
+        executorService.handleAuthGateResponse("{\"choice\":\"password\",\"username\":\"alice\",\"password\":\"secret\"}",
+            "login.example.com", creds, known, handled, taskId);
+        assertThat(creds.get("login.example.com")).isEqualTo("alice\nsecret");
+
+        // 4. Email link choice -> sets known values
+        executorService.handleAuthGateResponse("{\"choice\":\"email_link\",\"email\":\"alice@example.com\"}",
+            "login.example.com", creds, known, handled, taskId);
+        assertThat(known.get("email")).isEqualTo("alice@example.com");
+
+        // 5. Phone choice -> sets known values
+        executorService.handleAuthGateResponse("{\"choice\":\"phone\",\"phone\":\"+1234567890\"}",
+            "login.example.com", creds, known, handled, taskId);
+        assertThat(known.get("phone")).isEqualTo("+1234567890");
+    }
+
+    @Test
+    @DisplayName("Repeated failed auth verification fails task after 2 attempts instead of looping third card")
+    void testAuthGateMaxAttemptsFailsTask() throws Exception {
+        String targetUrl = "https://secure-portal.org/login";
+        String domain = "secure-portal.org";
+
+        given(routePreferenceService.evaluate(any(), any()))
+            .willReturn(RoutePreferenceService.RoutePreferenceResult.builder()
+                .canProceed(true)
+                .routeType(RoutePreferenceService.RouteType.BROWSER_ALLOWED)
+                .build());
+
+        given(browserWorkerClient.initSession(any(), any()))
+            .willReturn(new SessionResult(true, "sess-portal", null));
+        given(browserWorkerClient.initSession(any()))
+            .willReturn(new SessionResult(true, "sess-portal", null));
+
+        List<Map<String, Object>> authElements = List.of(
+            Map.of("type", "email", "label", "Email or username"),
+            Map.of("type", "password", "label", "Password"),
+            Map.of("role", "button", "text", "Log in")
+        );
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
+            .willReturn(new ActionResult(true, "Navigated", null, "base64",
+                targetUrl, "Login - Portal", "Enter your credentials to log in", null,
+                "obs-1", authElements, List.of(), null, "NORMAL"));
+
+        given(browserWorkerClient.unparkSession(any()))
+            .willReturn(new ActionResult(true, "Unparked", null, null,
+                targetUrl, "Login - Portal", "Enter your credentials to log in", null,
+                "obs-1", authElements, List.of(), null, "NORMAL"));
+
+        Task task = createTask("access secure area on " + targetUrl);
+        executorService.executeTask(task.getId());
+
+        // Resolve first approval card
+        long deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest firstApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "AUTH_GATE", "PENDING");
+            if (opt.isPresent()) {
+                firstApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(firstApproval).isNotNull();
+        firstApproval.setStatus("APPROVED");
+        firstApproval.setUserResponse("{\"choice\":\"handoff\"}");
+        approvalRepository.save(firstApproval);
+
+        // Resolve second approval card
+        deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest secondApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "AUTH_GATE", "PENDING");
+            if (opt.isPresent() && !opt.get().getId().equals(firstApproval.getId())) {
+                secondApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(secondApproval).isNotNull();
+        secondApproval.setStatus("APPROVED");
+        secondApproval.setUserResponse("{\"choice\":\"handoff\"}");
+        approvalRepository.save(secondApproval);
+
+        // Wait for task to terminate (should fail on 3rd attempt without firing 3rd card)
+        Task finalTask = waitForTerminal(task.getId());
+        assertThat(finalTask.getStatus()).isEqualTo(TaskStatus.FAILED);
+        assertThat(finalTask.getFailureReason()).contains("Login not completed for " + domain);
+
+        // Verify only 2 approval cards were ever created for this task
+        long totalAuthApprovals = approvalRepository.findAll().stream()
+            .filter(a -> task.getId().equals(a.getTaskId()) && "AUTH_GATE".equals(a.getProposedAction()))
+            .count();
+        assertThat(totalAuthApprovals).isEqualTo(2);
+    }
 }

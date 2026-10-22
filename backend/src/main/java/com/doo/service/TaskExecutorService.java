@@ -302,6 +302,9 @@ public class TaskExecutorService {
             Map<String, String> approvalAnswerCache = new HashMap<>();
             // Domains where auth has been handled this session — prevents repeated auth cards.
             Set<String> authHandledDomains = new HashSet<>();
+            // Per-domain auth gate attempt counter — capped at MAX_AUTH_GATE_ATTEMPTS.
+            Map<String, Integer> authGateAttempts = new HashMap<>();
+            final int MAX_AUTH_GATE_ATTEMPTS = 2;
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -381,6 +384,17 @@ public class TaskExecutorService {
                                 credentialHints = buildFullHints(taskCredentials, knownValues);
                                 continue;
                             }
+
+                            // Enforce max gate attempts before looping again
+                            int currentAttempts = authGateAttempts.getOrDefault(authDomain, 0);
+                            if (currentAttempts >= MAX_AUTH_GATE_ATTEMPTS) {
+                                String loginFailed = "Login not completed for " + authDomain;
+                                log.warn("Task {} — AUTH GATE: max attempts ({}) reached for {}; failing task",
+                                    taskId, MAX_AUTH_GATE_ATTEMPTS, authDomain);
+                                failTask(task, loginFailed);
+                                return;
+                            }
+                            authGateAttempts.put(authDomain, currentAttempts + 1);
 
                             // Bring window to front for OAuth/handoff scenarios
                             if (!authSurface.hasPasswordForm() || !authSurface.oauthProviders().isEmpty()) {
@@ -1649,33 +1663,56 @@ public class TaskExecutorService {
         return Character.toUpperCase(s.charAt(0)) + s.substring(1).toLowerCase();
     }
 
-    private void handleAuthGateResponse(String jsonResponse, String domain,
+    public void handleAuthGateResponse(String jsonResponse, String domain,
             Map<String, String> taskCredentials, Map<String, String> knownValues,
             Set<String> authHandledDomains, UUID taskId) {
         authHandledDomains.add(domain);
+        // Treat non-JSON or missing/unrecognized "choice" as explicit handoff (user signs in themselves).
+        // Log the parse failure clearly so it is visible in the task log rather than silently swallowed.
+        Map<String, Object> resp = null;
         try {
             @SuppressWarnings("unchecked")
-            Map<String, Object> resp = new com.fasterxml.jackson.databind.ObjectMapper()
+            Map<String, Object> parsed = new com.fasterxml.jackson.databind.ObjectMapper()
                 .readValue(jsonResponse, Map.class);
-            String choice = String.valueOf(resp.getOrDefault("choice", "handoff"));
-            if ("password".equals(choice)) {
-                String username = String.valueOf(resp.getOrDefault("username", ""));
-                String password = String.valueOf(resp.getOrDefault("password", ""));
-                if (!username.isBlank() && !password.isBlank()) {
-                    taskCredentials.put(domain, username + "\n" + password);
-                    log.info("Task {} — AUTH GATE: credentials provided for {}", taskId, domain);
-                }
-            } else if ("email_link".equals(choice)) {
-                String email = String.valueOf(resp.getOrDefault("email", ""));
-                if (!email.isBlank()) {
-                    knownValues.put("email", email);
-                    log.info("Task {} — AUTH GATE: email provided for {}", taskId, domain);
-                }
-            } else {
-                log.info("Task {} — AUTH GATE: handoff choice for {} — user handles auth", taskId, domain);
-            }
+            resp = parsed;
         } catch (Exception e) {
-            log.warn("Task {} — AUTH GATE: could not parse auth response: {}", taskId, e.getMessage());
+            log.warn("Task {} — AUTH GATE: user response is not valid JSON ('{}') — treating as handoff. Error: {}",
+                taskId, jsonResponse, e.getMessage());
+        }
+
+        if (resp == null) {
+            // Non-JSON response: fall through to handoff
+            log.info("Task {} — AUTH GATE: defaulting to handoff for {} (non-JSON response)", taskId, domain);
+            return;
+        }
+
+        String choice = String.valueOf(resp.getOrDefault("choice", ""));
+        if ("password".equals(choice)) {
+            String username = String.valueOf(resp.getOrDefault("username", ""));
+            String password = String.valueOf(resp.getOrDefault("password", ""));
+            if (!username.isBlank() && !password.isBlank()) {
+                taskCredentials.put(domain, username + "\n" + password);
+                log.info("Task {} — AUTH GATE: credentials provided for {}", taskId, domain);
+            }
+        } else if ("email_link".equals(choice)) {
+            String email = String.valueOf(resp.getOrDefault("email", ""));
+            if (!email.isBlank()) {
+                knownValues.put("email", email);
+                log.info("Task {} — AUTH GATE: email provided for {}", taskId, domain);
+            }
+        } else if ("phone".equals(choice)) {
+            String phone = String.valueOf(resp.getOrDefault("phone", ""));
+            if (!phone.isBlank()) {
+                knownValues.put("phone", phone);
+                log.info("Task {} — AUTH GATE: phone provided for {}", taskId, domain);
+            }
+        } else if (!choice.isBlank() && !"handoff".equals(choice) && !"oauth_note".equals(choice)) {
+            // Unrecognized choice field value — treat as handoff and log explicitly
+            log.warn("Task {} — AUTH GATE: unrecognized choice '{}' for {} — treating as handoff",
+                taskId, choice, domain);
+        } else {
+            // Explicit handoff, oauth_note, or empty choice
+            log.info("Task {} — AUTH GATE: handoff/oauth choice for {} — user handles sign-in in browser", taskId, domain);
         }
     }
 
