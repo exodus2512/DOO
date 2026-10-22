@@ -85,29 +85,41 @@ class SessionManager {
     if (IS_HEADED) {
       try {
         console.log(`[BrowserWorker] Launching persistent context with Google Chrome channel...`);
-        return await chromium.launchPersistentContext(profileDir, {
+        const ctx = await chromium.launchPersistentContext(profileDir, {
           ...options,
           channel: 'chrome',
         });
+        ctx._launcherUsed = 'chrome channel';
+        return ctx;
       } catch (err) {
         console.warn(`[BrowserWorker] 'chrome' channel unavailable (${err.message}), falling back to bundled chromium`);
-        return await chromium.launchPersistentContext(profileDir, options);
+        const ctx = await chromium.launchPersistentContext(profileDir, options);
+        ctx._launcherUsed = 'bundled';
+        return ctx;
       }
     }
-    return await chromium.launchPersistentContext(profileDir, options);
+    const ctx = await chromium.launchPersistentContext(profileDir, options);
+    ctx._launcherUsed = 'bundled';
+    return ctx;
   }
 
   async _launchBrowser(options) {
     if (IS_HEADED) {
       try {
         console.log(`[BrowserWorker] Launching browser with Google Chrome channel...`);
-        return await chromium.launch({ ...options, channel: 'chrome' });
+        const b = await chromium.launch({ ...options, channel: 'chrome' });
+        b._launcherUsed = 'chrome channel';
+        return b;
       } catch (err) {
         console.warn(`[BrowserWorker] 'chrome' channel unavailable (${err.message}), falling back to bundled chromium`);
-        return await chromium.launch(options);
+        const b = await chromium.launch(options);
+        b._launcherUsed = 'bundled';
+        return b;
       }
     }
-    return await chromium.launch(options);
+    const b = await chromium.launch(options);
+    b._launcherUsed = 'bundled';
+    return b;
   }
 
   async ensureBrowser() {
@@ -181,6 +193,18 @@ class SessionManager {
     page.setDefaultTimeout(15000);
     page.setDefaultNavigationTimeout(30000);
 
+    const launcherUsed = context._launcherUsed || (this.browser && this.browser._launcherUsed) || 'bundled';
+    let realUserAgent = '';
+    try {
+      realUserAgent = await page.evaluate(() => navigator.userAgent);
+    } catch {
+      realUserAgent = '';
+    }
+    console.log(`[BrowserWorker] Launcher used: ${launcherUsed}, User-Agent: "${realUserAgent}"`);
+    if (realUserAgent.includes('HeadlessChrome')) {
+      console.warn(`[BrowserWorker] WARNING: User-Agent contains "HeadlessChrome". Many sites with anti-bot protection will block this session.`);
+    }
+
     const sessionId = `session-${taskId}-${Date.now()}`;
     const cancelToken = { cancelled: false };
     const now = Date.now();
@@ -188,6 +212,8 @@ class SessionManager {
     this.sessions.set(taskId, {
       context, page, sessionId, cancelToken,
       domain: domain || null,
+      launcherUsed,
+      userAgent: realUserAgent,
       createdAt: now, lastActivity: now,
       lastObservation: null,
       parked: false,

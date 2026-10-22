@@ -166,6 +166,14 @@ describe('Polite Client Behaviour', () => {
       assert.ok(sessionsSrc.includes("process.env.BROWSER_LOCALE   || 'en-IN'"));
       assert.ok(sessionsSrc.includes("process.env.BROWSER_TIMEZONE || 'Asia/Kolkata'"));
     });
+
+    test('logs launcher used and real userAgent, warns on HeadlessChrome', () => {
+      assert.ok(sessionsSrc.includes('Launcher used:'), 'Should log which launcher was used');
+      assert.ok(sessionsSrc.includes('User-Agent:'), 'Should log real userAgent');
+      assert.ok(sessionsSrc.includes('HeadlessChrome'), 'Should check for HeadlessChrome');
+      assert.ok(sessionsSrc.includes('Many sites with anti-bot protection will block this session'), 'Should warn on HeadlessChrome');
+      assert.ok(!sessionsSrc.includes('userAgent: \'Mozilla'), 'Must not set a custom hardcoded User-Agent');
+    });
   });
 
 });
