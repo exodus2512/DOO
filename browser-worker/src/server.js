@@ -161,6 +161,8 @@ app.post('/action/execute', async (req, res) => {
       if (obs.screenshot?.base64 && !result.screenshot) {
         result.screenshot = obs.screenshot.base64;
       }
+      result.page_state = obs.page_state || 'NORMAL';
+      result.pageState = obs.page_state || 'NORMAL';
       // Send the structured observation for element-index-based actions
       result.observationId = obs.observation_id;
       result.interactiveElements = (obs.interactive_elements || []).map(el => ({
@@ -234,6 +236,8 @@ app.post('/session/unpark', async (req, res) => {
       currentUrl: observation.url,
       pageTitle: observation.title,
       pageText: observation.page_text?.text || '',
+      page_state: observation.page_state || 'NORMAL',
+      pageState: observation.page_state || 'NORMAL',
       observationId: observation.observation_id,
       interactiveElements: (observation.interactive_elements || []).map(el => ({
         index: el.index,

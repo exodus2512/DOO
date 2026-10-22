@@ -272,6 +272,8 @@ public class TaskExecutorService {
             String pageTitle = "";
             String pageText = "";
             String accessibilityTree = "";
+            String currentPageState = "NORMAL";
+            String lastScreenshot = null;
             int consecutiveFailures = 0;
             int observationEpoch = 0;
             String lastObservationHash = "";
@@ -508,6 +510,56 @@ public class TaskExecutorService {
                     }
                 }
 
+                // ── Bot block check before model call and before executing any action ──
+                if ("BOT_BLOCK".equalsIgnoreCase(currentPageState)) {
+                    log.warn("Task {} step {} | BOT_BLOCK before model call at {}", taskId, step, truncate(currentUrl, 80));
+                    String blockDomain = extractDomain(currentUrl);
+                    if (blockDomain != null) {
+                        blockedDomains.add(blockDomain);
+                        setDomainCooldown(blockDomain, Duration.ofMinutes(15));
+                    }
+                    if (lastScreenshot != null) {
+                        saveEvidence(taskId, "STEP_SCREENSHOT",
+                            "Bot block at " + truncate(currentUrl, 60), lastScreenshot, currentUrl);
+                    }
+                    Map<String, Object> bbParams = new HashMap<>();
+                    bbParams.put("type", "bot_block");
+                    bbParams.put("url", currentUrl);
+                    bbParams.put("reason", "The site returned an access-denial page.");
+                    bbParams.put("options", List.of(
+                        "open_live_view: Open the live browser view",
+                        "skip: Skip this source and try another",
+                        "stop: Stop the task"));
+                    String bbReason = "Bot block detected at " + truncate(currentUrl, 60);
+                    ApprovalRequest bbApproval = findOrCreateApproval(taskId, "BOT_BLOCK", bbReason, bbParams);
+                    PauseResult bbPause = pauseForUser(task, sessionId, bbApproval.getId(),
+                        bbReason, "BOT_BLOCK", step, bbParams);
+                    if (!bbPause.resumed) { failTask(task, bbPause.failureReason()); return; }
+                    if (bbPause.observationId != null) {
+                        lastObservationId = bbPause.observationId;
+                        lastInteractiveElements = bbPause.interactiveElements;
+                    }
+                    if (bbPause.currentUrl != null) currentUrl = bbPause.currentUrl;
+                    if (bbPause.pageTitle != null) pageTitle = bbPause.pageTitle;
+                    if (bbPause.pageText != null) {
+                        pageText = bbPause.pageText;
+                        lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                        observationEpoch++;
+                    }
+                    if (bbPause.pageState() != null) {
+                        currentPageState = bbPause.pageState();
+                    }
+                    ApprovalRequest bbResolved = approvalRepository.findById(bbApproval.getId()).orElse(null);
+                    String bbChoice = bbResolved != null && bbResolved.getUserResponse() != null
+                        ? bbResolved.getUserResponse().toLowerCase() : "stop";
+                    if (bbChoice.contains("stop")) {
+                        failTask(task, "BOT_BLOCK: user chose to stop at " + truncate(currentUrl, 60));
+                        return;
+                    }
+                    recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
+                    continue;
+                }
+
                 // Select next action
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — step " + step + ", url=" + truncate(currentUrl, 60), Map.of("phase", "SELECT_ACTION", "step", step, "keyPool", getKeyPoolState())));
                 AiProvider.ActionDecision decision = aiProvider.selectNextAction(
@@ -533,7 +585,23 @@ public class TaskExecutorService {
                 aiCallCount++;
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — chose: " + decision.actionType(), Map.of("phase", "SELECT_ACTION", "action", decision.actionType())));
 
-                // ── page_state routing ──────────────────────────────────────────
+                // ── page_state routing & bot block guard ──────────────────────────
+                boolean isBotBlockPage = "BOT_BLOCK".equalsIgnoreCase(currentPageState)
+                    || (decision.pageState() != null && "BOT_BLOCK".equalsIgnoreCase(decision.pageState()));
+                if (isBotBlockPage) {
+                    String actionType = decision.actionType() != null ? decision.actionType().toUpperCase() : "";
+                    if (!"ASK_USER".equals(actionType) && !"DONE".equals(actionType)) {
+                        log.warn("Task {} step {} | BOT_BLOCK rejection: cannot execute {} on blocked page", taskId, step, actionType);
+                        String blockDomain = extractDomain(currentUrl);
+                        if (blockDomain != null) {
+                            blockedDomains.add(blockDomain);
+                            setDomainCooldown(blockDomain, Duration.ofMinutes(15));
+                        }
+                        failTask(task, "site blocked automation (Cloudflare)");
+                        return;
+                    }
+                }
+
                 if (decision.pageState() != null) {
                     String ps = decision.pageState().toUpperCase();
                     log.debug("Task {} step {} | page_state={} why={}", taskId, step, ps,
@@ -542,16 +610,6 @@ public class TaskExecutorService {
                         // Auth gate runs at loop-top; skip this action and let it fire
                         recentActions.add("PAGE_STATE=LOGIN: deferring to auth gate");
                         continue;
-                    }
-                    if ("BOT_BLOCK".equals(ps)) {
-                        log.warn("Task {} step {} | model reports BOT_BLOCK at {}", taskId, step, currentUrl);
-                        String blockDomain = extractDomain(currentUrl);
-                        if (blockDomain != null) {
-                            blockedDomains.add(blockDomain);
-                            setDomainCooldown(blockDomain, Duration.ofMinutes(15));
-                        }
-                        failTask(task, "BOT_BLOCK: model detected access denial at " + truncate(currentUrl, 80));
-                        return;
                     }
                 }
 
@@ -968,10 +1026,28 @@ public class TaskExecutorService {
                         + (result.success() ? " [OK]" : " [FAIL]"));
                 }
 
+                if (result.currentUrl() != null && !result.currentUrl().isBlank()) {
+                    currentUrl = result.currentUrl();
+                }
+                if (result.pageTitle() != null) {
+                    pageTitle = result.pageTitle();
+                }
+                if (result.pageText() != null) {
+                    pageText = result.pageText();
+                }
+                if (result.pageState() != null) {
+                    currentPageState = result.pageState();
+                }
+                if (result.screenshot() != null) {
+                    lastScreenshot = result.screenshot();
+                }
+
                 // Handle bot_block BEFORE CAPTCHA — different options, never loops
-                boolean hasBotBlock = result.challenges() != null && result.challenges().stream()
-                    .anyMatch(c -> "bot_block".equals(c.getOrDefault("type", "")));
+                boolean hasBotBlock = "BOT_BLOCK".equalsIgnoreCase(currentPageState)
+                    || (result.challenges() != null && result.challenges().stream()
+                    .anyMatch(c -> "bot_block".equals(c.getOrDefault("type", ""))));
                 if (hasBotBlock) {
+                    currentPageState = "BOT_BLOCK";
                     log.warn("Task {} step {} | BOT_BLOCK at {}", taskId, step, truncate(currentUrl, 80));
                     String blockDomain = extractDomain(currentUrl);
                     if (blockDomain != null) {
@@ -1005,6 +1081,9 @@ public class TaskExecutorService {
                         pageText = bbPause.pageText;
                         lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
                         observationEpoch++;
+                    }
+                    if (bbPause.pageState() != null) {
+                        currentPageState = bbPause.pageState();
                     }
                     ApprovalRequest bbResolved = approvalRepository.findById(bbApproval.getId()).orElse(null);
                     String bbChoice = bbResolved != null && bbResolved.getUserResponse() != null
@@ -1467,7 +1546,7 @@ public class TaskExecutorService {
                     return false;
                 }
                 RoutePreferenceService.RoutePreferenceResult navPref = routePreferenceService.evaluate(url, task.getUserRequest());
-                if (!navPref.isCanProceed()) {
+                if (navPref != null && !navPref.isCanProceed()) {
                     log.warn("Task {} NAVIGATE to {} blocked by robots.txt: {}", task.getId(), url, navPref.getStopReason());
                     publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING", navPref.getStopReason(), task.getCurrentStep(), Map.of()));
                     return false;
@@ -1949,16 +2028,17 @@ public class TaskExecutorService {
         String pageTitle,
         String pageText,
         String observationId,
-        java.util.List<java.util.Map<String, Object>> interactiveElements
+        java.util.List<java.util.Map<String, Object>> interactiveElements,
+        String pageState
     ) {
         static PauseResult failed(String reason) {
-            return new PauseResult(false, reason, null, null, null, null, null);
+            return new PauseResult(false, reason, null, null, null, null, null, "NORMAL");
         }
         static PauseResult success(ActionResult unparkResult) {
             return new PauseResult(true, null,
                 unparkResult.currentUrl(), unparkResult.pageTitle(),
                 unparkResult.pageText(), unparkResult.observationId(),
-                unparkResult.interactiveElements());
+                unparkResult.interactiveElements(), unparkResult.pageState());
         }
     }
 
@@ -2014,8 +2094,9 @@ public class TaskExecutorService {
                 log.info("Task {} approval {} approved — resuming", taskId, approvalId);
                 // Unpark the browser and get fresh state
                 ActionResult unparkResult = browserWorkerClient.unparkSession(taskId);
-                if (!unparkResult.success()) {
-                    return PauseResult.failed("Browser session lost during wait: " + unparkResult.error());
+                if (unparkResult == null || !unparkResult.success()) {
+                    String err = unparkResult != null && unparkResult.error() != null ? unparkResult.error() : "null unpark response";
+                    return PauseResult.failed("Browser session lost during wait: " + err);
                 }
                 updateTaskStatus(task, TaskStatus.RUNNING, null);
                 publishEvent(TaskEvent.statusChange(taskId, "RUNNING", "Resumed after user approval"));

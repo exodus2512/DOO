@@ -110,8 +110,12 @@ public class BrowserWorkerClient {
             java.util.Map<String, Object> scroll =
                 (java.util.Map<String, Object>) response.get("scroll");
 
+            String pageState = (String) response.get("page_state");
+            if (pageState == null) pageState = (String) response.get("pageState");
+            if (pageState == null) pageState = "NORMAL";
+
             return new ActionResult(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                accessibilityTree, observationId, interactiveElements, challenges, scroll);
+                accessibilityTree, observationId, interactiveElements, challenges, scroll, pageState);
         } catch (WebClientResponseException e) {
             log.error("Browser worker HTTP error {}: {}", e.getStatusCode(), e.getMessage());
             return ActionResult.failure("Browser worker error: " + e.getStatusCode() + " " + e.getResponseBodyAsString());
@@ -136,12 +140,17 @@ public class BrowserWorkerClient {
 
             if (response == null) return BrowserState.empty();
 
+            String pageState = (String) response.get("page_state");
+            if (pageState == null) pageState = (String) response.get("pageState");
+            if (pageState == null) pageState = "NORMAL";
+
             return new BrowserState(
                 (String) response.get("currentUrl"),
                 (String) response.get("pageTitle"),
                 (String) response.get("pageText"),
                 (String) response.get("accessibilityTree"),
-                (String) response.get("screenshot")
+                (String) response.get("screenshot"),
+                pageState
             );
         } catch (Exception e) {
             log.warn("Could not get browser state for task {}: {}", taskId, e.getMessage());
@@ -213,8 +222,12 @@ public class BrowserWorkerClient {
             java.util.List<java.util.Map<String, Object>> interactiveElements =
                 (java.util.List<java.util.Map<String, Object>>) response.get("interactiveElements");
 
+            String pageState = (String) response.get("page_state");
+            if (pageState == null) pageState = (String) response.get("pageState");
+            if (pageState == null) pageState = "NORMAL";
+
             return new ActionResult(success, "Session unparked", null, screenshot,
-                currentUrl, pageTitle, pageText, null, observationId, interactiveElements, null);
+                currentUrl, pageTitle, pageText, null, observationId, interactiveElements, null, null, pageState);
         } catch (Exception e) {
             log.warn("Could not unpark session for task {}: {}", taskId, e.getMessage());
             return ActionResult.failure("Unpark failed: " + e.getMessage());
@@ -357,14 +370,25 @@ public class BrowserWorkerClient {
         String observationId,
         java.util.List<java.util.Map<String, Object>> interactiveElements,
         java.util.List<java.util.Map<String, Object>> challenges,
-        java.util.Map<String, Object> scroll
+        java.util.Map<String, Object> scroll,
+        String pageState
     ) {
+        public ActionResult(boolean success, String result, String error, String screenshot,
+                            String currentUrl, String pageTitle, String pageText,
+                            String accessibilityTree, String observationId,
+                            java.util.List<java.util.Map<String, Object>> interactiveElements,
+                            java.util.List<java.util.Map<String, Object>> challenges,
+                            java.util.Map<String, Object> scroll) {
+            this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
+                 accessibilityTree, observationId, interactiveElements, challenges, scroll, "NORMAL");
+        }
+
         /** Convenience constructor without perception fields (for tests and simple callers). */
         public ActionResult(boolean success, String result, String error, String screenshot,
                             String currentUrl, String pageTitle, String pageText,
                             String accessibilityTree) {
             this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                 accessibilityTree, null, null, null, null);
+                 accessibilityTree, null, null, null, null, "NORMAL");
         }
 
         public ActionResult(boolean success, String result, String error, String screenshot,
@@ -373,11 +397,11 @@ public class BrowserWorkerClient {
                             java.util.List<java.util.Map<String, Object>> interactiveElements,
                             java.util.List<java.util.Map<String, Object>> challenges) {
             this(success, result, error, screenshot, currentUrl, pageTitle, pageText,
-                 accessibilityTree, observationId, interactiveElements, challenges, null);
+                 accessibilityTree, observationId, interactiveElements, challenges, null, "NORMAL");
         }
 
         public static ActionResult failure(String error) {
-            return new ActionResult(false, null, error, null, null, null, null, null, null, null, null, null);
+            return new ActionResult(false, null, error, null, null, null, null, null, null, null, null, null, "NORMAL");
         }
     }
 
@@ -386,10 +410,16 @@ public class BrowserWorkerClient {
         String pageTitle,
         String pageText,
         String accessibilityTree,
-        String screenshot
+        String screenshot,
+        String pageState
     ) {
+        public BrowserState(String currentUrl, String pageTitle, String pageText,
+                            String accessibilityTree, String screenshot) {
+            this(currentUrl, pageTitle, pageText, accessibilityTree, screenshot, "NORMAL");
+        }
+
         public static BrowserState empty() {
-            return new BrowserState(null, null, null, null, null);
+            return new BrowserState(null, null, null, null, null, "NORMAL");
         }
     }
 }
