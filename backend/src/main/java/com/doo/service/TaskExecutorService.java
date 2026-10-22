@@ -422,11 +422,14 @@ public class TaskExecutorService {
                                         ? authPause.interactiveElements() : lastInteractiveElements;
                                     String verifyText = authPause.pageText() != null ? authPause.pageText() : pageText;
                                     String verifyUrl = authPause.currentUrl() != null ? authPause.currentUrl() : currentUrl;
-                                    if (verifyLoggedIn(verifyEls, verifyText, verifyUrl, authSurface)) {
+                                    LoginVerificationResult verification = verifyLoginStatus(verifyEls, verifyText, verifyUrl, authSurface);
+                                    if (verification.verified()) {
                                         loginVerified = true;
                                         log.info("Task {} — AUTH GATE: login verified for {} (attempt {})", taskId, authDomain, loginAttempt + 1);
                                         String domainForSave = extractDomain(verifyUrl);
-                                        if (domainForSave != null) browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                        if (domainForSave != null && verification.canSaveStorageState()) {
+                                            browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                        }
                                         break;
                                     }
                                     if (loginAttempt < 2) {
@@ -1893,35 +1896,67 @@ public class TaskExecutorService {
         }
     }
 
+    public record LoginVerificationResult(
+        boolean verified,
+        boolean canSaveStorageState
+    ) {
+        public static final LoginVerificationResult NOT_VERIFIED = new LoginVerificationResult(false, false);
+    }
+
+    private static final java.util.regex.Pattern AUTH_PATH_URL_PATTERN = java.util.regex.Pattern.compile(
+        ".*/(login|signin|sign-in|auth|account/login|user/login|enter|signup|sign-up|register|join|onboarding).*",
+        java.util.regex.Pattern.CASE_INSENSITIVE
+    );
+
+    private static final java.util.regex.Pattern LOGGED_IN_MARKERS = java.util.regex.Pattern.compile(
+        "(?i)\\b(sign\\s*out|log\\s*out|logout|my\\s+account|dashboard|avatar)\\b"
+    );
+
     /**
      * Check whether the auth surface is gone and at least one logged-in marker is present.
      * Returns true when we're confident the user is authenticated.
      */
-    private static boolean verifyLoggedIn(
+    public static LoginVerificationResult verifyLoginStatus(
             List<Map<String, Object>> elements, String pageText, String url, AuthSurface authSurface) {
-        if (elements == null) return false;
+        if (elements == null) return LoginVerificationResult.NOT_VERIFIED;
         AuthSurface current = detectAuthSurface(elements, pageText, url);
-        if (current.isAuthPage()) return false; // still on an auth page
+        if (current.isAuthPage()) return LoginVerificationResult.NOT_VERIFIED; // still on an auth page
 
-        final java.util.regex.Pattern LOGGED_IN_MARKERS = java.util.regex.Pattern.compile(
-            "(?i)\\b(sign\\s*out|log\\s*out|logout|my\\s+account|my\\s+profile|profile|dashboard|settings|account\\s+settings|avatar|notifications\\s+for|welcome|hello)\\b"
-        );
+        // 1. Positive logged-in marker in interactive elements
         for (Map<String, Object> el : elements) {
             String combined = el.getOrDefault("label", "") + " "
                 + el.getOrDefault("text", "") + " "
                 + (el.get("href") != null ? el.get("href") : "");
-            if (LOGGED_IN_MARKERS.matcher(combined).find()) return true;
+            if (LOGGED_IN_MARKERS.matcher(combined).find()) {
+                return new LoginVerificationResult(true, true);
+            }
         }
+
+        // 2. Positive logged-in marker in page text
         if (pageText != null && LOGGED_IN_MARKERS.matcher(
                 pageText.substring(0, Math.min(1000, pageText.length()))).find()) {
-            return true;
+            return new LoginVerificationResult(true, true);
         }
-        // URL left the typical auth path — treat as likely success
-        if (url != null && !url.toLowerCase().matches(
-                ".*/(login|signin|sign-in|auth|account/login|user/login).*")) {
-            return true;
+
+        // 3. Check if still on an auth-path URL (login, enter, signup, register, onboarding, etc.)
+        boolean isAuthPath = url != null && AUTH_PATH_URL_PATTERN.matcher(url).find();
+        if (isAuthPath) {
+            return LoginVerificationResult.NOT_VERIFIED;
         }
-        return false;
+
+        // 4. Confirmed absence of an auth surface:
+        // Current is not an auth page, URL is not an auth path, and non-empty elements list confirms regular page content
+        if (!elements.isEmpty()) {
+            return new LoginVerificationResult(true, true);
+        }
+
+        // 5. Fallback: URL left the auth path alone (no elements/markers to confirm)
+        return new LoginVerificationResult(true, false);
+    }
+
+    public static boolean verifyLoggedIn(
+            List<Map<String, Object>> elements, String pageText, String url, AuthSurface authSurface) {
+        return verifyLoginStatus(elements, pageText, url, authSurface).verified();
     }
 
     // ─── Confirmation signal patterns ─────────────────────────────────────────────
