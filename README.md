@@ -58,6 +58,52 @@ short-lived token; the same browser session is kept alive throughout.
 | Bot-block wall (403/429/unusual traffic) | Live View or skip source |
 | Cloud/datacenter IP | Challenges increase; headed helps but not guaranteed |
 
+---
+
+## 🤖 What DOO will and won't do about bot checks
+
+DOO is **bot-friendly by design**. Rather than engaging in an adversarial arms race of anti-bot evasion and fingerprint spoofing, DOO operates as a transparent, polite client that honors website policies, prioritizes official interfaces, and hands off challenges to the human operator.
+
+### What DOO will do
+
+1. **Real Browser Environment**:
+   - In headed mode (`HEADED=true`), launches real installed Google Chrome (`channel: 'chrome'`) with `launchPersistentContext` per domain.
+   - Preserves authentic browser fingerprints: no custom User-Agent strings, no webdriver patch scripts, no hidden flags.
+   - Inherits legitimate locale and timezone settings from environment variables (e.g. `en-IN`, `Asia/Kolkata`).
+
+2. **Polite Client Dynamics**:
+   - **Human Action Pacing**: Injects randomized pauses (`humanPause` 300–1200 ms) between user interactions.
+   - **Single Concurrency**: Locks execution to one page at a time per domain to eliminate multi-tab burst scraping.
+   - **Domain Navigation Throttling**: Enforces a minimum 2-second rate limit between navigations to the same domain.
+   - **Backoff & Retry-After Adherence**: Immediately honors `Retry-After` headers (both delta-seconds and RFC 1123 HTTP dates) on HTTP 429 (Too Many Requests) and 503 (Service Unavailable) with exponential backoff.
+   - **Domain Cooldown**: Enforces an automatic 15-minute cooldown on any domain after a bot block is observed, preventing recurring automated hammering.
+
+3. **Prefer Official Routes First (`ROUTE_PREFERENCE`)**:
+   - Before launching a browser, checks for official public REST APIs (Wikipedia, GitHub, Reddit, Hacker News, etc.) or RSS/Atom feeds for the target domain.
+   - Recommends and utilizes official search APIs instead of scraping search engine result pages.
+   - Automatically downloads and parses `robots.txt` for disallow rules and retrieves terms of service links. If `robots.txt` disallows the path, DOO halts and notifies the user instead of bypassing it.
+
+4. **Session Reuse**:
+   - Persists browser profile directories and Playwright `storageState` per domain after verified human login so recurring tasks retain valid sessions without triggering new-visitor challenge gates.
+
+5. **Deterministic Page Classification & Human Hand-Off**:
+   - Classifies every page before interacting: `NORMAL`, `LOGIN`, `CAPTCHA_VISIBLE`, or `BOT_BLOCK`.
+   - Distinguishes between visible challenges and invisible background badges (such as reCAPTCHA v3), ignoring invisible badges to prevent false alarms.
+   - On `CAPTCHA_VISIBLE`, pauses execution, opens the Live View card, and waits for the human user to solve the challenge. Resumes only when the challenge has cleared.
+   - On `BOT_BLOCK` (Cloudflare "Attention Required", "Just a moment", HTTP 403/429, or "unusual traffic"), stops immediately, takes a screenshot evidence artifact, sets the domain cooldown, and offers: hand off in live view / try another source / stop. **Never retries in an automated loop.**
+
+6. **Honest & Transparent Reporting**:
+   - The final synthesized task result includes an **Automation Transparency & Official Alternatives** report detailing which domains blocked automation, actions attempted, and alternative official APIs or feeds available for that domain.
+
+### What DOO will NOT do
+
+- ❌ **No CAPTCHA solving**: DOO will never use automated CAPTCHA solvers, audio transcribers, or third-party captcha-breaking APIs.
+- ❌ **No token farming**: DOO will never farm, harvest, or pre-generate anti-bot bypass tokens or cookies.
+- ❌ **No stealth plugins**: DOO does not use `puppeteer-extra-plugin-stealth` or modify internal browser JavaScript objects.
+- ❌ **No fingerprint spoofing**: DOO does not spoof Canvas, WebGL, AudioContext, client hints, or TLS client hellos.
+- ❌ **No proxy rotation to dodge blocks**: DOO does not rotate residential proxies or IP pools to circumvent rate limits or IP bans.
+
+
 
 
 DOO is an autonomous, GUI-first personal AI agent designed to execute real multi-step tasks inside actual web browsers, capture photographic proof of every action, and rigorously verify whether the requested outcome was actually achieved.
