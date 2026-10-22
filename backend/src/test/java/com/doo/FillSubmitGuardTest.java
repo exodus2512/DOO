@@ -104,7 +104,7 @@ class FillSubmitGuardTest {
     @Test
     @DisplayName("RESOLVE_FAILED error triggers distinct retry with fresh observation")
     void resolveFailureRetriesWithValidIndices() throws Exception {
-        Task task = createTask("fill the test form and submit it");
+        Task task = createTask("fill the test form with Full Name and submit it");
 
         given(browserWorkerClient.initSession(any()))
             .willReturn(new SessionResult(true, "sess-2", null));

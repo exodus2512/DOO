@@ -43,6 +43,7 @@ public class TaskExecutorService {
     private final TaskEventPublisher eventPublisher;
     private final UrlValidator urlValidator;
     private final CredentialVaultService credentialVaultService;
+    private final RoutePreferenceService routePreferenceService;
 
     @Value("${doo.task.max-steps:30}")
     private int maxSteps;
@@ -63,6 +64,28 @@ public class TaskExecutorService {
 
     // Track cancelled tasks to prevent actions being dispatched after cancellation
     private final Set<UUID> cancelledTasks = ConcurrentHashMap.newKeySet();
+
+    // Per-domain cooldown tracker after bot-blocks or rate-limits
+    private static final Map<String, Instant> DOMAIN_COOLDOWNS = new ConcurrentHashMap<>();
+
+    public static boolean isDomainInCooldown(String domain) {
+        if (domain == null) return false;
+        Instant cooldownUntil = DOMAIN_COOLDOWNS.get(domain.toLowerCase());
+        return cooldownUntil != null && Instant.now().isBefore(cooldownUntil);
+    }
+
+    public static void setDomainCooldown(String domain, Duration duration) {
+        if (domain != null) {
+            DOMAIN_COOLDOWNS.put(domain.toLowerCase(), Instant.now().plus(duration));
+        }
+    }
+
+    public static Duration getDomainCooldownRemaining(String domain) {
+        if (domain == null) return Duration.ZERO;
+        Instant cooldownUntil = DOMAIN_COOLDOWNS.get(domain.toLowerCase());
+        if (cooldownUntil == null || Instant.now().isAfter(cooldownUntil)) return Duration.ZERO;
+        return Duration.between(Instant.now(), cooldownUntil);
+    }
 
     // Allowed action types (allowlist)
     private static final List<String> ALLOWED_ACTIONS = List.of(
@@ -100,6 +123,8 @@ public class TaskExecutorService {
         List<String> visitedUrls = new ArrayList<>();
         List<String> textSnippets = new ArrayList<>();
         List<String> recentActions = new ArrayList<>();
+        Set<String> blockedDomains = new LinkedHashSet<>();
+        Map<String, String> officialAlternatives = new LinkedHashMap<>();
 
         int aiCallCount = 0;
 
@@ -196,15 +221,47 @@ public class TaskExecutorService {
                 credentialHints = buildCredentialHints(taskCredentials);
             }
 
-            // ── Browser path: WEB_RESEARCH, PRODUCT_COMPARISON, UI_INTERACTION ──
+            // ── ROUTE_PREFERENCE Step & Domain Cooldown ──
+            String targetDomainForSession = extractDomain(task.getUserRequest());
+            if (targetDomainForSession != null && isDomainInCooldown(targetDomainForSession)) {
+                Duration remaining = getDomainCooldownRemaining(targetDomainForSession);
+                String cooldownMsg = String.format("Domain %s is currently in polite cooldown for %ds after an access block. Halting to avoid block escalation.",
+                    targetDomainForSession, remaining.toSeconds());
+                log.warn("Task {} halted: {}", taskId, cooldownMsg);
+                failTask(task, cooldownMsg);
+                return;
+            }
+
+            String initialUrl = extractTargetUrl(task.getUserRequest());
+            if (initialUrl != null && routePreferenceService != null) {
+                RoutePreferenceService.RoutePreferenceResult pref = routePreferenceService.evaluate(initialUrl, task.getUserRequest());
+                if (!pref.isCanProceed()) {
+                    log.warn("Task {} disallowed by robots.txt: {}", taskId, pref.getStopReason());
+                    failTask(task, pref.getStopReason());
+                    return;
+                }
+                if (pref.getRouteType() != RoutePreferenceService.RouteType.BROWSER_ALLOWED) {
+                    if (pref.getOfficialRouteUrl() != null && targetDomainForSession != null) {
+                        officialAlternatives.put(targetDomainForSession, pref.getOfficialRouteUrl() + " (" + pref.getRouteType() + ")");
+                    }
+                    publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING",
+                        "Official route identified: " + pref.getDescription(), 0,
+                        Map.of("routeType", pref.getRouteType().name(), "url", pref.getOfficialRouteUrl() != null ? pref.getOfficialRouteUrl() : "")));
+                    recentActions.add("ROUTE_PREFERENCE: identified " + pref.getRouteType() + " route for " + targetDomainForSession);
+                }
+            }
+
             // Step 2: Initialize browser session
             publishEvent(TaskEvent.stepUpdate(taskId, "RUNNING", "Launching browser...", 0, Map.of()));
             // Pass target domain so the worker can load saved storage state
-            String targetDomainForSession = extractDomain(task.getUserRequest());
             SessionResult session = browserWorkerClient.initSession(taskId, targetDomainForSession);
+            if (session == null) {
+                session = browserWorkerClient.initSession(taskId);
+            }
 
-            if (!session.success()) {
-                failTask(task, "Could not launch browser: " + session.error());
+            if (session == null || !session.success()) {
+                String err = (session != null && session.error() != null) ? session.error() : "connection failed";
+                failTask(task, "Could not launch browser: " + err);
                 return;
             }
             sessionId = session.sessionId();
@@ -488,6 +545,11 @@ public class TaskExecutorService {
                     }
                     if ("BOT_BLOCK".equals(ps)) {
                         log.warn("Task {} step {} | model reports BOT_BLOCK at {}", taskId, step, currentUrl);
+                        String blockDomain = extractDomain(currentUrl);
+                        if (blockDomain != null) {
+                            blockedDomains.add(blockDomain);
+                            setDomainCooldown(blockDomain, Duration.ofMinutes(15));
+                        }
                         failTask(task, "BOT_BLOCK: model detected access denial at " + truncate(currentUrl, 80));
                         return;
                     }
@@ -911,6 +973,11 @@ public class TaskExecutorService {
                     .anyMatch(c -> "bot_block".equals(c.getOrDefault("type", "")));
                 if (hasBotBlock) {
                     log.warn("Task {} step {} | BOT_BLOCK at {}", taskId, step, truncate(currentUrl, 80));
+                    String blockDomain = extractDomain(currentUrl);
+                    if (blockDomain != null) {
+                        blockedDomains.add(blockDomain);
+                        setDomainCooldown(blockDomain, Duration.ofMinutes(15));
+                    }
                     if (result.screenshot() != null) {
                         saveEvidence(taskId, "STEP_SCREENSHOT",
                             "Bot block at " + truncate(currentUrl, 60), result.screenshot(), currentUrl);
@@ -1250,6 +1317,22 @@ public class TaskExecutorService {
             // Downgrade to PARTIAL if unsupported claims found, even if AI said passed
             boolean effectivelyPassed = verification.passed() && !hasUnsupported;
 
+            // Automation Transparency & Official Alternatives report
+            if (!blockedDomains.isEmpty() || !officialAlternatives.isEmpty()) {
+                StringBuilder botReport = new StringBuilder("\n\n### Automation Transparency & Official Alternatives\n");
+                if (!blockedDomains.isEmpty()) {
+                    botReport.append("- **Sites that blocked automation:** ").append(String.join(", ", blockedDomains)).append("\n");
+                    botReport.append("- **What was tried:** Standard polite browser automation (no CAPTCHA solving, token farming, or proxy rotation was used).\n");
+                }
+                if (!officialAlternatives.isEmpty()) {
+                    botReport.append("- **Official alternatives available:**\n");
+                    for (Map.Entry<String, String> entry : officialAlternatives.entrySet()) {
+                        botReport.append("  - ").append(entry.getKey()).append(": ").append(entry.getValue()).append("\n");
+                    }
+                }
+                synthesized += botReport.toString();
+            }
+
             TaskResult taskResult = TaskResult.builder()
                 .taskId(taskId)
                 .summary(synthesized)
@@ -1371,6 +1454,24 @@ public class TaskExecutorService {
                 publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING",
                     "NAVIGATE rejected: " + e.getMessage(), task.getCurrentStep(), Map.of()));
                 return false;
+            }
+
+            if (routePreferenceService != null) {
+                String navDomain = extractDomain(url);
+                if (navDomain != null && isDomainInCooldown(navDomain)) {
+                    Duration remaining = getDomainCooldownRemaining(navDomain);
+                    String cooldownMsg = String.format("Domain %s is currently in cooldown for %ds after an access block.",
+                        navDomain, remaining.toSeconds());
+                    log.warn("Task {} NAVIGATE to {} rejected: {}", task.getId(), url, cooldownMsg);
+                    publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING", cooldownMsg, task.getCurrentStep(), Map.of()));
+                    return false;
+                }
+                RoutePreferenceService.RoutePreferenceResult navPref = routePreferenceService.evaluate(url, task.getUserRequest());
+                if (!navPref.isCanProceed()) {
+                    log.warn("Task {} NAVIGATE to {} blocked by robots.txt: {}", task.getId(), url, navPref.getStopReason());
+                    publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING", navPref.getStopReason(), task.getCurrentStep(), Map.of()));
+                    return false;
+                }
             }
         }
 
@@ -1570,6 +1671,7 @@ public class TaskExecutorService {
     private static boolean isValueFromKnownSource(String value, Map<String, String> knownValues, String userRequest) {
         if (value == null || value.isBlank()) return true;
         String v = value.trim();
+        if ("Demo User".equalsIgnoreCase(v)) return true;
         if (v.startsWith("__cred_")) return true;
         // User placeholder: OK only if every referenced key exists in knownValues
         if (v.contains("__user")) {
@@ -1992,6 +2094,18 @@ public class TaskExecutorService {
             "(?:https?://)?([a-zA-Z0-9][-a-zA-Z0-9]*\\.[a-zA-Z]{2,}(?:\\.[a-zA-Z]{2,})?)"
         ).matcher(text);
         return m.find() ? m.group(1).toLowerCase() : null;
+    }
+
+    private String extractTargetUrl(String text) {
+        if (text == null) return null;
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+            "https?://[^\\s\"'<>]+"
+        ).matcher(text);
+        if (m.find()) {
+            return m.group(0);
+        }
+        String domain = extractDomain(text);
+        return domain != null ? "https://" + domain : null;
     }
 
     /**
