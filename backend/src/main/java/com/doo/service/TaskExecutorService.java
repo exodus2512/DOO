@@ -129,6 +129,7 @@ public class TaskExecutorService {
         int aiCallCount = 0;
 
         try {
+            this.pendingAuthLogin = null;
             // Transition to RUNNING
             updateTaskStatus(task, TaskStatus.RUNNING, null);
 
@@ -340,13 +341,19 @@ public class TaskExecutorService {
                     return;
                 }
 
+                // Check pending auth login verification
+                if (!checkPendingAuthVerification(step, currentUrl, pageText, lastInteractiveElements, taskId, task)) {
+                    return;
+                }
+
                 // ── Auth surface gate ──────────────────────────────────────────────────────
                 // After observing a new page, detect auth surfaces in the DOM and show a card
                 // matching what is actually available. This replaces plan-text credential scanning.
                 if (lastInteractiveElements != null && currentUrl != null && !currentUrl.isBlank()) {
                     String authDomain = extractDomain(currentUrl);
                     if (authDomain != null && !authHandledDomains.contains(authDomain)
-                            && !taskCredentials.containsKey(authDomain)) {
+                            && !taskCredentials.containsKey(authDomain)
+                            && this.pendingAuthLogin == null) {
 
                         // Detect sign-up vs log-in forms and prefer navigating to the log-in form before offering login methods
                         if (isSignupSurface(currentUrl, pageText, lastInteractiveElements)
@@ -431,6 +438,12 @@ public class TaskExecutorService {
                                 handleAuthGateResponse(cachedAuthResponse, authDomain, taskCredentials,
                                     knownValues, authHandledDomains, taskId);
                                 credentialHints = buildFullHints(taskCredentials, knownValues);
+                                String cachedChoice = extractAuthChoice(cachedAuthResponse);
+                                if ("password".equals(cachedChoice) || "email_link".equals(cachedChoice)) {
+                                    this.pendingAuthLogin = new PendingAuthLogin(authDomain, cachedChoice, step + 1);
+                                    log.info("Task {} step {} | AUTH GATE: reusing cached response, set pendingAuthLogin for {} with choice {}",
+                                        taskId, step, authDomain, cachedChoice);
+                                }
                                 continue;
                             }
 
@@ -461,32 +474,40 @@ public class TaskExecutorService {
                                 handleAuthGateResponse(authResolved.getUserResponse(), authDomain,
                                     taskCredentials, knownValues, authHandledDomains, taskId);
                                 approvalAnswerCache.put(authDedupKey, authResolved.getUserResponse());
-                                // Verify login succeeded before saving storage state
-                                boolean loginVerified = false;
-                                for (int loginAttempt = 0; loginAttempt < 3; loginAttempt++) {
-                                    List<Map<String, Object>> verifyEls = authPause.interactiveElements() != null
-                                        ? authPause.interactiveElements() : lastInteractiveElements;
-                                    String verifyText = authPause.pageText() != null ? authPause.pageText() : pageText;
-                                    String verifyUrl = authPause.currentUrl() != null ? authPause.currentUrl() : currentUrl;
-                                    LoginVerificationResult verification = verifyLoginStatus(verifyEls, verifyText, verifyUrl, authSurface);
-                                    if (verification.verified()) {
-                                        loginVerified = true;
-                                        log.info("Task {} — AUTH GATE: login verified for {} (attempt {})", taskId, authDomain, loginAttempt + 1);
-                                        String domainForSave = extractDomain(verifyUrl);
-                                        if (domainForSave != null && verification.canSaveStorageState()) {
-                                            browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                
+                                String authChoice = extractAuthChoice(authResolved.getUserResponse());
+                                if ("password".equals(authChoice) || "email_link".equals(authChoice)) {
+                                    this.pendingAuthLogin = new PendingAuthLogin(authDomain, authChoice, step + 1);
+                                    log.info("Task {} step {} | AUTH GATE: set pendingAuthLogin for {} with choice {}",
+                                        taskId, step, authDomain, authChoice);
+                                } else {
+                                    // Verify login succeeded before saving storage state for handoff/oauth
+                                    boolean loginVerified = false;
+                                    for (int loginAttempt = 0; loginAttempt < 3; loginAttempt++) {
+                                        List<Map<String, Object>> verifyEls = authPause.interactiveElements() != null
+                                            ? authPause.interactiveElements() : lastInteractiveElements;
+                                        String verifyText = authPause.pageText() != null ? authPause.pageText() : pageText;
+                                        String verifyUrl = authPause.currentUrl() != null ? authPause.currentUrl() : currentUrl;
+                                        LoginVerificationResult verification = verifyLoginStatus(verifyEls, verifyText, verifyUrl, authSurface);
+                                        if (verification.verified()) {
+                                            loginVerified = true;
+                                            log.info("Task {} — AUTH GATE: login verified for {} (attempt {})", taskId, authDomain, loginAttempt + 1);
+                                            String domainForSave = extractDomain(verifyUrl);
+                                            if (domainForSave != null && verification.canSaveStorageState()) {
+                                                browserWorkerClient.saveStorageState(taskId, domainForSave);
+                                            }
+                                            break;
                                         }
-                                        break;
+                                        if (loginAttempt < 2) {
+                                            try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                                        }
                                     }
-                                    if (loginAttempt < 2) {
-                                        try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+                                    if (!loginVerified) {
+                                        log.warn("Task {} — AUTH GATE: login not verified after 3 attempts for {}", taskId, authDomain);
+                                        authHandledDomains.remove(authDomain);
+                                        approvalAnswerCache.remove(authDedupKey);
+                                        recentActions.add("AUTH_GATE: login verification failed — will retry");
                                     }
-                                }
-                                if (!loginVerified) {
-                                    log.warn("Task {} — AUTH GATE: login not verified after 3 attempts for {}", taskId, authDomain);
-                                    authHandledDomains.remove(authDomain);
-                                    approvalAnswerCache.remove(authDedupKey);
-                                    recentActions.add("AUTH_GATE: login verification failed — will retry");
                                 }
                             } else {
                                 authHandledDomains.add(authDomain);
@@ -516,7 +537,7 @@ public class TaskExecutorService {
                 // Skip on login pages (pages with a visible password field).
                 boolean hasPasswordField = lastInteractiveElements != null && lastInteractiveElements.stream()
                     .anyMatch(e -> "password".equals(String.valueOf(e.getOrDefault("type", ""))));
-                if (lastInteractiveElements != null && !hasPasswordField) {
+                if (lastInteractiveElements != null && !hasPasswordField && this.pendingAuthLogin == null) {
                     List<Map<String, Object>> missingFields = detectMissingFields(
                         lastInteractiveElements, knownValues, task.getUserRequest());
                     if (!missingFields.isEmpty()) {
@@ -700,6 +721,7 @@ public class TaskExecutorService {
 
                 // Select next action
                 publishEvent(TaskEvent.debug(taskId, "[STEP 3/5] SELECT_ACTION — step " + step + ", url=" + truncate(currentUrl, 60), Map.of("phase", "SELECT_ACTION", "step", step, "keyPool", getKeyPoolState())));
+                String effectiveCredentialHints = getEffectiveCredentialHints(credentialHints, this.pendingAuthLogin);
                 AiProvider.ActionDecision decision = aiProvider.selectNextAction(
                     new AiProvider.ActionSelectionRequest(
                         task.getUserRequest(),
@@ -715,7 +737,7 @@ public class TaskExecutorService {
                         task.getWorkflowType().name(),
                         lastObservationId,
                         lastInteractiveElements,
-                        credentialHints,
+                        effectiveCredentialHints,
                         lastScrollInfo,
                         textSnippets.size()
                     )
@@ -744,7 +766,7 @@ public class TaskExecutorService {
                     String ps = decision.pageState().toUpperCase();
                     log.debug("Task {} step {} | page_state={} why={}", taskId, step, ps,
                         decision.why() != null ? decision.why() : "");
-                    if ("LOGIN".equals(ps)) {
+                    if ("LOGIN".equals(ps) && this.pendingAuthLogin == null) {
                         // Auth gate runs at loop-top; skip this action and let it fire
                         recentActions.add("PAGE_STATE=LOGIN: deferring to auth gate");
                         continue;
@@ -1679,6 +1701,7 @@ public class TaskExecutorService {
                 browserWorkerClient.closeSession(taskId, sessionId);
             }
             cancelledTasks.remove(taskId);
+            this.pendingAuthLogin = null;
 
             // Log AI call stats
             String taskLabel = task != null ? truncate(task.getUserRequest(), 60) : taskId.toString();
@@ -1957,6 +1980,76 @@ public class TaskExecutorService {
         boolean canSaveStorageState
     ) {
         public static final LoginVerificationResult NOT_VERIFIED = new LoginVerificationResult(false, false);
+    }
+
+    public record PendingAuthLogin(String domain, String choice, int startStep) {
+        public PendingAuthLogin(String domain, String choice) {
+            this(domain, choice, 0);
+        }
+    }
+    private volatile PendingAuthLogin pendingAuthLogin;
+
+    public PendingAuthLogin getPendingAuthLogin() {
+        return pendingAuthLogin;
+    }
+
+    public void setPendingAuthLogin(PendingAuthLogin pendingAuthLogin) {
+        this.pendingAuthLogin = pendingAuthLogin;
+    }
+
+    public String getEffectiveCredentialHints(String baseHints, PendingAuthLogin pending) {
+        if (pending == null) return baseHints;
+        String directive = buildAuthDirective(pending.choice(), pending.domain());
+        if (baseHints == null || baseHints.isBlank()) {
+            return directive;
+        }
+        return baseHints + "\n\n" + directive;
+    }
+
+    public boolean checkPendingAuthVerification(int step, String currentUrl, String pageText,
+            List<Map<String, Object>> elements, UUID taskId, Task task) {
+        if (pendingAuthLogin == null) return true;
+        AuthSurface authSurface = (elements != null)
+            ? detectAuthSurface(elements, pageText, currentUrl)
+            : new AuthSurface(false, false, List.of(), false, false);
+        LoginVerificationResult verification = verifyLoginStatus(elements, pageText, currentUrl, authSurface);
+        if (verification.verified()) {
+            log.info("Task {} step {} | AUTH GATE: login verified for {}",
+                taskId, step, pendingAuthLogin.domain());
+            String domainForSave = extractDomain(currentUrl);
+            if (domainForSave != null && verification.canSaveStorageState() && browserWorkerClient != null) {
+                browserWorkerClient.saveStorageState(taskId, domainForSave);
+            }
+            pendingAuthLogin = null;
+            return true;
+        } else if (step - pendingAuthLogin.startStep() >= 5) {
+            String failMsg = "login did not complete for " + pendingAuthLogin.domain();
+            log.warn("Task {} step {} | AUTH GATE: {}", taskId, step, failMsg);
+            if (task != null) {
+                failTask(task, failMsg);
+            }
+            return false;
+        }
+        return true;
+    }
+
+    public static String extractAuthChoice(String jsonResponse) {
+        if (jsonResponse == null || jsonResponse.isBlank()) return "handoff";
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> parsed = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readValue(jsonResponse, Map.class);
+            return String.valueOf(parsed.getOrDefault("choice", "handoff"));
+        } catch (Exception e) {
+            return "handoff";
+        }
+    }
+
+    public static String buildAuthDirective(String method, String domain) {
+        return String.format(
+            "The user provided %s credentials for %s. Complete the sign-in now: FILL the login fields using the provided placeholders, then CLICK the form's primary Log in / Continue / Sign in button (NOT OAuth buttons, NOT sign-up links). If no password field is visible, CLICK the control that reveals it (e.g. 'Continue with email') first.",
+            method, domain
+        );
     }
 
     private static final java.util.regex.Pattern AUTH_PATH_URL_PATTERN = java.util.regex.Pattern.compile(
