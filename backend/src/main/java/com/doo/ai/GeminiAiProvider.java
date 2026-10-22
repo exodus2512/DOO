@@ -165,7 +165,30 @@ public class GeminiAiProvider implements AiProvider {
             log.info("[DEMO MODE] Using deterministic plan generation");
             return deterministic_generatePlan(userRequest, context.workflowType());
         }
-        String prompt = """
+        String prompt = buildPlanPrompt(userRequest, successCriteria, context);
+
+        try {
+            String taskLabel = truncate(userRequest, 60);
+            log.info("[STEP 2/5] PLAN — generating for: {}", taskLabel);
+            getOrCreateStats(taskLabel).record(AiCallStats.Phase.PLAN);
+            String response = callGemini(prompt, taskLabel);
+            JsonNode json = objectMapper.readTree(extractJson(response));
+            List<String> steps = new ArrayList<>();
+            json.path("steps").forEach(n -> steps.add(n.asText()));
+            log.info("[STEP 2/5] PLAN — {} steps generated", steps.size());
+            return new TaskPlan(steps, json.path("successCriteria").asText(successCriteria));
+        } catch (Exception e) {
+            log.error("[STEP 2/5] PLAN — FAILED: {}", e.getMessage());
+            throw new RuntimeException("AI provider error during planning: " + e.getMessage(), e);
+        }
+    }
+
+    public String buildPlanPrompt(String userRequest, String successCriteria, WorkflowContext context) {
+        String criteria = (successCriteria != null && !successCriteria.isBlank())
+            ? successCriteria
+            : "Complete the user's request thoroughly and provide clear evidence";
+
+        return """
             You are DOO, a general-purpose AI browser agent. Create a focused execution plan.
 
             User request: "%s"
@@ -178,7 +201,7 @@ public class GeminiAiProvider implements AiProvider {
             - EXTRACT: pull structured data from the current page (price, features, text, links)
             - INTERACT: fill a form field, click a button, select an option
             - COMPARE: visit multiple sources and extract the same schema from each for comparison
-            - ASK_USER: pause and ask the user for input (credentials, personal data, choices)
+            - ASK_USER: pause and ask the user for input (personal data, choices)
             - SYNTHESIZE: combine extracted data into the deliverable (table, report, list)
             - VERIFY: check the final result against evidence and success criteria
 
@@ -197,29 +220,10 @@ public class GeminiAiProvider implements AiProvider {
               "steps": ["[TYPE] step description", "[TYPE] step description", ...],
               "successCriteria": "refined testable criteria"
             }
-            """.formatted(userRequest, context.workflowType(), successCriteria);
-
-        try {
-            String taskLabel = truncate(userRequest, 60);
-            log.info("[STEP 2/5] PLAN — generating for: {}", taskLabel);
-            getOrCreateStats(taskLabel).record(AiCallStats.Phase.PLAN);
-            String response = callGemini(prompt, taskLabel);
-            JsonNode json = objectMapper.readTree(extractJson(response));
-            List<String> steps = new ArrayList<>();
-            json.path("steps").forEach(n -> steps.add(n.asText()));
-            log.info("[STEP 2/5] PLAN — {} steps generated", steps.size());
-            return new TaskPlan(steps, json.path("successCriteria").asText(successCriteria));
-        } catch (Exception e) {
-            log.error("[STEP 2/5] PLAN — FAILED: {}", e.getMessage());
-            throw new RuntimeException("AI provider error during planning: " + e.getMessage(), e);
-        }
+            """.formatted(userRequest, context.workflowType(), criteria);
     }
 
-    @Override
-    public ActionDecision selectNextAction(ActionSelectionRequest request) {
-        if (!isAvailable()) {
-            return deterministic_selectAction(request);
-        }
+    public String buildActionPrompt(ActionSelectionRequest request) {
         // Build the page state block: prefer indexed elements, fall back to raw text
         String pageStateBlock;
         if (request.observationId() != null && request.interactiveElements() != null
@@ -286,7 +290,7 @@ public class GeminiAiProvider implements AiProvider {
             ? "Extracted snippets so far: " + request.extractedSnippetCount()
             : "";
 
-        String prompt = """
+        return """
             You are DOO, an AI browser agent selecting the next browser action.
 
             Task: "%s"
@@ -349,8 +353,7 @@ public class GeminiAiProvider implements AiProvider {
             - DO NOT press Enter after filling just one field of a multi-field form.
             - For single-field search inputs (type=search or a lone input), follow FILL with PRESS_KEY Enter.
             - If a previous action returned RESOLVE_FAILED, pick from the current valid indices.
-            - When logging into a site: (1) FILL username field, (2) FILL password field using credential placeholder, (3) CLICK the login/submit button. Always fill BOTH username AND password before clicking login.
-            - If the page shows an error like "Password is required" or "Invalid credentials": you missed a FILL step. Go back and fill the empty field before clicking login again.
+            - Login is handled by the AUTH GATE, never by you. NEVER ASK_USER for usernames or passwords. If the task needs login and no sign-in fields are visible yet, CLICK the page's Sign in / Log in button once to reveal the sign-in options, then stop. The auth gate will offer the methods the page actually provides. Only FILL login fields when credential hints (__cred_username/__cred_password placeholders) are present below.
             - Use EXTRACT_TEXT as soon as useful content is visible. Always extract before DONE.
             - You MUST use EXTRACT_TEXT at least once before DONE.
             - For EXTRACT_TEXT, set the "label" field to describe WHAT you're extracting (e.g. "pricing table", "product features", "form error messages").
@@ -390,6 +393,14 @@ public class GeminiAiProvider implements AiProvider {
                 obsIdLine,
                 credBlock
             );
+    }
+
+    @Override
+    public ActionDecision selectNextAction(ActionSelectionRequest request) {
+        if (!isAvailable()) {
+            return deterministic_selectAction(request);
+        }
+        String prompt = buildActionPrompt(request);
 
         String taskLabel = truncate(request.userRequest(), 60);
         log.info("[STEP 3/5] SELECT_ACTION — step {}, url={}", request.currentStep(), truncate(request.currentUrl(), 80));
@@ -968,6 +979,30 @@ public class GeminiAiProvider implements AiProvider {
                 Map.of("url", url),
                 "Starting navigation (demo mode)", false, "");
         }
+        // If the page has a Sign in / Log in button/link and no form/input fields yet, CLICK it to reveal options
+        if (request.interactiveElements() != null && !request.interactiveElements().isEmpty()) {
+            boolean hasInputs = request.interactiveElements().stream()
+                .anyMatch(el -> "textbox".equals(el.get("role")) || "input".equals(el.get("tag"))
+                    || "password".equals(el.get("type")) || "email".equals(el.get("type")));
+            if (!hasInputs) {
+                for (java.util.Map<String, Object> el : request.interactiveElements()) {
+                    String role = String.valueOf(el.getOrDefault("role", ""));
+                    String tag = String.valueOf(el.getOrDefault("tag", ""));
+                    String text = String.valueOf(el.getOrDefault("text", "")).toLowerCase();
+                    String label = String.valueOf(el.getOrDefault("label", "")).toLowerCase();
+                    if (("button".equals(role) || "link".equals(role) || "button".equals(tag) || "a".equals(tag))
+                            && (text.contains("sign in") || text.contains("log in") || label.contains("sign in") || label.contains("log in"))) {
+                        int idx = el.get("index") instanceof Number n ? n.intValue() : 0;
+                        return new ActionDecision("CLICK",
+                            Map.of("element_index", idx,
+                                   "observation_id", request.observationId() != null ? request.observationId() : "",
+                                   "description", "Sign in button"),
+                            "Clicking Sign in button to reveal sign-in options", false, "");
+                    }
+                }
+            }
+        }
+
         if ("UI_INTERACTION".equals(request.workflowType())) {
             if (request.currentStep() == 1) {
                 // Use element_index if we have an observation, fall back to selector for tests

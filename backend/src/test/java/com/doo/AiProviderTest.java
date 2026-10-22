@@ -329,4 +329,57 @@ class AiProviderTest {
             assertThat(ad.approvalReason()).isEqualTo("needs approval");
         }
     }
+
+    @Nested
+    @DisplayName("Auth Gate & Login Prompt Rules")
+    class AuthGatePromptRulesTests {
+
+        @Test
+        @DisplayName("GeminiAiProvider prompts have new auth gate rules and old username+password workflow is gone")
+        void testAuthGatePromptRulesPresentAndOldGone() {
+            GeminiAiProvider provider = new GeminiAiProvider("", "gemini-1.5-flash", true, objectMapper);
+
+            // 1. Action prompt
+            ActionSelectionRequest actionRequest = new ActionSelectionRequest(
+                "Sign in and check messages",
+                "[INTERACT] Click sign in",
+                0,
+                List.of("[INTERACT] Click sign in"),
+                "https://example.com",
+                "Home",
+                "Welcome to Example",
+                "",
+                List.of(),
+                List.of("NAVIGATE", "CLICK", "FILL"),
+                "UI_INTERACTION",
+                "obs-1",
+                List.of(Map.of("index", 1, "role", "button", "text", "Sign in")),
+                null
+            );
+            String actionPrompt = provider.buildActionPrompt(actionRequest);
+
+            // Assert new auth gate rules are present
+            assertThat(actionPrompt).contains("Login is handled by the AUTH GATE, never by you.");
+            assertThat(actionPrompt).contains("NEVER ASK_USER for usernames or passwords.");
+            assertThat(actionPrompt).contains("If the task needs login and no sign-in fields are visible yet, CLICK the page's Sign in / Log in button once to reveal the sign-in options, then stop.");
+            assertThat(actionPrompt).contains("The auth gate will offer the methods the page actually provides.");
+            assertThat(actionPrompt).contains("Only FILL login fields when credential hints (__cred_username/__cred_password placeholders) are present below.");
+
+            // Assert never-click-OAuth rule is preserved
+            assertThat(actionPrompt).contains("NEVER click OAuth/SSO buttons");
+
+            // Assert old username+password workflow is gone
+            assertThat(actionPrompt).doesNotContain("When logging into a site: (1) FILL username");
+            assertThat(actionPrompt).doesNotContain("(2) FILL password");
+            assertThat(actionPrompt).doesNotContain("(3) CLICK login");
+            assertThat(actionPrompt).doesNotContain("Always fill BOTH username AND password before clicking login");
+
+            // 2. Planning prompt
+            String planPrompt = provider.buildPlanPrompt("login to account", "logged in",
+                new WorkflowContext("UI_INTERACTION"));
+            // Assert ASK_USER does not mention credentials
+            assertThat(planPrompt).contains("- ASK_USER: pause and ask the user for input (personal data, choices)");
+            assertThat(planPrompt).doesNotContain("credentials, personal data");
+        }
+    }
 }
