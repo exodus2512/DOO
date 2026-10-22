@@ -305,6 +305,9 @@ public class TaskExecutorService {
             // Per-domain auth gate attempt counter — capped at MAX_AUTH_GATE_ATTEMPTS.
             Map<String, Integer> authGateAttempts = new HashMap<>();
             final int MAX_AUTH_GATE_ATTEMPTS = 2;
+            // Per-domain bot block attempt counter — capped at MAX_BOT_BLOCK_ATTEMPTS.
+            Map<String, Integer> botBlockAttempts = new HashMap<>();
+            final int MAX_BOT_BLOCK_ATTEMPTS = 2;
 
             for (int step = 0; step < maxSteps && !isCancelled(taskId); step++) {
                 // Wall-clock budget enforcement
@@ -528,6 +531,19 @@ public class TaskExecutorService {
                 if ("BOT_BLOCK".equalsIgnoreCase(currentPageState)) {
                     log.warn("Task {} step {} | BOT_BLOCK before model call at {}", taskId, step, truncate(currentUrl, 80));
                     String blockDomain = extractDomain(currentUrl);
+                    String domainKey = blockDomain != null ? blockDomain : (currentUrl != null ? currentUrl : "unknown");
+
+                    // Cap: max 2 bot_block cards per domain per task, then fail with "site blocked automation (Cloudflare) at <domain>"
+                    int currentAttempts = botBlockAttempts.getOrDefault(domainKey, 0);
+                    if (currentAttempts >= MAX_BOT_BLOCK_ATTEMPTS) {
+                        String blockFailed = "site blocked automation (Cloudflare) at " + domainKey;
+                        log.warn("Task {} — BOT_BLOCK: max attempts ({}) reached for {}; failing task",
+                            taskId, MAX_BOT_BLOCK_ATTEMPTS, domainKey);
+                        failTask(task, blockFailed);
+                        return;
+                    }
+                    botBlockAttempts.put(domainKey, currentAttempts + 1);
+
                     if (blockDomain != null) {
                         blockedDomains.add(blockDomain);
                         setDomainCooldown(blockDomain, Duration.ofMinutes(15));
@@ -565,13 +581,72 @@ public class TaskExecutorService {
                     }
                     ApprovalRequest bbResolved = approvalRepository.findById(bbApproval.getId()).orElse(null);
                     String bbChoice = bbResolved != null && bbResolved.getUserResponse() != null
-                        ? bbResolved.getUserResponse().toLowerCase() : "stop";
+                        ? bbResolved.getUserResponse().toLowerCase().trim() : "stop";
+
                     if (bbChoice.contains("stop")) {
                         failTask(task, "BOT_BLOCK: user chose to stop at " + truncate(currentUrl, 60));
                         return;
+                    } else if (bbChoice.contains("skip")) {
+                        if (blockDomain != null) {
+                            blockedDomains.add(blockDomain);
+                        }
+                        String noteDomain = blockDomain != null ? blockDomain : currentUrl;
+                        recentActions.add(noteDomain + " is unavailable, use other sources");
+                        String curDom = extractDomain(currentUrl);
+                        if (curDom != null && blockedDomains.contains(curDom)) {
+                            ActionResult blankRes = browserWorkerClient.executeAction(taskId, sessionId, "NAVIGATE", Map.of("url", "about:blank"));
+                            currentUrl = "about:blank";
+                            pageTitle = "about:blank";
+                            pageText = "";
+                            currentPageState = "NORMAL";
+                            if (blankRes.observationId() != null) {
+                                lastObservationId = blankRes.observationId();
+                                lastInteractiveElements = blankRes.interactiveElements();
+                            }
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        } else {
+                            currentPageState = "NORMAL";
+                        }
+                        continue;
+                    } else if (bbChoice.contains("open_live_view")) {
+                        BrowserWorkerClient.LiveTokenResult liveTokenRes = browserWorkerClient.getLiveToken(taskId);
+                        String token = liveTokenRes.success() ? liveTokenRes.token() : null;
+                        String wsUrl = liveTokenRes.success() ? liveTokenRes.wsUrl() : null;
+
+                        Map<String, Object> liveParams = new HashMap<>();
+                        liveParams.put("type", "live_view");
+                        liveParams.put("taskId", taskId.toString());
+                        liveParams.put("url", currentUrl);
+                        liveParams.put("token", token);
+                        liveParams.put("wsUrl", wsUrl);
+
+                        String liveReason = "Live view open for user handoff at " + truncate(currentUrl, 60);
+                        publishEvent(TaskEvent.liveView(taskId, liveReason, liveParams));
+                        ApprovalRequest liveApproval = findOrCreateApproval(taskId, "LIVE_VIEW", liveReason, liveParams);
+                        PauseResult livePause = pauseForUser(task, sessionId, liveApproval.getId(),
+                            liveReason, "LIVE_VIEW", step, liveParams);
+                        if (!livePause.resumed) { failTask(task, livePause.failureReason()); return; }
+                        if (livePause.observationId != null) {
+                            lastObservationId = livePause.observationId;
+                            lastInteractiveElements = livePause.interactiveElements;
+                        }
+                        if (livePause.currentUrl != null) currentUrl = livePause.currentUrl;
+                        if (livePause.pageTitle != null) pageTitle = livePause.pageTitle;
+                        if (livePause.pageText != null) {
+                            pageText = livePause.pageText;
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        }
+                        if (livePause.pageState() != null) {
+                            currentPageState = livePause.pageState();
+                        }
+                        recentActions.add("LIVE_VIEW: user resumed session at " + truncate(currentUrl, 50));
+                        continue;
+                    } else {
+                        recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
+                        continue;
                     }
-                    recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
-                    continue;
                 }
 
                 // Select next action
@@ -805,7 +880,7 @@ public class TaskExecutorService {
                 }
 
                 // Validate action
-                if (!validateAction(decision, task)) {
+                if (!validateAction(decision, task, blockedDomains)) {
                     consecutiveFailures++;
                     if (consecutiveFailures >= maxRetries) {
                         failTask(task, "Too many invalid actions proposed by AI");
@@ -1006,9 +1081,27 @@ public class TaskExecutorService {
                         taskId, step, decision.actionType(), eidx, obsId, detail);
                 }
 
+                // Guard: never navigate to a domain in blockedDomains
+                if ("NAVIGATE".equalsIgnoreCase(decision.actionType())) {
+                    String navUrl = String.valueOf(actionArgs.getOrDefault("url", ""));
+                    String navDomain = extractDomain(navUrl);
+                    if (navDomain != null && blockedDomains.contains(navDomain)) {
+                        log.warn("Task {} step {} | Blocked domain navigation prevented for {}", taskId, step, navDomain);
+                        recentActions.add(navDomain + " is unavailable, use other sources");
+                        taskStep.setStatus("SKIPPED");
+                        taskStep.setResult("Domain " + navDomain + " is blocked for this task");
+                        taskStep.setCompletedAt(Instant.now());
+                        taskStepRepository.save(taskStep);
+                        continue;
+                    }
+                }
+
                 // Execute action
                 ActionResult result = browserWorkerClient.executeAction(
                     taskId, sessionId, decision.actionType(), actionArgs);
+                if (result == null) {
+                    result = ActionResult.failure("Empty action result from browser worker");
+                }
 
                 // Update step record
                 taskStep.setStatus(result.success() ? "COMPLETED" : "FAILED");
@@ -1064,6 +1157,19 @@ public class TaskExecutorService {
                     currentPageState = "BOT_BLOCK";
                     log.warn("Task {} step {} | BOT_BLOCK at {}", taskId, step, truncate(currentUrl, 80));
                     String blockDomain = extractDomain(currentUrl);
+                    String domainKey = blockDomain != null ? blockDomain : (currentUrl != null ? currentUrl : "unknown");
+
+                    // Cap: max 2 bot_block cards per domain per task, then fail with "site blocked automation (Cloudflare) at <domain>"
+                    int currentAttempts = botBlockAttempts.getOrDefault(domainKey, 0);
+                    if (currentAttempts >= MAX_BOT_BLOCK_ATTEMPTS) {
+                        String blockFailed = "site blocked automation (Cloudflare) at " + domainKey;
+                        log.warn("Task {} — BOT_BLOCK: max attempts ({}) reached for {}; failing task",
+                            taskId, MAX_BOT_BLOCK_ATTEMPTS, domainKey);
+                        failTask(task, blockFailed);
+                        return;
+                    }
+                    botBlockAttempts.put(domainKey, currentAttempts + 1);
+
                     if (blockDomain != null) {
                         blockedDomains.add(blockDomain);
                         setDomainCooldown(blockDomain, Duration.ofMinutes(15));
@@ -1101,13 +1207,72 @@ public class TaskExecutorService {
                     }
                     ApprovalRequest bbResolved = approvalRepository.findById(bbApproval.getId()).orElse(null);
                     String bbChoice = bbResolved != null && bbResolved.getUserResponse() != null
-                        ? bbResolved.getUserResponse().toLowerCase() : "stop";
+                        ? bbResolved.getUserResponse().toLowerCase().trim() : "stop";
+
                     if (bbChoice.contains("stop")) {
                         failTask(task, "BOT_BLOCK: user chose to stop at " + truncate(currentUrl, 60));
                         return;
+                    } else if (bbChoice.contains("skip")) {
+                        if (blockDomain != null) {
+                            blockedDomains.add(blockDomain);
+                        }
+                        String noteDomain = blockDomain != null ? blockDomain : currentUrl;
+                        recentActions.add(noteDomain + " is unavailable, use other sources");
+                        String curDom = extractDomain(currentUrl);
+                        if (curDom != null && blockedDomains.contains(curDom)) {
+                            ActionResult blankRes = browserWorkerClient.executeAction(taskId, sessionId, "NAVIGATE", Map.of("url", "about:blank"));
+                            currentUrl = "about:blank";
+                            pageTitle = "about:blank";
+                            pageText = "";
+                            currentPageState = "NORMAL";
+                            if (blankRes.observationId() != null) {
+                                lastObservationId = blankRes.observationId();
+                                lastInteractiveElements = blankRes.interactiveElements();
+                            }
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        } else {
+                            currentPageState = "NORMAL";
+                        }
+                        continue;
+                    } else if (bbChoice.contains("open_live_view")) {
+                        BrowserWorkerClient.LiveTokenResult liveTokenRes = browserWorkerClient.getLiveToken(taskId);
+                        String token = liveTokenRes.success() ? liveTokenRes.token() : null;
+                        String wsUrl = liveTokenRes.success() ? liveTokenRes.wsUrl() : null;
+
+                        Map<String, Object> liveParams = new HashMap<>();
+                        liveParams.put("type", "live_view");
+                        liveParams.put("taskId", taskId.toString());
+                        liveParams.put("url", currentUrl);
+                        liveParams.put("token", token);
+                        liveParams.put("wsUrl", wsUrl);
+
+                        String liveReason = "Live view open for user handoff at " + truncate(currentUrl, 60);
+                        publishEvent(TaskEvent.liveView(taskId, liveReason, liveParams));
+                        ApprovalRequest liveApproval = findOrCreateApproval(taskId, "LIVE_VIEW", liveReason, liveParams);
+                        PauseResult livePause = pauseForUser(task, sessionId, liveApproval.getId(),
+                            liveReason, "LIVE_VIEW", step, liveParams);
+                        if (!livePause.resumed) { failTask(task, livePause.failureReason()); return; }
+                        if (livePause.observationId != null) {
+                            lastObservationId = livePause.observationId;
+                            lastInteractiveElements = livePause.interactiveElements;
+                        }
+                        if (livePause.currentUrl != null) currentUrl = livePause.currentUrl;
+                        if (livePause.pageTitle != null) pageTitle = livePause.pageTitle;
+                        if (livePause.pageText != null) {
+                            pageText = livePause.pageText;
+                            lastObservationHash = computeObservationHash(currentUrl, pageTitle, pageText, lastInteractiveElements);
+                            observationEpoch++;
+                        }
+                        if (livePause.pageState() != null) {
+                            currentPageState = livePause.pageState();
+                        }
+                        recentActions.add("LIVE_VIEW: user resumed session at " + truncate(currentUrl, 50));
+                        continue;
+                    } else {
+                        recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
+                        continue;
                     }
-                    recentActions.add("BOT_BLOCK: user chose " + bbChoice + " at " + truncate(currentUrl, 50));
-                    continue;
                 }
 
                 // Handle CAPTCHA/2FA challenges: pause for user, DO NOT attempt to solve
@@ -1515,6 +1680,10 @@ public class TaskExecutorService {
     }
 
     private boolean validateAction(AiProvider.ActionDecision decision, Task task) {
+        return validateAction(decision, task, java.util.Set.of());
+    }
+
+    private boolean validateAction(AiProvider.ActionDecision decision, Task task, Set<String> blockedDomains) {
         if (decision == null || decision.actionType() == null) return false;
         
         String actionType = decision.actionType().toUpperCase();
@@ -1549,8 +1718,15 @@ public class TaskExecutorService {
                 return false;
             }
 
+            String navDomain = extractDomain(url);
+            if (navDomain != null && blockedDomains != null && blockedDomains.contains(navDomain)) {
+                String blockedMsg = "Navigation to blocked domain " + navDomain + " rejected";
+                log.warn("Task {} NAVIGATE to {} rejected: domain is blocked for this task", task.getId(), url);
+                publishEvent(TaskEvent.stepUpdate(task.getId(), "RUNNING", blockedMsg, task.getCurrentStep(), Map.of()));
+                return false;
+            }
+
             if (routePreferenceService != null) {
-                String navDomain = extractDomain(url);
                 if (navDomain != null && isDomainInCooldown(navDomain)) {
                     Duration remaining = getDomainCooldownRemaining(navDomain);
                     String cooldownMsg = String.format("Domain %s is currently in cooldown for %ds after an access block.",

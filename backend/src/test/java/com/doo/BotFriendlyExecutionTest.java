@@ -20,8 +20,11 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.verify;
 
 @SpringBootTest(properties = {
     "doo.ai.demo-mode=true",
@@ -333,5 +336,307 @@ class BotFriendlyExecutionTest {
             .filter(a -> task.getId().equals(a.getTaskId()) && "AUTH_GATE".equals(a.getProposedAction()))
             .count();
         assertThat(totalAuthApprovals).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("BOT_BLOCK choice 'stop': fails the task immediately")
+    void testBotBlockChoiceStopFailsTask() throws Exception {
+        String targetUrl = "https://blocked-stop.com/page";
+        String domain = "blocked-stop.com";
+
+        given(routePreferenceService.evaluate(any(), any()))
+            .willReturn(RoutePreferenceService.RoutePreferenceResult.builder()
+                .canProceed(true)
+                .routeType(RoutePreferenceService.RouteType.BROWSER_ALLOWED)
+                .build());
+
+        given(browserWorkerClient.initSession(any(), any()))
+            .willReturn(new SessionResult(true, "sess-stop", null));
+        given(browserWorkerClient.initSession(any()))
+            .willReturn(new SessionResult(true, "sess-stop", null));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
+            .willReturn(new ActionResult(true, "Navigated", null, "base64",
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        given(browserWorkerClient.unparkSession(any()))
+            .willReturn(new ActionResult(true, "Unparked", null, null,
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        Task task = createTask("scrape blocked-stop.com at " + targetUrl);
+        executorService.executeTask(task.getId());
+
+        long deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest approval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "BOT_BLOCK", "PENDING");
+            if (opt.isPresent()) {
+                approval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(approval).isNotNull();
+        approval.setStatus("APPROVED");
+        approval.setUserResponse("stop");
+        approvalRepository.save(approval);
+
+        Task finalTask = waitForTerminal(task.getId());
+        assertThat(finalTask.getStatus()).isEqualTo(TaskStatus.FAILED);
+        assertThat(finalTask.getFailureReason()).contains("BOT_BLOCK: user chose to stop");
+
+        TaskExecutorService.setDomainCooldown(domain, Duration.ofSeconds(-1));
+    }
+
+    @Test
+    @DisplayName("BOT_BLOCK choice 'skip': adds domain to blockedDomains, navigates to about:blank, and prevents future navigation")
+    void testBotBlockChoiceSkipNavigatesAboutBlankAndBlocksDomain() throws Exception {
+        String targetUrl = "https://blocked-skip.com/page";
+        String domain = "blocked-skip.com";
+
+        given(routePreferenceService.evaluate(any(), any()))
+            .willReturn(RoutePreferenceService.RoutePreferenceResult.builder()
+                .canProceed(true)
+                .routeType(RoutePreferenceService.RouteType.BROWSER_ALLOWED)
+                .build());
+
+        given(browserWorkerClient.initSession(any(), any()))
+            .willReturn(new SessionResult(true, "sess-skip", null));
+        given(browserWorkerClient.initSession(any()))
+            .willReturn(new SessionResult(true, "sess-skip", null));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
+            .willReturn(new ActionResult(true, "Navigated", null, "base64",
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), argThat(m -> m != null && "about:blank".equals(m.get("url")))))
+            .willReturn(new ActionResult(true, "Navigated about:blank", null, null,
+                "about:blank", "about:blank", "", null, "obs-blank", List.of(), List.of(), null, "NORMAL"));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("SCREENSHOT"), any()))
+            .willReturn(new ActionResult(true, "Screenshot", null, "base64",
+                "about:blank", "about:blank", "", null, "obs-ss", List.of(), List.of(), null, "NORMAL"));
+
+        given(browserWorkerClient.unparkSession(any()))
+            .willReturn(new ActionResult(true, "Unparked", null, null,
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        Task task = createTask("research blocked-skip.com at " + targetUrl);
+        executorService.executeTask(task.getId());
+
+        long deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest approval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "BOT_BLOCK", "PENDING");
+            if (opt.isPresent()) {
+                approval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(approval).isNotNull();
+        approval.setStatus("APPROVED");
+        approval.setUserResponse("skip");
+        approvalRepository.save(approval);
+
+        Task finalTask = waitForTerminal(task.getId());
+        assertThat(finalTask.getStatus()).isNotEqualTo(TaskStatus.WAITING_FOR_USER);
+        // Verify navigate to about:blank was invoked
+        verify(browserWorkerClient, atLeastOnce()).executeAction(eq(task.getId()), any(), eq("NAVIGATE"),
+            argThat(m -> m != null && "about:blank".equals(m.get("url"))));
+
+        TaskExecutorService.setDomainCooldown(domain, Duration.ofSeconds(-1));
+    }
+
+    @Test
+    @DisplayName("BOT_BLOCK choice 'open_live_view': calls live-token, pauses with LIVE_VIEW approval, and resumes on approval")
+    void testBotBlockChoiceOpenLiveView() throws Exception {
+        String targetUrl = "https://blocked-live.com/page";
+        String domain = "blocked-live.com";
+
+        given(routePreferenceService.evaluate(any(), any()))
+            .willReturn(RoutePreferenceService.RoutePreferenceResult.builder()
+                .canProceed(true)
+                .routeType(RoutePreferenceService.RouteType.BROWSER_ALLOWED)
+                .build());
+
+        given(browserWorkerClient.initSession(any(), any()))
+            .willReturn(new SessionResult(true, "sess-live", null));
+        given(browserWorkerClient.initSession(any()))
+            .willReturn(new SessionResult(true, "sess-live", null));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
+            .willReturn(new ActionResult(true, "Navigated", null, "base64",
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        given(browserWorkerClient.unparkSession(any()))
+            .willReturn(new ActionResult(true, "Unparked", null, null,
+                targetUrl, "Live Resumed", "Content now accessible", null,
+                "obs-2", List.of(), List.of(), null, "NORMAL"));
+
+        given(browserWorkerClient.getLiveToken(any()))
+            .willReturn(new BrowserWorkerClient.LiveTokenResult(true, "token-12345", 600,
+                "ws://localhost:3001/session/live", null));
+
+        Task task = createTask("research on " + targetUrl);
+        executorService.executeTask(task.getId());
+
+        // 1. Resolve bot_block with open_live_view
+        long deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest bbApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "BOT_BLOCK", "PENDING");
+            if (opt.isPresent()) {
+                bbApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(bbApproval).isNotNull();
+        bbApproval.setStatus("APPROVED");
+        bbApproval.setUserResponse("open_live_view");
+        approvalRepository.save(bbApproval);
+
+        // 2. Wait for LIVE_VIEW approval card
+        deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest liveApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "LIVE_VIEW", "PENDING");
+            if (opt.isPresent()) {
+                liveApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(liveApproval).isNotNull();
+        assertThat(liveApproval.getParameters().get("token")).isEqualTo("token-12345");
+        assertThat(liveApproval.getParameters().get("wsUrl")).isEqualTo("ws://localhost:3001/session/live");
+
+        // 3. User resumes
+        liveApproval.setStatus("APPROVED");
+        liveApproval.setUserResponse("resumed");
+        approvalRepository.save(liveApproval);
+
+        Task finalTask = waitForTerminal(task.getId());
+        assertThat(finalTask.getStatus()).isNotEqualTo(TaskStatus.WAITING_FOR_USER);
+
+        TaskExecutorService.setDomainCooldown(domain, Duration.ofSeconds(-1));
+    }
+
+    @Test
+    @DisplayName("Repeated bot_block fails task after 2 attempts with Cloudflare error, no third card")
+    void testBotBlockMaxAttemptsFailsTask() throws Exception {
+        String targetUrl = "https://cf-blocked-twice.org/feed";
+        String domain = "cf-blocked-twice.org";
+
+        given(routePreferenceService.evaluate(any(), any()))
+            .willReturn(RoutePreferenceService.RoutePreferenceResult.builder()
+                .canProceed(true)
+                .routeType(RoutePreferenceService.RouteType.BROWSER_ALLOWED)
+                .build());
+
+        given(browserWorkerClient.initSession(any(), any()))
+            .willReturn(new SessionResult(true, "sess-cf", null));
+        given(browserWorkerClient.initSession(any()))
+            .willReturn(new SessionResult(true, "sess-cf", null));
+
+        given(browserWorkerClient.getLiveToken(any()))
+            .willReturn(new BrowserWorkerClient.LiveTokenResult(true, "token-cf", 600,
+                "ws://localhost:3001/session/live", null));
+
+        given(browserWorkerClient.executeAction(any(), any(), eq("NAVIGATE"), any()))
+            .willReturn(new ActionResult(true, "Navigated", null, "base64",
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        given(browserWorkerClient.unparkSession(any()))
+            .willReturn(new ActionResult(true, "Unparked", null, null,
+                targetUrl, "Attention Required! | Cloudflare", "Sorry, you have been blocked", null,
+                "obs-1", List.of(), List.of(), null, "BOT_BLOCK"));
+
+        Task task = createTask("fetch feed on " + targetUrl);
+        executorService.executeTask(task.getId());
+
+        // Resolve first card with open_live_view
+        long deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest firstApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "BOT_BLOCK", "PENDING");
+            if (opt.isPresent()) {
+                firstApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(firstApproval).isNotNull();
+        firstApproval.setStatus("APPROVED");
+        firstApproval.setUserResponse("open_live_view");
+        approvalRepository.save(firstApproval);
+
+        // Resolve first LIVE_VIEW
+        deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest firstLive = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "LIVE_VIEW", "PENDING");
+            if (opt.isPresent()) {
+                firstLive = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(firstLive).isNotNull();
+        firstLive.setStatus("APPROVED");
+        firstLive.setUserResponse("resumed");
+        approvalRepository.save(firstLive);
+
+        // Resolve second card with open_live_view
+        deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest secondApproval = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "BOT_BLOCK", "PENDING");
+            if (opt.isPresent() && !opt.get().getId().equals(firstApproval.getId())) {
+                secondApproval = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(secondApproval).isNotNull();
+        secondApproval.setStatus("APPROVED");
+        secondApproval.setUserResponse("open_live_view");
+        approvalRepository.save(secondApproval);
+
+        // Resolve second LIVE_VIEW
+        deadline = System.currentTimeMillis() + 20000;
+        ApprovalRequest secondLive = null;
+        while (System.currentTimeMillis() < deadline) {
+            var opt = approvalRepository.findFirstByTaskIdAndProposedActionAndStatus(task.getId(), "LIVE_VIEW", "PENDING");
+            if (opt.isPresent() && !opt.get().getId().equals(firstLive.getId())) {
+                secondLive = opt.get();
+                break;
+            }
+            Thread.sleep(200);
+        }
+        assertThat(secondLive).isNotNull();
+        secondLive.setStatus("APPROVED");
+        secondLive.setUserResponse("resumed");
+        approvalRepository.save(secondLive);
+
+        // Wait for terminal state: should fail on 3rd attempt without firing 3rd card
+        Task finalTask = waitForTerminal(task.getId());
+        assertThat(finalTask.getStatus()).isEqualTo(TaskStatus.FAILED);
+        assertThat(finalTask.getFailureReason()).contains("site blocked automation (Cloudflare) at " + domain);
+
+        // Verify only 2 bot block approval cards were created
+        long totalBbApprovals = approvalRepository.findAll().stream()
+            .filter(a -> task.getId().equals(a.getTaskId()) && "BOT_BLOCK".equals(a.getProposedAction()))
+            .count();
+        assertThat(totalBbApprovals).isEqualTo(2);
+
+        TaskExecutorService.setDomainCooldown(domain, Duration.ofSeconds(-1));
     }
 }

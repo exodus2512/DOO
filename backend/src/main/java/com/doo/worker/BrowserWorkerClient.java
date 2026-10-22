@@ -21,6 +21,7 @@ import java.util.UUID;
 @Component
 public class BrowserWorkerClient {
 
+    private final String workerUrl;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final int timeoutSeconds;
@@ -31,6 +32,7 @@ public class BrowserWorkerClient {
         @Value("${doo.browser-worker.timeout-seconds:120}") int timeoutSeconds,
         ObjectMapper objectMapper
     ) {
+        this.workerUrl = workerUrl;
         this.timeoutSeconds = timeoutSeconds;
         this.objectMapper = objectMapper;
         this.webClient = WebClient.builder()
@@ -355,6 +357,41 @@ public class BrowserWorkerClient {
             return false;
         }
     }
+
+    /**
+     * Issue a short-lived live view WebSocket token from the browser worker.
+     */
+    public LiveTokenResult getLiveToken(UUID taskId) {
+        try {
+            Map response = webClient.post()
+                .uri("/session/live-token")
+                .bodyValue(Map.of("taskId", taskId.toString()))
+                .retrieve()
+                .bodyToMono(Map.class)
+                .timeout(Duration.ofSeconds(10))
+                .block();
+
+            if (response == null || !response.containsKey("token")) {
+                return new LiveTokenResult(false, null, 0, null, "No token in response");
+            }
+
+            String token = (String) response.get("token");
+            Number ttl = (Number) response.getOrDefault("ttlSeconds", 600);
+            int ttlSec = ttl != null ? ttl.intValue() : 600;
+            String wsBase = workerUrl.replaceFirst("^http", "ws");
+            String wsUrl = wsBase + "/session/" + taskId + "/live?token=" + token;
+            return new LiveTokenResult(true, token, ttlSec, wsUrl, null);
+        } catch (Exception e) {
+            log.warn("Could not get live token for task {}: {}", taskId, e.getMessage());
+            return new LiveTokenResult(false, null, 0, null, e.getMessage());
+        }
+    }
+
+    public String getWorkerUrl() {
+        return workerUrl;
+    }
+
+    public record LiveTokenResult(boolean success, String token, int ttlSeconds, String wsUrl, String error) {}
 
     public record SessionResult(boolean success, String sessionId, String error) {}
 

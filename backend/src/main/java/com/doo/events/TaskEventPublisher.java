@@ -138,6 +138,10 @@ public class TaskEventPublisher {
             return new TaskEvent(taskId, "waiting", "WAITING_FOR_USER", reason, data != null ? data : Map.of(), Instant.now());
         }
 
+        public static TaskEvent liveView(UUID taskId, String message, Map<String, Object> data) {
+            return new TaskEvent(taskId, "live_view", "WAITING_FOR_USER", message, data != null ? data : Map.of(), Instant.now());
+        }
+
         public static TaskEvent debug(UUID taskId, String message, Map<String, Object> data) {
             return new TaskEvent(taskId, "debug", null, message, data != null ? data : Map.of(), Instant.now());
         }
