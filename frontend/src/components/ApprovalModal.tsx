@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState } from 'react';
-import { CheckCircle2, XCircle, ShieldAlert, Clock, KeyRound, Eye, EyeOff, MessageSquareText } from 'lucide-react';
+import { CheckCircle2, XCircle, ShieldAlert, Clock, KeyRound, Eye, EyeOff, MessageSquareText, LogIn } from 'lucide-react';
 import { ApprovalRequest } from '@/lib/api';
 
 interface ApprovalModalProps {
@@ -20,6 +20,12 @@ interface AskField {
   options?: string[];
 }
 
+interface AuthOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 function isCredentialRequest(approval: ApprovalRequest): boolean {
   return approval.parameters?.type === 'credential_request'
     || approval.proposedAction === 'CREDENTIAL_REQUEST';
@@ -28,6 +34,11 @@ function isCredentialRequest(approval: ApprovalRequest): boolean {
 function isFormInputRequest(approval: ApprovalRequest): boolean {
   return approval.parameters?.type === 'form_input_request'
     || approval.proposedAction === 'ASK_USER';
+}
+
+function isAuthGateRequest(approval: ApprovalRequest): boolean {
+  return approval.parameters?.type === 'auth_gate'
+    || approval.proposedAction === 'AUTH_GATE';
 }
 
 function parseFields(approval: ApprovalRequest): AskField[] {
@@ -42,6 +53,18 @@ function parseFields(approval: ApprovalRequest): AskField[] {
     options: typeof f === 'object' && Array.isArray(f.options) ? f.options : undefined,
   }));
 }
+
+function parseAuthOptions(approval: ApprovalRequest): AuthOption[] {
+  const raw = approval.parameters?.options;
+  if (!Array.isArray(raw)) return [{ value: 'handoff', label: 'Sign in in the browser window' }];
+  return raw.map((o: any) => ({
+    value: typeof o === 'string' ? o : (o.value || o),
+    label: typeof o === 'object' ? (o.label || o.value || o) : o,
+    description: typeof o === 'object' ? o.description : undefined,
+  }));
+}
+
+const HANDOFF_CHOICES = new Set(['handoff', 'oauth_note']);
 
 export default function ApprovalModal({
   approval,
@@ -58,6 +81,15 @@ export default function ApprovalModal({
   const [timeLeft, setTimeLeft] = useState<number | null>(null);
   const [formValues, setFormValues] = useState<Record<string, string>>({});
 
+  // Auth gate state
+  const [authChoice, setAuthChoice] = useState<string>('');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPhone, setAuthPhone] = useState('');
+  const [authUsername, setAuthUsername] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authShowPassword, setAuthShowPassword] = useState(false);
+  const [authSaveToVault, setAuthSaveToVault] = useState(false);
+
   React.useEffect(() => {
     if (!approval || approval.status !== 'PENDING') { setTimeLeft(null); return; }
     const update = () => {
@@ -70,6 +102,16 @@ export default function ApprovalModal({
     return () => clearInterval(id);
   }, [approval]);
 
+  // Reset auth choice when a new approval arrives
+  React.useEffect(() => {
+    setAuthChoice('');
+    setAuthEmail('');
+    setAuthPhone('');
+    setAuthUsername('');
+    setAuthPassword('');
+    setAuthSaveToVault(false);
+  }, [approval?.id]);
+
   if (!approval || approval.status !== 'PENDING') {
     return null;
   }
@@ -77,17 +119,45 @@ export default function ApprovalModal({
   const isCred = isCredentialRequest(approval);
   const isOtp = approval.parameters?.type === 'otp_request';
   const isCaptcha = approval.parameters?.type === 'captcha_request';
-  const isAskUser = !isCred && !isOtp && !isCaptcha && isFormInputRequest(approval);
+  const isAuthGate = !isCred && !isOtp && !isCaptcha && isAuthGateRequest(approval);
+  const isAskUser = !isCred && !isOtp && !isCaptcha && !isAuthGate && isFormInputRequest(approval);
   const askFields = isAskUser ? parseFields(approval) : [];
+  const authOptions = isAuthGate ? parseAuthOptions(approval) : [];
   const askReason = (approval.parameters?.reason as string) || approval.prompt || 'The agent needs information to continue';
   const domain = (approval.parameters?.domain as string) || 'the site';
+
+  // Auth gate selected option
+  const selectedAuthOption = authOptions.find(o => o.value === authChoice);
+  const isHandoffChoice = !authChoice || HANDOFF_CHOICES.has(authChoice);
 
   const allRequiredFilled = askFields
     .filter(f => f.required)
     .every(f => (formValues[f.name] || '').trim().length > 0);
 
+  // Validate auth gate submit readiness
+  const authGateSubmitReady = (() => {
+    if (!authChoice) return false;
+    if (isHandoffChoice) return true;
+    if (authChoice === 'password') return authUsername.trim().length > 0 && authPassword.length > 0;
+    if (authChoice === 'email_link') return authEmail.trim().length > 0;
+    if (authChoice === 'phone') return authPhone.trim().length > 0;
+    return true;
+  })();
+
   const handleApprove = () => {
-    if (isCred) {
+    if (isAuthGate) {
+      const payload: Record<string, unknown> = { choice: authChoice || 'handoff' };
+      if (authChoice === 'password') {
+        payload.username = authUsername;
+        payload.password = authPassword;
+        payload.saveToVault = authSaveToVault;
+      } else if (authChoice === 'email_link') {
+        payload.email = authEmail;
+      } else if (authChoice === 'phone') {
+        payload.phone = authPhone;
+      }
+      onApprove(JSON.stringify(payload));
+    } else if (isCred) {
       const payload = JSON.stringify({ username, password, saveToVault });
       onApprove(payload);
     } else if (isOtp) {
@@ -107,44 +177,53 @@ export default function ApprovalModal({
     setFormValues(prev => ({ ...prev, [name]: value }));
   };
 
-  const headerIcon = isCred ? <KeyRound className="w-6 h-6" /> :
+  const headerIcon = isAuthGate ? <LogIn className="w-6 h-6" /> :
+    isCred ? <KeyRound className="w-6 h-6" /> :
     isAskUser ? <MessageSquareText className="w-6 h-6" /> :
     <ShieldAlert className="w-6 h-6" />;
 
-  const headerColorClass = isCred ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
+  const headerColorClass = isAuthGate ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
+    isCred ? 'bg-blue-500/15 border-blue-500/30 text-blue-400' :
     isAskUser ? 'bg-violet-500/15 border-violet-500/30 text-violet-400' :
     'bg-amber-500/15 border-amber-500/30 text-amber-400';
 
-  const badgeColorClass = isCred ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
+  const badgeColorClass = isAuthGate ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
+    isCred ? 'bg-blue-500/20 text-blue-300 border-blue-500/30' :
     isAskUser ? 'bg-violet-500/20 text-violet-300 border-violet-500/30' :
     'bg-amber-500/20 text-amber-300 border-amber-500/30';
 
-  const badgeLabel = isCred ? 'Login Required' :
+  const badgeLabel = isAuthGate ? 'Login Required' :
+    isCred ? 'Login Required' :
     isAskUser ? 'Input Needed' :
     isCaptcha ? 'Your Turn' :
     isOtp ? 'Verification Code' :
     'Action Approval Required';
 
-  const headerTitle = isCred ? `Login required for ${domain}` :
+  const headerTitle = isAuthGate ? `Login required for ${domain}` :
+    isCred ? `Login required for ${domain}` :
     isAskUser ? 'DOO needs your input' :
     isCaptcha ? 'Please solve the CAPTCHA' :
     isOtp ? 'Enter the verification code' :
     'DOO paused for user confirmation';
 
-  const headerDesc = isCred ? 'Provide credentials to continue. They will only be used for this task.' :
-    isAskUser ? askReason :
-    isCaptcha ? 'DOO detected a CAPTCHA it cannot solve. Please complete it in the browser view below.' :
-    isOtp ? 'A verification code was sent to your device. Enter it below to continue.' :
-    'The agent is about to execute a protected or sensitive operation.';
+  const headerDesc = isAuthGate
+    ? ((approval.parameters?.authMethods as string) || 'Choose how to sign in to continue.')
+    : isCred ? 'Provide credentials to continue. They will only be used for this task.'
+    : isAskUser ? askReason
+    : isCaptcha ? 'DOO detected a CAPTCHA it cannot solve. Please complete it in the browser view below.'
+    : isOtp ? 'A verification code was sent to your device. Enter it below to continue.'
+    : 'The agent is about to execute a protected or sensitive operation.';
 
-  const borderColor = isAskUser ? 'border-violet-500/40' : 'border-amber-500/40';
-  const shadowColor = isAskUser ? 'shadow-violet-500/10' : 'shadow-amber-500/10';
+  const borderColor = isAuthGate || isCred ? 'border-blue-500/40' :
+    isAskUser ? 'border-violet-500/40' : 'border-amber-500/40';
+  const shadowColor = isAuthGate || isCred ? 'shadow-blue-500/10' :
+    isAskUser ? 'shadow-violet-500/10' : 'shadow-amber-500/10';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-fade-in">
       <div className={`w-full max-w-lg rounded-2xl bg-slate-900 border ${borderColor} shadow-2xl ${shadowColor} overflow-hidden`}>
         {/* Header */}
-        <div className="p-6 bg-gradient-to-r from-amber-950/60 via-slate-900 to-slate-900 border-b border-amber-500/20 flex items-start space-x-4">
+        <div className="p-6 bg-gradient-to-r from-blue-950/40 via-slate-900 to-slate-900 border-b border-blue-500/20 flex items-start space-x-4">
           <div className={`p-3 rounded-xl border ${headerColorClass}`}>
             {headerIcon}
           </div>
@@ -161,7 +240,121 @@ export default function ApprovalModal({
 
         {/* Content */}
         <div className="p-6 space-y-4">
-          {isCred ? (
+          {isAuthGate ? (
+            <>
+              {/* Sign-in method radio list */}
+              <div className="space-y-2">
+                <label className="block text-xs font-medium text-slate-300 mb-2">Choose how to sign in</label>
+                {authOptions.map((opt) => (
+                  <label
+                    key={opt.value}
+                    className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
+                      authChoice === opt.value
+                        ? 'border-blue-500/60 bg-blue-950/40'
+                        : 'border-slate-700/60 bg-slate-800/30 hover:border-slate-600'
+                    }`}
+                  >
+                    <input
+                      type="radio"
+                      name="auth_method"
+                      value={opt.value}
+                      checked={authChoice === opt.value}
+                      onChange={() => setAuthChoice(opt.value)}
+                      className="mt-0.5 w-4 h-4 text-blue-500 border-slate-600 bg-slate-900 focus:ring-blue-500/50"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-slate-200">{opt.label}</div>
+                      {opt.description && (
+                        <div className="text-xs text-slate-400 mt-0.5">{opt.description}</div>
+                      )}
+                    </div>
+                  </label>
+                ))}
+              </div>
+
+              {/* Dynamic inputs per choice */}
+              {authChoice === 'password' && (
+                <div className="space-y-3 pt-1">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">Username / Email</label>
+                    <input
+                      type="text"
+                      autoComplete="username"
+                      placeholder="Enter username or email"
+                      value={authUsername}
+                      onChange={(e) => setAuthUsername(e.target.value)}
+                      className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">Password</label>
+                    <div className="relative">
+                      <input
+                        type={authShowPassword ? 'text' : 'password'}
+                        autoComplete="current-password"
+                        placeholder="Enter password"
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 pr-10"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setAuthShowPassword(!authShowPassword)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                      >
+                        {authShowPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+                  <label className="flex items-center space-x-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={authSaveToVault}
+                      onChange={(e) => setAuthSaveToVault(e.target.checked)}
+                      className="w-4 h-4 rounded border-slate-700 bg-slate-950 text-blue-500 focus:ring-blue-500/50"
+                    />
+                    <span className="text-sm text-slate-300">Save to vault for future tasks on {domain}</span>
+                  </label>
+                </div>
+              )}
+
+              {authChoice === 'email_link' && (
+                <div className="pt-1">
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">Email address</label>
+                  <input
+                    type="email"
+                    autoComplete="email"
+                    placeholder="Enter your email address"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  />
+                </div>
+              )}
+
+              {authChoice === 'phone' && (
+                <div className="pt-1">
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5">Phone number</label>
+                  <input
+                    type="tel"
+                    autoComplete="tel"
+                    placeholder="Enter your phone number"
+                    value={authPhone}
+                    onChange={(e) => setAuthPhone(e.target.value)}
+                    className="w-full px-3.5 py-2.5 rounded-lg bg-slate-950 border border-slate-800 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
+                  />
+                </div>
+              )}
+
+              {isHandoffChoice && authChoice && (
+                <div className="rounded-xl bg-blue-950/30 border border-blue-500/20 p-3">
+                  <p className="text-sm text-blue-200">
+                    Complete sign-in in the browser window, then press <span className="font-semibold">Continue</span>.
+                  </p>
+                </div>
+              )}
+            </>
+          ) : isCred ? (
             <>
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1.5">Username / Email</label>
@@ -305,16 +498,22 @@ export default function ApprovalModal({
             className="flex items-center space-x-2 px-4 py-2 rounded-xl text-sm font-semibold text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/40 transition-colors disabled:opacity-50"
           >
             <XCircle className="w-4 h-4" />
-            <span>{isCred ? 'Skip Login' : isAskUser ? 'Skip' : 'Reject'}</span>
+            <span>{isAuthGate ? 'Skip Login' : isCred ? 'Skip Login' : isAskUser ? 'Skip' : 'Reject'}</span>
           </button>
           <button
             type="button"
             onClick={handleApprove}
-            disabled={isSubmitting || (isCred && (!username || !password)) || (isOtp && !otpCode) || (isAskUser && !allRequiredFilled)}
-            className="flex items-center space-x-2 px-5 py-2 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 shadow-md shadow-amber-500/20 transition-all disabled:opacity-50"
+            disabled={
+              isSubmitting
+              || (isAuthGate && !authGateSubmitReady)
+              || (isCred && (!username || !password))
+              || (isOtp && !otpCode)
+              || (isAskUser && !allRequiredFilled)
+            }
+            className="flex items-center space-x-2 px-5 py-2 rounded-xl text-sm font-semibold text-slate-950 bg-gradient-to-r from-blue-400 to-blue-500 hover:from-blue-300 hover:to-blue-400 shadow-md shadow-blue-500/20 transition-all disabled:opacity-50"
           >
             <CheckCircle2 className="w-4 h-4" />
-            <span>{isCred ? 'Login & Continue' : isCaptcha ? 'Done — Continue' : isOtp ? 'Submit Code' : isAskUser ? 'Submit & Continue' : 'Approve & Continue'}</span>
+            <span>{isAuthGate ? 'Continue' : isCred ? 'Login & Continue' : isCaptcha ? 'Done — Continue' : isOtp ? 'Submit Code' : isAskUser ? 'Submit & Continue' : 'Approve & Continue'}</span>
           </button>
         </div>
       </div>
