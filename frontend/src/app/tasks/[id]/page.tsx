@@ -181,6 +181,28 @@ export default function TaskDetailPage() {
       api.getEvidence(taskId).then(setArtifacts).catch(console.error);
     }
 
+    if (event.eventType === 'live_view' && event.data) {
+      const d = event.data as any;
+      const normalized: ApprovalRequest = {
+        id: d.id || `live-${taskId}`,
+        taskId: taskId,
+        prompt: event.message || 'Live view open for user handoff',
+        proposedAction: 'LIVE_VIEW',
+        actionDescription: event.message || 'Live view session active',
+        reason: event.message || null,
+        parameters: {
+          type: 'live_view',
+          ...d,
+        },
+        status: 'PENDING',
+        userResponse: null,
+        createdAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+        resolvedAt: null,
+      };
+      setPendingApproval(normalized);
+    }
+
     if (event.eventType === 'approval_required' && event.data) {
       const d = event.data as any;
       const normalized: ApprovalRequest = {

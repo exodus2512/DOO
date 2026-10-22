@@ -382,10 +382,11 @@ server.on('upgrade', async (request, socket, head) => {
   const token = url.searchParams.get('token');
   const claimedTaskId = liveMatch[1];
 
-  // Validate secret header for WS too
+  // Validate token or secret header (browsers cannot send custom headers on WS upgrade)
   const secret = request.headers['x-worker-secret'];
   const tokenTaskId = live.validateToken(token);
-  if (!tokenTaskId || tokenTaskId !== claimedTaskId || secret !== WORKER_SECRET) {
+  const isAuthorized = (tokenTaskId && tokenTaskId === claimedTaskId) || (secret === WORKER_SECRET);
+  if (!isAuthorized) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     socket.destroy();
     return;

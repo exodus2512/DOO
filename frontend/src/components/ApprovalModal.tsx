@@ -3,11 +3,12 @@
 import React, { useState } from 'react';
 import { CheckCircle2, XCircle, ShieldAlert, Clock, KeyRound, Eye, EyeOff, MessageSquareText, LogIn } from 'lucide-react';
 import { ApprovalRequest } from '@/lib/api';
+import LiveViewPanel from './LiveViewPanel';
 
 interface ApprovalModalProps {
   approval: ApprovalRequest | null;
-  onApprove: (reason?: string) => Promise<void>;
-  onReject: (reason?: string) => Promise<void>;
+  onApprove: (reason?: string) => Promise<void> | void;
+  onReject: (reason?: string) => Promise<void> | void;
   isSubmitting?: boolean;
 }
 
@@ -44,6 +45,11 @@ function isAuthGateRequest(approval: ApprovalRequest): boolean {
 function isBotBlockRequest(approval: ApprovalRequest): boolean {
   return approval.parameters?.type === 'bot_block'
     || approval.proposedAction === 'BOT_BLOCK';
+}
+
+function isLiveViewRequest(approval: ApprovalRequest): boolean {
+  return approval.parameters?.type === 'live_view'
+    || approval.proposedAction === 'LIVE_VIEW';
 }
 
 interface BotBlockOption {
@@ -161,6 +167,26 @@ export default function ApprovalModal({
   const isCaptcha = approval.parameters?.type === 'captcha_request';
   const isAuthGate = !isCred && !isOtp && !isCaptcha && isAuthGateRequest(approval);
   const isBotBlock = !isCred && !isOtp && !isCaptcha && !isAuthGate && isBotBlockRequest(approval);
+  const isLiveView = !isCred && !isOtp && !isCaptcha && !isAuthGate && !isBotBlock && isLiveViewRequest(approval);
+
+  if (isLiveView) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fade-in">
+        <div className="w-full max-w-5xl rounded-2xl overflow-hidden shadow-2xl">
+          <LiveViewPanel
+            wsUrl={approval.parameters?.wsUrl as string}
+            token={approval.parameters?.token as string}
+            taskId={approval.taskId}
+            targetUrl={approval.parameters?.url as string}
+            onResume={() => onApprove('resumed')}
+            onStop={() => onReject('stop')}
+            isSubmitting={isSubmitting}
+          />
+        </div>
+      </div>
+    );
+  }
+
   const isAskUser = !isCred && !isOtp && !isCaptcha && !isAuthGate && !isBotBlock && isFormInputRequest(approval);
   const askFields = isAskUser ? parseFields(approval) : [];
   const authOptions = isAuthGate ? parseAuthOptions(approval) : [];
