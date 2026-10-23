@@ -1,15 +1,15 @@
 # ==============================================================================
-# DOO — Development Environment Startup Script (PowerShell)
+# DOO - Development Environment Startup Script (PowerShell)
 # ==============================================================================
 $ErrorActionPreference = "Stop"
 
 Write-Host @"
 ============================================================
-      ____    ___     ___  
-     |  _ \  / _ \   / _ \ 
+      ____    ___     ___
+     |  _ \  / _ \   / _ \
      | | | || | | | | | | |
      | |_| || |_| | | |_| |
-     |____/  \___/   \___/  Phase 1 · Personal AI Agent
+     |____/  \___/   \___/  Phase 1 - Personal AI Agent
 ============================================================
  "You ask. It does."
 ============================================================
@@ -35,6 +35,22 @@ if (Test-Path "$RootDir\.env") {
     }
 }
 
+# --- What is actually about to run ---
+try {
+    $Commit = (git -C $RootDir rev-parse --short HEAD 2>$null)
+    $Dirty = @(git -C $RootDir status --short 2>$null).Count
+    Write-Host "Code version: commit $Commit, $Dirty uncommitted file(s)" -ForegroundColor Magenta
+    if ($Dirty -gt 0) {
+        Write-Host "WARNING: uncommitted changes are included in this run." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "(git not available, skipping version info)" -ForegroundColor DarkGray
+}
+Write-Host "HEADED=$($env:HEADED)  HEADLESS=$($env:HEADLESS)  PROFILE_MODE=$($env:PROFILE_MODE)" -ForegroundColor Magenta
+if ($env:HEADED -ne "true" -and $env:HEADLESS -ne "false") {
+    Write-Host "WARNING: worker will run HEADLESS. Set HEADED=true in .env for real Chrome." -ForegroundColor Yellow
+}
+
 # --- Automatic Port Cleanup ---
 function Stop-PortProcess([int]$Port) {
     $conns = Get-NetTCPConnection -LocalPort $Port -ErrorAction SilentlyContinue
@@ -54,9 +70,9 @@ Stop-PortProcess 3001
 Stop-PortProcess 8081
 Stop-PortProcess 8082
 
-# 1. Start Browser Worker (Node.js Playwright on port 3001)
-Write-Host "[1/4] Starting Browser Worker service on http://localhost:3001..." -ForegroundColor Yellow
-$WorkerProcess = Start-Process -FilePath "node" -ArgumentList "src/server.js" -WorkingDirectory "$RootDir\browser-worker" -PassThru
+# 1. Start Browser Worker (Node.js Playwright on port 3001, auto-restarts on file changes)
+Write-Host "[1/4] Starting Browser Worker service on http://localhost:3001 (--watch)..." -ForegroundColor Yellow
+$WorkerProcess = Start-Process -FilePath "node" -ArgumentList "--watch", "src/server.js" -WorkingDirectory "$RootDir\browser-worker" -PassThru
 
 Start-Sleep -Seconds 2
 
@@ -66,7 +82,7 @@ $FixtureProcess = Start-Process -FilePath "node" -ArgumentList "server.js" -Work
 
 Start-Sleep -Seconds 1
 
-# 3. Start Frontend (Next.js on port 3000)
+# 3. Start Frontend (Next.js on port 3000, hot reloads by itself)
 Write-Host "[3/4] Starting Next.js UI on http://localhost:3000..." -ForegroundColor Yellow
 $FrontendProcess = Start-Process -FilePath "cmd.exe" -ArgumentList "/c npm run dev" -WorkingDirectory "$RootDir\frontend" -PassThru
 
@@ -79,7 +95,6 @@ if ($ActiveProfile -eq "default") {
 } else {
     Write-Host "[4/4] Launching Spring Boot with embedded database profile (H2)..." -ForegroundColor Green
 }
-
 Write-Host "`nAll DOO services initialized!" -ForegroundColor Cyan
 Write-Host "------------------------------------------------------------"
 Write-Host "Frontend UI:     http://localhost:3000" -ForegroundColor White
@@ -91,11 +106,15 @@ Write-Host "Press Ctrl+C to terminate all services.`n" -ForegroundColor DarkGray
 
 try {
     Set-Location "$RootDir\backend"
-    $JarPath = "$RootDir\backend\target\doo-backend-1.0.0-SNAPSHOT.jar"
-    if (Test-Path $JarPath) {
-        Write-Host "Running packaged backend JAR (profile: $ActiveProfile)..." -ForegroundColor Green
+    if ($env:USE_JAR -eq "true") {
+        # Opt-in only: rebuild the jar first so it is never stale
+        Write-Host "USE_JAR=true: rebuilding packaged backend JAR..." -ForegroundColor Green
+        & $Maven "-q" "-DskipTests" "package"
+        $JarPath = "$RootDir\backend\target\doo-backend-1.0.0-SNAPSHOT.jar"
         & "$JavaHome\bin\java.exe" "-Djava.net.preferIPv4Stack=true" "-Dspring.profiles.active=$ActiveProfile" "-jar" $JarPath
     } else {
+        # Default: always compile and run the CURRENT source
+        Write-Host "Running backend from current source (profile: $ActiveProfile)..." -ForegroundColor Green
         $MavenArgs = @("spring-boot:run", "-Dspring-boot.run.profiles=$ActiveProfile", "-Dspring-boot.run.jvmArguments=-Djava.net.preferIPv4Stack=true")
         & $Maven $MavenArgs
     }
